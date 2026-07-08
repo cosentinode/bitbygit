@@ -1669,6 +1669,9 @@ fn parse_branch_prompt(input: &str) -> Result<PromptCommand, String> {
     };
     let parts = rest.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
+        [branch] if branch.eq_ignore_ascii_case("list") => {
+            Err("Use `branches` to list branches.".to_owned())
+        }
         [branch] => Ok(PromptCommand::CreateBranch {
             branch: parse_branch_arg(branch, "Expected: branch <name>")?,
             base: None,
@@ -2111,13 +2114,7 @@ mod tests {
                 base: None,
             })
         );
-        assert_eq!(
-            parse_prompt("branch list"),
-            Ok(PromptCommand::CreateBranch {
-                branch: "list".to_owned(),
-                base: None,
-            })
-        );
+        assert!(parse_prompt("branch list").is_err());
         assert_eq!(
             parse_prompt("branch feature/auth from origin/main"),
             Ok(PromptCommand::CreateBranch {
