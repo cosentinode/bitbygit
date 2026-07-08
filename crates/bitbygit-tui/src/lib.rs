@@ -2,6 +2,7 @@ use std::error::Error;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
+use crossterm::event::KeyModifiers;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -126,13 +127,18 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
             KeyCode::Char('q') if self.focus != Focus::Prompt => self.should_quit = true,
             KeyCode::Tab => self.focus = self.next_visible_focus(),
             KeyCode::BackTab => self.focus = self.previous_visible_focus(),
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
             KeyCode::Char(value)
-                if self.focus == Focus::Prompt && self.prompt.len() < MAX_PROMPT_LEN =>
+                if self.focus == Focus::Prompt
+                    && prompt_accepts_modifiers(key.modifiers)
+                    && self.prompt.len() + value.len_utf8() <= MAX_PROMPT_LEN =>
             {
                 self.prompt.push(value);
             }
@@ -150,7 +156,7 @@ impl App {
                 if let Some(focus) = self.last_viewport.focus_at(mouse.column, mouse.row) {
                     self.focus = focus;
                     if focus == Focus::Repos {
-                        self.select_repo_at(mouse.row);
+                        self.select_repo_at_position(mouse.column, mouse.row);
                     }
                 }
             }
@@ -183,14 +189,20 @@ impl App {
         order
     }
 
-    fn select_repo_at(&mut self, row: u16) {
+    fn select_repo_at_position(&mut self, column: u16, row: u16) {
         let first_row = self.last_viewport.repos.y.saturating_add(1);
         let last_row = self
             .last_viewport
             .repos
             .y
             .saturating_add(self.last_viewport.repos.height.saturating_sub(1));
-        if row < first_row || row >= last_row {
+        let first_column = self.last_viewport.repos.x.saturating_add(1);
+        let last_column = self
+            .last_viewport
+            .repos
+            .x
+            .saturating_add(self.last_viewport.repos.width.saturating_sub(1));
+        if row < first_row || row >= last_row || column < first_column || column >= last_column {
             return;
         }
         let index = row.saturating_sub(first_row) as usize;
@@ -210,6 +222,10 @@ impl App {
             self.selected_repo += 1;
         }
     }
+}
+
+fn prompt_accepts_modifiers(modifiers: KeyModifiers) -> bool {
+    modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
 }
 
 impl Default for App {
@@ -472,6 +488,14 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_requests_clean_exit() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
     fn q_is_text_when_prompt_is_focused() {
         let mut app = App::new();
         app.focus = Focus::Prompt;
@@ -495,6 +519,15 @@ mod tests {
     }
 
     #[test]
+    fn modified_prompt_chords_are_ignored() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+
+        assert!(app.prompt.is_empty());
+    }
+
+    #[test]
     fn prompt_input_is_bounded() {
         let mut app = App::new();
         app.focus = Focus::Prompt;
@@ -503,6 +536,18 @@ mod tests {
         }
 
         assert_eq!(app.prompt.len(), MAX_PROMPT_LEN);
+    }
+
+    #[test]
+    fn prompt_cap_accounts_for_multibyte_chars() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        for _ in 0..MAX_PROMPT_LEN - 1 {
+            app.handle_key(key(KeyCode::Char('x')));
+        }
+        app.handle_key(key(KeyCode::Char('\u{00e9}')));
+
+        assert_eq!(app.prompt.len(), MAX_PROMPT_LEN - 1);
     }
 
     #[test]
@@ -562,6 +607,21 @@ mod tests {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: app.last_viewport.repos.x,
             row: app.last_viewport.repos.y,
+            modifiers: KeyModifiers::empty(),
+        }));
+
+        assert_eq!(app.selected_repo, 2);
+    }
+
+    #[test]
+    fn mouse_click_on_repo_side_border_does_not_select_repo() {
+        let mut app = App::new();
+        app.selected_repo = 2;
+        app.last_viewport = Viewport::split(Rect::new(0, 0, 100, 30));
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.last_viewport.repos.x,
+            row: app.last_viewport.repos.y + 2,
             modifiers: KeyModifiers::empty(),
         }));
 
