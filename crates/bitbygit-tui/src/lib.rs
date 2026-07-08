@@ -394,7 +394,8 @@ impl App {
                 upstream_branch,
                 upstream,
                 expected_remote_oid,
-            } => match validate_push_plan(&local_branch, Some(&upstream), &target) {
+                remote_url,
+            } => match validate_push_plan(&local_branch, Some(&upstream), &target, &remote, remote_url.as_deref()) {
                 Ok(()) => run_audited_git_operation_with_output("push", "push", || {
                     let source_oid = target.oid.as_deref().ok_or_else(|| GitError::Blocked {
                         message: "push is blocked because the planned branch has no commit"
@@ -414,8 +415,9 @@ impl App {
                 branch,
                 target,
                 expected_remote_oid,
+                remote_url,
             } => {
-                match validate_push_plan(&branch, None, &target) {
+                match validate_push_plan(&branch, None, &target, &remote, remote_url.as_deref()) {
                     Ok(()) => {
                         run_audited_git_operation_with_output("push", "push_set_upstream", || {
                             let source_oid = target.oid.as_deref().ok_or_else(|| {
@@ -632,6 +634,13 @@ impl App {
                             return;
                         }
                     };
+                let remote_url = match Git::new(current_dir()).remote_push_url(&remote) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        self.details = format!("Unable to snapshot push remote URL: {error}");
+                        return;
+                    }
+                };
                 self.pending_confirmation = Some(PendingAction::Push {
                     local_branch: branch.clone(),
                     target: head_target.clone(),
@@ -639,6 +648,7 @@ impl App {
                     upstream_branch,
                     upstream: upstream.clone(),
                     expected_remote_oid,
+                    remote_url,
                 });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {upstream}\n- ahead: {} commit(s)\nPress y to push or n to cancel.",
@@ -658,11 +668,19 @@ impl App {
                             return;
                         }
                     };
+                let remote_url = match Git::new(current_dir()).remote_push_url(&remote) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        self.details = format!("Unable to snapshot push remote URL: {error}");
+                        return;
+                    }
+                };
                 self.pending_confirmation = Some(PendingAction::PushSetUpstream {
                     remote: remote.clone(),
                     branch: branch.clone(),
                     target: head_target,
                     expected_remote_oid,
+                    remote_url,
                 });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {remote}\n- set upstream to {remote}/{branch}\nPress y to push or n to cancel."
@@ -690,15 +708,6 @@ impl App {
                 return;
             }
         };
-        if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
-            self.details = "Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned();
-            return;
-        }
-        if rebase && !status.is_clean() {
-            self.details = "Pull rebase blocked: working tree must be clean.".to_owned();
-            return;
-        }
-        self.prompt.clear();
         let head_target = match Git::new(current_dir()).head_target() {
             Ok(target) => target,
             Err(error) => {
@@ -724,6 +733,34 @@ impl App {
             self.details = format!("Pull blocked: upstream config does not match {upstream}.");
             return;
         }
+        let fetch = Git::new(current_dir()).fetch_remote_branch(&remote, &upstream_branch);
+        if let Err(error) = fetch {
+            self.details = format!("Unable to fetch pull target: {error}");
+            return;
+        }
+        let status = match Git::new(current_dir()).status() {
+            Ok(status) => status,
+            Err(error) => {
+                self.details = format!("Unable to refresh pull plan after fetch: {error}");
+                return;
+            }
+        };
+        if branch_name(&status.branch).as_deref() != Ok(local_branch.as_str()) {
+            self.details = "Pull blocked: current branch changed during fetch.".to_owned();
+            return;
+        }
+        if status.branch.upstream.as_deref() != Some(upstream.as_str()) {
+            self.details = "Pull blocked: upstream changed during fetch.".to_owned();
+            return;
+        }
+        if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
+            self.details = "Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned();
+            return;
+        }
+        if rebase && !status.is_clean() {
+            self.details = "Pull rebase blocked: working tree must be clean.".to_owned();
+            return;
+        }
         let upstream_oid =
             match Git::new(current_dir()).remote_tracking_oid(&remote, &upstream_branch) {
                 Ok(upstream_oid) => upstream_oid,
@@ -732,6 +769,7 @@ impl App {
                     return;
                 }
             };
+        self.prompt.clear();
         if rebase {
             self.pending_confirmation = Some(PendingAction::PullRebase {
                 local_branch,
@@ -742,7 +780,7 @@ impl App {
                 upstream_oid,
             });
             self.details = format!(
-                "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- block if the remote changed since this plan\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
+                "Pull rebase plan:\n- rebase current branch onto fetched {upstream}\n- block if the fetched upstream changes before confirmation\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
                 status.branch.behind
             );
         } else {
@@ -755,7 +793,7 @@ impl App {
                 upstream_oid,
             });
             self.details = format!(
-                "Pull plan:\n- fetch and fast-forward from {upstream}\n- block if the remote changed since this plan\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
+                "Pull plan:\n- fast-forward from fetched {upstream}\n- block if the fetched upstream changes before confirmation\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
                 status.branch.behind
             );
         }
@@ -797,12 +835,14 @@ enum PendingAction {
         upstream_branch: String,
         upstream: String,
         expected_remote_oid: Option<String>,
+        remote_url: Option<String>,
     },
     PushSetUpstream {
         remote: String,
         branch: String,
         target: HeadTarget,
         expected_remote_oid: Option<String>,
+        remote_url: Option<String>,
     },
     Pull {
         local_branch: String,
@@ -1194,6 +1234,8 @@ fn validate_push_plan(
     branch: &str,
     expected_upstream: Option<&str>,
     target: &HeadTarget,
+    remote: &str,
+    remote_url: Option<&str>,
 ) -> Result<(), String> {
     if Git::new(current_dir())
         .head_target()
@@ -1211,6 +1253,14 @@ fn validate_push_plan(
     }
     if status.branch.upstream.as_deref() != expected_upstream {
         return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
+    }
+    if Git::new(current_dir())
+        .remote_push_url(remote)
+        .map_err(|error| format!("Unable to revalidate push remote URL: {error}"))?
+        .as_deref()
+        != remote_url
+    {
+        return Err("Push blocked: remote URL changed since the plan was shown.".to_owned());
     }
     if status.branch.behind > 0 {
         return Err("Push blocked: branch is now behind its upstream.".to_owned());

@@ -143,6 +143,15 @@ impl Git {
             .map(ToOwned::to_owned))
     }
 
+    pub fn remote_push_url(&self, remote: &str) -> Result<Option<String>, GitError> {
+        let push_url =
+            self.config_value(["config", "--get", &format!("remote.{remote}.pushurl")])?;
+        if push_url.is_some() {
+            return Ok(push_url);
+        }
+        self.config_value(["config", "--get", &format!("remote.{remote}.url")])
+    }
+
     pub fn pull(&self) -> Result<GitOutput, GitError> {
         self.run(["pull", "--ff-only"])
     }
@@ -153,17 +162,15 @@ impl Git {
         branch: &str,
         expected_upstream_oid: Option<&str>,
     ) -> Result<GitOutput, GitError> {
-        let fetch = self.fetch_remote_branch(remote, branch)?;
         self.ensure_remote_tracking_unchanged(remote, branch, expected_upstream_oid, "pull")?;
-        let merge_target = expected_upstream_oid
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| remote_tracking_ref(remote, branch));
-        let merge = self.run_args(vec![
+        let merge_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
+            message: "pull is blocked because the upstream ref is unavailable".to_owned(),
+        })?;
+        self.run_args(vec![
             "merge".to_owned(),
             "--ff-only".to_owned(),
-            merge_target,
-        ])?;
-        Ok(combine_outputs(fetch, merge))
+            merge_target.to_owned(),
+        ])
     }
 
     pub fn pull_rebase(&self) -> Result<GitOutput, GitError> {
@@ -176,18 +183,16 @@ impl Git {
         branch: &str,
         expected_upstream_oid: Option<&str>,
     ) -> Result<GitOutput, GitError> {
-        let fetch = self.fetch_remote_branch(remote, branch)?;
         self.ensure_remote_tracking_unchanged(
             remote,
             branch,
             expected_upstream_oid,
             "pull rebase",
         )?;
-        let rebase_target = expected_upstream_oid
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| remote_tracking_ref(remote, branch));
-        let rebase = self.run_args(vec!["rebase".to_owned(), rebase_target])?;
-        Ok(combine_outputs(fetch, rebase))
+        let rebase_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
+            message: "pull rebase is blocked because the upstream ref is unavailable".to_owned(),
+        })?;
+        self.run_args(vec!["rebase".to_owned(), rebase_target.to_owned()])
     }
 
     pub fn upstream_push_target(&self, branch: &str) -> Result<Option<(String, String)>, GitError> {
@@ -211,7 +216,7 @@ impl Git {
         self.ref_oid(&remote_tracking_ref(remote, branch))
     }
 
-    fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+    pub fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
         self.run_args(vec![
             "fetch".to_owned(),
             "--".to_owned(),
