@@ -3,7 +3,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +81,8 @@ impl LocalStore {
         let now = now_secs()?;
         let id = RepoId::from_path(&root);
         let mut records = self.load_registry_map()?;
+        let mut state = self.load_state()?;
+        let old_records = records.clone();
         let record = records
             .entry(id.clone())
             .and_modify(|record| {
@@ -94,23 +96,31 @@ impl LocalStore {
                 last_seen_at: now,
             })
             .clone();
+        push_recent(&mut state.recent_repos, record.id.clone());
 
         self.save_registry(records.into_values())?;
-        self.touch_recent(&record.id)?;
+        if let Err(error) = self.save_state(&state) {
+            self.save_registry(old_records.into_values())?;
+            return Err(error);
+        }
         Ok(record)
     }
 
     pub fn remove_repository(&self, id: &RepoId) -> Result<Option<RepositoryRecord>, StoreError> {
         let mut records = self.load_registry_map()?;
-        let removed = records.remove(id);
-        self.save_registry(records.into_values())?;
-
         let mut state = self.load_state()?;
+        let old_records = records.clone();
+        let removed = records.remove(id);
         if state.active_repo.as_ref() == Some(id) {
             state.active_repo = None;
         }
         state.recent_repos.retain(|repo_id| repo_id != id);
-        self.save_state(&state)?;
+
+        self.save_registry(records.into_values())?;
+        if let Err(error) = self.save_state(&state) {
+            self.save_registry(old_records.into_values())?;
+            return Err(error);
+        }
 
         Ok(removed)
     }
@@ -196,12 +206,6 @@ impl LocalStore {
             .map_err(|error| attach_parse_path(error, &self.paths.audit_file))
     }
 
-    fn touch_recent(&self, id: &RepoId) -> Result<(), StoreError> {
-        let mut state = self.load_state()?;
-        push_recent(&mut state.recent_repos, id.clone());
-        self.save_state(&state)
-    }
-
     fn save_state(&self, state: &AppState) -> Result<(), StoreError> {
         write_atomic(&self.paths.state_file, &format_state(state))
     }
@@ -235,8 +239,18 @@ impl LocalStore {
 pub struct RepoId(String);
 
 impl RepoId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn parse(value: impl Into<String>) -> Result<Self, StoreError> {
+        let value = value.into();
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(parse_store_error(
+                "repository id contains invalid characters".to_owned(),
+            ));
+        }
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -415,15 +429,71 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
         })?;
     }
 
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, contents).map_err(|source| StoreError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    fs::rename(&tmp_path, path).map_err(|source| StoreError::Io {
+    let mut last_error = None;
+    for attempt in 0..100_u8 {
+        let tmp_path = unique_tmp_path(path, attempt);
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+                continue;
+            }
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: tmp_path,
+                    source,
+                });
+            }
+        };
+
+        if let Err(source) = file.write_all(contents.as_bytes()) {
+            let _cleanup = fs::remove_file(&tmp_path);
+            return Err(StoreError::Io {
+                path: tmp_path,
+                source,
+            });
+        }
+
+        if let Err(source) = file.sync_all() {
+            let _cleanup = fs::remove_file(&tmp_path);
+            return Err(StoreError::Io {
+                path: tmp_path,
+                source,
+            });
+        }
+
+        if let Err(source) = fs::rename(&tmp_path, path) {
+            let _cleanup = fs::remove_file(&tmp_path);
+            return Err(StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+
+        return Ok(());
+    }
+
+    Err(StoreError::Io {
         path: path.to_path_buf(),
-        source,
+        source: last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "temporary store file already exists",
+            )
+        }),
     })
+}
+
+fn unique_tmp_path(path: &Path, attempt: u8) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "store".into());
+    path.with_file_name(format!(".{file_name}.tmp-{}-{attempt}", std::process::id()))
 }
 
 fn parse_registry(contents: &str) -> Result<BTreeMap<RepoId, RepositoryRecord>, StoreError> {
@@ -440,7 +510,7 @@ fn parse_registry(contents: &str) -> Result<BTreeMap<RepoId, RepositoryRecord>, 
                 fields.len()
             )));
         }
-        let id = RepoId::new(fields[0]);
+        let id = RepoId::parse(fields[0])?;
         let path = decode_path(fields[1])?;
         let added_at = parse_u64(fields[2], "added_at")?;
         let last_seen_at = parse_u64(fields[3], "last_seen_at")?;
@@ -477,7 +547,7 @@ fn parse_state(contents: &str) -> Result<AppState, StoreError> {
     for line in contents.lines() {
         if let Some(value) = line.strip_prefix("active\t") {
             if !value.is_empty() {
-                state.active_repo = Some(RepoId::new(value));
+                state.active_repo = Some(RepoId::parse(value)?);
             }
             continue;
         }
@@ -486,8 +556,8 @@ fn parse_state(contents: &str) -> Result<AppState, StoreError> {
             state.recent_repos = value
                 .split(',')
                 .filter(|value| !value.is_empty())
-                .map(RepoId::new)
-                .collect();
+                .map(RepoId::parse)
+                .collect::<Result<Vec<_>, _>>()?;
             continue;
         }
 
@@ -528,7 +598,7 @@ fn parse_audit_entries(contents: &str) -> Result<Vec<AuditEntry>, StoreError> {
             repo_id: if fields[1] == "-" {
                 None
             } else {
-                Some(RepoId::new(fields[1]))
+                Some(RepoId::parse(fields[1])?)
             },
             operation: decode_string(fields[2])?,
             result: decode_string(fields[3])?,
@@ -773,6 +843,42 @@ mod tests {
             Err(StoreError::Parse { path: Some(_), .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn corrupt_state_prevents_add_without_registry_mutation() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        fs::write(&store.paths().state_file, "bad-line\n")?;
+
+        let result = store.add_repository(repo.path());
+
+        assert!(matches!(result, Err(StoreError::Parse { .. })));
+        assert!(store.list_repositories()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_state_prevents_remove_without_registry_mutation() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        let record = store.add_repository(repo.path())?;
+        fs::write(&store.paths().state_file, "bad-line\n")?;
+
+        let result = store.remove_repository(&record.id);
+
+        assert!(matches!(result, Err(StoreError::Parse { .. })));
+        assert_eq!(store.list_repositories()?, vec![record]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_repository_ids_are_rejected() {
+        assert!(RepoId::parse("bad\tid").is_err());
+        assert!(RepoId::parse("bad,id").is_err());
+        assert!(RepoId::parse("").is_err());
     }
 
     #[test]
