@@ -10,7 +10,8 @@ with suggestions.
 
 ## Planner Pipeline
 
-1. Normalize prompt text by trimming whitespace and matching case-insensitively.
+1. Normalize prompt text by trimming whitespace and matching commands
+   case-insensitively without changing quoted values.
 2. Parse quoted strings before connector tokenization.
 3. Tokenize supported connectors such as `and`, `then`, and `&&` outside quoted
    strings.
