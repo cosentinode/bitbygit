@@ -16,8 +16,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use bitbygit_git::{
-    BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget, StatusEntry,
-    StatusEntryType,
+    BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget,
+    StatusEntry, StatusEntryType,
 };
 use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
@@ -860,8 +860,8 @@ impl App {
                     .map(|branch| {
                         let marker = if branch.current { "*" } else { " " };
                         let kind = match branch.kind {
-                            bitbygit_git::BranchKind::Local => "local",
-                            bitbygit_git::BranchKind::Remote => "remote",
+                            BranchKind::Local => "local",
+                            BranchKind::Remote => "remote",
                         };
                         let upstream = branch
                             .upstream
@@ -901,6 +901,12 @@ impl App {
                 return;
             }
         };
+        if let Err(error) =
+            Git::new(current_dir()).ensure_remote_checkout_target_available(&branch_target)
+        {
+            self.details = format!("Checkout blocked: {error}");
+            return;
+        }
         self.prompt.clear();
         self.pending_confirmation = Some(PendingAction::Checkout {
             branch: branch_target.clone(),

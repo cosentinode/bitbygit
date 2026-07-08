@@ -105,12 +105,15 @@ impl Git {
                 "--".to_owned(),
                 branch.name.clone(),
             ]),
-            BranchKind::Remote => self.run_args(vec![
-                "switch".to_owned(),
-                "--track".to_owned(),
-                "--".to_owned(),
-                branch.name.clone(),
-            ]),
+            BranchKind::Remote => {
+                self.ensure_remote_checkout_target_available(branch)?;
+                self.run_args(vec![
+                    "switch".to_owned(),
+                    "--track".to_owned(),
+                    "--".to_owned(),
+                    branch.name.clone(),
+                ])
+            }
         }
     }
 
@@ -434,6 +437,32 @@ impl Git {
                 ),
             }),
         }
+    }
+
+    pub fn ensure_remote_checkout_target_available(
+        &self,
+        branch: &BranchTarget,
+    ) -> Result<(), GitError> {
+        if branch.kind != BranchKind::Remote {
+            return Ok(());
+        }
+        let Some(local_name) = local_name_for_remote_branch(&branch.name) else {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "checkout is blocked because remote branch {} has no local branch name",
+                    branch.name
+                ),
+            });
+        };
+        if matches!(self.branch_target(local_name)?, Some(existing) if existing.kind == BranchKind::Local)
+        {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "checkout is blocked because local branch {local_name} already exists; checkout {local_name} instead"
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn ensure_valid_new_branch_name(&self, branch: &str) -> Result<(), GitError> {
@@ -1496,6 +1525,12 @@ fn parse_branch_line(line: &str) -> Result<BranchInfo, GitError> {
     })
 }
 
+fn local_name_for_remote_branch(name: &str) -> Option<&str> {
+    name.split_once('/')
+        .map(|(_remote, branch)| branch)
+        .filter(|branch| !branch.is_empty())
+}
+
 fn strip_byte_line_ending(value: &[u8]) -> &[u8] {
     value.strip_suffix(b"\n").unwrap_or(value)
 }
@@ -1837,6 +1872,32 @@ mod tests {
             return Err("expected dirty tree guardrail".into());
         };
         assert!(error.to_string().contains("working tree is not clean"));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_checkout_blocks_when_local_branch_exists() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+        let git = Git::new(repo.path());
+        let remote = git.branch_target("origin/main")?.ok_or("missing remote")?;
+
+        let result = git.checkout_branch(&remote, &git.head_target()?);
+
+        let Err(error) = result else {
+            return Err("expected remote checkout guardrail".into());
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("local branch main already exists")
+        );
         Ok(())
     }
 
