@@ -66,8 +66,12 @@ impl Git {
         self.run(["fetch"])
     }
 
-    pub fn push_current_branch(&self) -> Result<GitOutput, GitError> {
-        self.run(["push"])
+    pub fn push_current_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+        self.run_args(vec![
+            "push".to_owned(),
+            remote.to_owned(),
+            format!("HEAD:refs/heads/{branch}"),
+        ])
     }
 
     pub fn push_current_branch_set_upstream(
@@ -344,6 +348,7 @@ impl Git {
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
         let output = Command::new("git")
             .current_dir(&self.cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {
@@ -459,6 +464,7 @@ impl Git {
             .collect::<Vec<_>>();
         let mut command = Command::new("git");
         command.current_dir(&self.cwd).args(&args);
+        command.env("GIT_TERMINAL_PROMPT", "0");
         if literal_pathspecs {
             command.env("GIT_LITERAL_PATHSPECS", "1");
         }
@@ -488,6 +494,7 @@ impl Git {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let output = Command::new("git")
             .current_dir(&self.cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {

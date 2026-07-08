@@ -380,29 +380,44 @@ impl App {
                         PendingAction::StageAll => git.stage_all(),
                         PendingAction::UnstageAll => git.unstage_all(),
                         PendingAction::Commit { .. }
-                        | PendingAction::Push
+                        | PendingAction::Push { .. }
                         | PendingAction::PushSetUpstream { .. }
                         | PendingAction::Pull
                         | PendingAction::PullRebase => unreachable!(),
                     }
                 })
             }
-            PendingAction::Push => run_audited_git_operation_with_output("push", "push", || {
-                Git::new(current_dir()).push_current_branch()
-            }),
+            PendingAction::Push { remote, branch } => match validate_push_plan(&branch, true) {
+                Ok(()) => run_audited_git_operation_with_output("push", "push", || {
+                    Git::new(current_dir()).push_current_branch(&remote, &branch)
+                }),
+                Err(error) => error,
+            },
             PendingAction::PushSetUpstream { remote, branch } => {
-                run_audited_git_operation_with_output("push", "push_set_upstream", || {
-                    Git::new(current_dir()).push_current_branch_set_upstream(&remote, &branch)
-                })
+                match validate_push_plan(&branch, false) {
+                    Ok(()) => {
+                        run_audited_git_operation_with_output("push", "push_set_upstream", || {
+                            Git::new(current_dir())
+                                .push_current_branch_set_upstream(&remote, &branch)
+                        })
+                    }
+                    Err(error) => error,
+                }
             }
-            PendingAction::Pull => run_audited_git_operation_with_output("pull", "pull", || {
-                Git::new(current_dir()).pull()
-            }),
-            PendingAction::PullRebase => {
-                run_audited_git_operation_with_output("pull rebase", "pull_rebase", || {
-                    Git::new(current_dir()).pull_rebase()
-                })
-            }
+            PendingAction::Pull => match validate_pull_plan(false) {
+                Ok(()) => run_audited_git_operation_with_output("pull", "pull", || {
+                    Git::new(current_dir()).pull()
+                }),
+                Err(error) => error,
+            },
+            PendingAction::PullRebase => match validate_pull_plan(true) {
+                Ok(()) => run_audited_git_operation_with_output(
+                    "pull rebase",
+                    "pull_rebase",
+                    || Git::new(current_dir()).pull_rebase(),
+                ),
+                Err(error) => error,
+            },
             PendingAction::Commit {
                 message,
                 staged_items,
@@ -527,7 +542,14 @@ impl App {
         self.prompt.clear();
         match &status.branch.upstream {
             Some(upstream) => {
-                self.pending_confirmation = Some(PendingAction::Push);
+                let Some((remote, upstream_branch)) = split_upstream(upstream) else {
+                    self.details = format!("Push blocked: unable to parse upstream {upstream}.");
+                    return;
+                };
+                self.pending_confirmation = Some(PendingAction::Push {
+                    remote,
+                    branch: upstream_branch,
+                });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {upstream}\n- ahead: {} commit(s)\nPress y to push or n to cancel.",
                     status.branch.ahead
@@ -561,11 +583,6 @@ impl App {
             self.details = "Pull blocked: current branch has no upstream.".to_owned();
             return;
         }
-        if status.branch.behind == 0 {
-            self.details = "Pull skipped: branch is not behind its upstream.".to_owned();
-            self.prompt.clear();
-            return;
-        }
         if status.branch.ahead > 0 && !rebase {
             self.details = "Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned();
             return;
@@ -579,13 +596,13 @@ impl App {
         if rebase {
             self.pending_confirmation = Some(PendingAction::PullRebase);
             self.details = format!(
-                "Pull rebase plan:\n- rebase current branch onto {upstream}\n- behind: {} commit(s)\nPress y to rebase or n to cancel.",
+                "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
                 status.branch.behind
             );
         } else {
             self.pending_confirmation = Some(PendingAction::Pull);
             self.details = format!(
-                "Pull plan:\n- pull from {upstream} using configured strategy\n- behind: {} commit(s)\nPress y to pull or n to cancel.",
+                "Pull plan:\n- fetch and pull from {upstream} using configured strategy\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
                 status.branch.behind
             );
         }
@@ -616,7 +633,10 @@ impl App {
 enum PendingAction {
     StageAll,
     UnstageAll,
-    Push,
+    Push {
+        remote: String,
+        branch: String,
+    },
     PushSetUpstream {
         remote: String,
         branch: String,
@@ -636,7 +656,7 @@ impl PendingAction {
         match self {
             Self::StageAll => "stage all",
             Self::UnstageAll => "unstage all",
-            Self::Push => "push",
+            Self::Push { .. } => "push",
             Self::PushSetUpstream { .. } => "push",
             Self::Pull => "pull",
             Self::PullRebase => "pull rebase",
@@ -648,7 +668,7 @@ impl PendingAction {
         match self {
             Self::StageAll => "stage_all",
             Self::UnstageAll => "unstage_all",
-            Self::Push => "push",
+            Self::Push { .. } => "push",
             Self::PushSetUpstream { .. } => "push_set_upstream",
             Self::Pull => "pull",
             Self::PullRebase => "pull_rebase",
@@ -991,6 +1011,47 @@ fn default_remote_name() -> Option<String> {
         .find(|remote| remote.name == "origin")
         .or_else(|| remotes.first())
         .map(|remote| remote.name.clone())
+}
+
+fn split_upstream(upstream: &str) -> Option<(String, String)> {
+    let (remote, branch) = upstream.split_once('/')?;
+    (!remote.is_empty() && !branch.is_empty()).then(|| (remote.to_owned(), branch.to_owned()))
+}
+
+fn validate_push_plan(branch: &str, expect_upstream: bool) -> Result<(), String> {
+    let status = Git::new(current_dir())
+        .status()
+        .map_err(|error| format!("Unable to revalidate push plan: {error}"))?;
+    let current_branch = branch_name(&status.branch)?;
+    if current_branch != branch {
+        return Err("Push blocked: current branch changed since the plan was shown.".to_owned());
+    }
+    if expect_upstream && status.branch.upstream.is_none() {
+        return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
+    }
+    if !expect_upstream && status.branch.upstream.is_some() {
+        return Err("Push blocked: upstream was added since the plan was shown.".to_owned());
+    }
+    if status.branch.behind > 0 {
+        return Err("Push blocked: branch is now behind its upstream.".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_pull_plan(rebase: bool) -> Result<(), String> {
+    let status = Git::new(current_dir())
+        .status()
+        .map_err(|error| format!("Unable to revalidate pull plan: {error}"))?;
+    if status.branch.upstream.is_none() {
+        return Err("Pull blocked: current branch has no upstream.".to_owned());
+    }
+    if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
+        return Err("Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned());
+    }
+    if rebase && !status.is_clean() {
+        return Err("Pull rebase blocked: working tree must be clean.".to_owned());
+    }
+    Ok(())
 }
 
 fn parse_prompt(input: &str) -> Result<PromptCommand, String> {

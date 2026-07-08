@@ -113,7 +113,7 @@ Success condition:
 
 Status:
 
-- in progress
+- completed
 
 Must have:
 
