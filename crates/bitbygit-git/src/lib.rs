@@ -88,11 +88,24 @@ impl Git {
     }
 
     pub fn pull(&self) -> Result<GitOutput, GitError> {
-        self.run(["pull"])
+        self.run(["pull", "--ff-only"])
     }
 
     pub fn pull_rebase(&self) -> Result<GitOutput, GitError> {
         self.run(["pull", "--rebase"])
+    }
+
+    pub fn upstream_push_target(&self, branch: &str) -> Result<Option<(String, String)>, GitError> {
+        let remote = self.config_value(["config", "--get", &format!("branch.{branch}.remote")])?;
+        let merge = self.config_value(["config", "--get", &format!("branch.{branch}.merge")])?;
+        let (Some(remote), Some(merge)) = (remote, merge) else {
+            return Ok(None);
+        };
+        let branch = merge
+            .strip_prefix("refs/heads/")
+            .unwrap_or(merge.as_str())
+            .to_owned();
+        Ok(Some((remote, branch)))
     }
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {

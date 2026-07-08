@@ -409,13 +409,19 @@ impl App {
                     Err(error) => error,
                 }
             }
-            PendingAction::Pull { upstream } => match validate_pull_plan(false, &upstream) {
+            PendingAction::Pull {
+                local_branch,
+                upstream,
+            } => match validate_pull_plan(false, &local_branch, &upstream) {
                 Ok(()) => run_audited_git_operation_with_output("pull", "pull", || {
                     Git::new(current_dir()).pull()
                 }),
                 Err(error) => error,
             },
-            PendingAction::PullRebase { upstream } => match validate_pull_plan(true, &upstream) {
+            PendingAction::PullRebase {
+                local_branch,
+                upstream,
+            } => match validate_pull_plan(true, &local_branch, &upstream) {
                 Ok(()) => run_audited_git_operation_with_output(
                     "pull rebase",
                     "pull_rebase",
@@ -547,10 +553,25 @@ impl App {
         self.prompt.clear();
         match &status.branch.upstream {
             Some(upstream) => {
-                let Some((remote, upstream_branch)) = split_upstream(upstream) else {
-                    self.details = format!("Push blocked: unable to parse upstream {upstream}.");
-                    return;
+                let target = match Git::new(current_dir()).upstream_push_target(&branch) {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        self.details =
+                            format!("Push blocked: unable to resolve upstream {upstream}.");
+                        return;
+                    }
+                    Err(error) => {
+                        self.details = format!("Unable to prepare push target: {error}");
+                        return;
+                    }
                 };
+                let (remote, upstream_branch) = target;
+                let expected_upstream = format!("{remote}/{upstream_branch}");
+                if expected_upstream != *upstream {
+                    self.details =
+                        format!("Push blocked: upstream config does not match {upstream}.");
+                    return;
+                }
                 self.pending_confirmation = Some(PendingAction::Push {
                     local_branch: branch.clone(),
                     remote,
@@ -590,6 +611,13 @@ impl App {
             self.details = "Pull blocked: current branch has no upstream.".to_owned();
             return;
         }
+        let local_branch = match branch_name(&status.branch) {
+            Ok(branch) => branch,
+            Err(error) => {
+                self.details = error;
+                return;
+            }
+        };
         if status.branch.ahead > 0 && !rebase {
             self.details = "Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned();
             return;
@@ -602,6 +630,7 @@ impl App {
         let upstream = status.branch.upstream.clone().unwrap_or_default();
         if rebase {
             self.pending_confirmation = Some(PendingAction::PullRebase {
+                local_branch,
                 upstream: upstream.clone(),
             });
             self.details = format!(
@@ -610,10 +639,11 @@ impl App {
             );
         } else {
             self.pending_confirmation = Some(PendingAction::Pull {
+                local_branch,
                 upstream: upstream.clone(),
             });
             self.details = format!(
-                "Pull plan:\n- fetch and pull from {upstream} using configured strategy\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
+                "Pull plan:\n- fetch and fast-forward from {upstream}\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
                 status.branch.behind
             );
         }
@@ -629,7 +659,7 @@ impl App {
     }
 
     fn clamp_file_scroll_for(&mut self, area: Rect) {
-        let visible_len = status_visible_len(area);
+        let visible_len = status_file_visible_len(area);
         if self.selected_file < self.file_scroll {
             self.file_scroll = self.selected_file;
         }
@@ -655,9 +685,11 @@ enum PendingAction {
         branch: String,
     },
     Pull {
+        local_branch: String,
         upstream: String,
     },
     PullRebase {
+        local_branch: String,
         upstream: String,
     },
     Commit {
@@ -968,7 +1000,7 @@ fn repo_list(app: &App) -> List<'_> {
 }
 
 fn status_panel(app: &App, area: Rect) -> Paragraph<'_> {
-    let visible_len = status_visible_len(area);
+    let visible_len = status_file_visible_len(area);
     let mut lines = vec![Line::from(branch_summary(app.branch.as_ref()))];
     if app.files.is_empty() {
         lines.push(Line::from("working tree clean or unavailable"));
@@ -978,7 +1010,7 @@ fn status_panel(app: &App, area: Rect) -> Paragraph<'_> {
                 .iter()
                 .enumerate()
                 .skip(app.file_scroll)
-                .take(visible_len.saturating_sub(1).max(1))
+                .take(visible_len)
                 .map(|(index, file)| {
                     let marker = if index == app.selected_file {
                         "> "
@@ -1030,11 +1062,6 @@ fn default_remote_name() -> Option<String> {
         .map(|remote| remote.name.clone())
 }
 
-fn split_upstream(upstream: &str) -> Option<(String, String)> {
-    let (remote, branch) = upstream.split_once('/')?;
-    (!remote.is_empty() && !branch.is_empty()).then(|| (remote.to_owned(), branch.to_owned()))
-}
-
 fn validate_push_plan(branch: &str, expected_upstream: Option<&str>) -> Result<(), String> {
     let status = Git::new(current_dir())
         .status()
@@ -1052,10 +1079,13 @@ fn validate_push_plan(branch: &str, expected_upstream: Option<&str>) -> Result<(
     Ok(())
 }
 
-fn validate_pull_plan(rebase: bool, expected_upstream: &str) -> Result<(), String> {
+fn validate_pull_plan(rebase: bool, branch: &str, expected_upstream: &str) -> Result<(), String> {
     let status = Git::new(current_dir())
         .status()
         .map_err(|error| format!("Unable to revalidate pull plan: {error}"))?;
+    if branch_name(&status.branch)? != branch {
+        return Err("Pull blocked: current branch changed since the plan was shown.".to_owned());
+    }
     if status.branch.upstream.as_deref() != Some(expected_upstream) {
         return Err("Pull blocked: upstream changed since the plan was shown.".to_owned());
     }
@@ -1088,6 +1118,10 @@ fn parse_prompt(input: &str) -> Result<PromptCommand, String> {
 
 fn status_visible_len(area: Rect) -> usize {
     area.height.saturating_sub(2).max(1) as usize
+}
+
+fn status_file_visible_len(area: Rect) -> usize {
+    status_visible_len(area).saturating_sub(1).max(1)
 }
 
 fn details_panel(app: &App) -> Paragraph<'_> {
@@ -1627,7 +1661,7 @@ mod tests {
         let mut app = App::new();
         app.focus = Focus::Status;
         app.last_viewport.status = Rect::new(0, 0, 30, 5);
-        let visible_len = status_visible_len(app.last_viewport.status);
+        let visible_len = status_file_visible_len(app.last_viewport.status);
         app.files = (0..visible_len + 5)
             .map(|index| FileRow {
                 path: std::path::PathBuf::from(format!("file-{index}.txt")),
