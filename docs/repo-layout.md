@@ -18,6 +18,9 @@ bitbygit/
     bitbygit-git/
       src/lib.rs
 
+    bitbygit-store/
+      src/lib.rs
+
   docs/
     adr/
       0001-system-git-first.md

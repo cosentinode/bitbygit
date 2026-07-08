@@ -77,10 +77,15 @@ The executor may run processes, but only from validated operation plans.
 
 - `crates/bitbygit`: CLI binary entry point.
 - `crates/bitbygit-core`: shared domain model and constants.
+- `crates/bitbygit-git`: typed system Git command boundary.
+- `crates/bitbygit-store`: local registry, app state, and audit storage.
 
 Future phases should add crates only when the boundary is useful in practice.
-Likely future crates include `bitbygit-git`, `bitbygit-tui`, `bitbygit-gh`, and
-`bitbygit-store`.
+Likely future crates include `bitbygit-tui` and `bitbygit-gh`.
+
+The initial store is a single-writer file-backed store. The TUI should route
+mutations through one runtime owner; multi-process locking is a later concern
+before supporting concurrent app instances.
 
 ## Git Boundary
 

@@ -45,7 +45,7 @@ Success condition:
 
 Status:
 
-- in progress
+- merged
 
 Must have:
 
@@ -59,6 +59,10 @@ Success condition:
 - Git state can be queried safely and deterministically
 
 ## Phase 3: Repository registry and local app state
+
+Status:
+
+- in progress
 
 Must have:
 

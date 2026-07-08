@@ -12,3 +12,5 @@ semantic versioning once releases begin.
   system Git ADR.
 - Added the initial typed system Git command layer with porcelain v2 status
   parsing and temporary-repository tests.
+- Added the initial local store for registered repositories, active/recent state,
+  and audit entries.
