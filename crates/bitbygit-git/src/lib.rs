@@ -275,7 +275,7 @@ impl WorktreeStatus {
             .filter(|entry| {
                 matches!(
                     entry.entry_type,
-                    StatusEntryType::Ordinary | StatusEntryType::Renamed
+                    StatusEntryType::Ordinary | StatusEntryType::Renamed | StatusEntryType::Copied
                 ) && entry.index != ChangeKind::Unmodified
             })
             .collect()
@@ -287,7 +287,7 @@ impl WorktreeStatus {
             .filter(|entry| {
                 matches!(
                     entry.entry_type,
-                    StatusEntryType::Ordinary | StatusEntryType::Renamed
+                    StatusEntryType::Ordinary | StatusEntryType::Renamed | StatusEntryType::Copied
                 ) && entry.worktree != ChangeKind::Unmodified
             })
             .collect()
@@ -321,6 +321,7 @@ pub struct StatusEntry {
 pub enum StatusEntryType {
     Ordinary,
     Renamed,
+    Copied,
     Untracked,
     Ignored,
     Conflict,
@@ -340,7 +341,8 @@ pub enum ChangeKind {
     Unknown(char),
 }
 
-pub fn parse_status(input: &str) -> Result<WorktreeStatus, GitError> {
+#[cfg(test)]
+fn parse_status(input: &str) -> Result<WorktreeStatus, GitError> {
     parse_status_bytes(input.as_bytes())
 }
 
@@ -349,18 +351,18 @@ fn parse_status_bytes(input: &[u8]) -> Result<WorktreeStatus, GitError> {
     let mut oid = None;
     let mut entries = Vec::new();
     let nul_delimited = input.contains(&0);
-    let mut records = if nul_delimited {
-        input
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty())
-            .collect::<Vec<_>>()
-            .into_iter()
+    let mut records: Box<dyn Iterator<Item = &[u8]> + '_> = if nul_delimited {
+        Box::new(
+            input
+                .split(|byte| *byte == 0)
+                .filter(|record| !record.is_empty()),
+        )
     } else {
-        input
-            .split(|byte| *byte == b'\n')
-            .filter(|record| !record.is_empty())
-            .collect::<Vec<_>>()
-            .into_iter()
+        Box::new(
+            input
+                .split(|byte| *byte == b'\n')
+                .filter(|record| !record.is_empty()),
+        )
     };
 
     while let Some(line) = records.next() {
@@ -508,7 +510,11 @@ fn parse_renamed_entry(line: &[u8], original_path: Option<&[u8]>) -> Result<Stat
         original_path: Some(path_from_bytes(original_path)),
         index,
         worktree,
-        entry_type: StatusEntryType::Renamed,
+        entry_type: if index == ChangeKind::Copied || worktree == ChangeKind::Copied {
+            StatusEntryType::Copied
+        } else {
+            StatusEntryType::Renamed
+        },
     })
 }
 
@@ -583,8 +589,7 @@ fn parse_remotes(input: &str) -> Vec<Remote> {
 }
 
 fn strip_byte_line_ending(value: &[u8]) -> &[u8] {
-    let value = value.strip_suffix(b"\n").unwrap_or(value);
-    value.strip_suffix(b"\r").unwrap_or(value)
+    value.strip_suffix(b"\n").unwrap_or(value)
 }
 
 fn strip_bytes_prefix<'a>(value: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
@@ -747,6 +752,19 @@ mod tests {
             status.entries[0].original_path,
             Some(PathBuf::from("old name.txt"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_copied_file() -> Result<(), Box<dyn Error>> {
+        let status = parse_status(concat!(
+            "# branch.head main\0",
+            "2 C. N... 100644 100644 100644 abc def C100 copy.txt\0",
+            "source.txt\0"
+        ))?;
+
+        assert_eq!(status.entries[0].entry_type, StatusEntryType::Copied);
+        assert_eq!(status.staged_files().len(), 1);
         Ok(())
     }
 
@@ -959,6 +977,21 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reads_repository_root_ending_in_carriage_return() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new_with_raw_suffix(b"-cr\r")?;
+        repo.run(["init", "-b", "main"])?;
+
+        let root = Git::new(repo.path()).repo_root()?;
+
+        assert_eq!(
+            root.as_os_str().as_bytes(),
+            repo.path().as_os_str().as_bytes()
+        );
+        Ok(())
+    }
+
     struct TempRepo {
         path: PathBuf,
     }
@@ -977,9 +1010,14 @@ mod tests {
 
         #[cfg(unix)]
         fn new_non_utf8() -> Result<Self, Box<dyn Error>> {
+            Self::new_with_raw_suffix(b"-\xff")
+        }
+
+        #[cfg(unix)]
+        fn new_with_raw_suffix(suffix: &[u8]) -> Result<Self, Box<dyn Error>> {
             let id = NEXT_REPO_ID.fetch_add(1, Ordering::Relaxed);
-            let mut name = format!("bitbygit-test-{}-{id}-", std::process::id()).into_bytes();
-            name.push(0xff);
+            let mut name = format!("bitbygit-test-{}-{id}", std::process::id()).into_bytes();
+            name.extend_from_slice(suffix);
             let path = std::env::temp_dir().join(OsString::from_vec(name));
             if path.exists() {
                 fs::remove_dir_all(&path)?;
