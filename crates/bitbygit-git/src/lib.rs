@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
@@ -128,11 +129,19 @@ impl Git {
     }
 
     pub fn remote_head_oid(&self, remote: &str, branch: &str) -> Result<Option<String>, GitError> {
+        self.head_oid_at(remote, branch)
+    }
+
+    pub fn remote_url_head_oid(&self, url: &str, branch: &str) -> Result<Option<String>, GitError> {
+        self.head_oid_at(url, branch)
+    }
+
+    fn head_oid_at(&self, target: &str, branch: &str) -> Result<Option<String>, GitError> {
         let output = self.run_args(vec![
             "ls-remote".to_owned(),
             "--heads".to_owned(),
             "--".to_owned(),
-            remote.to_owned(),
+            target.to_owned(),
             format!("refs/heads/{branch}"),
         ])?;
         Ok(output
@@ -238,7 +247,7 @@ impl Git {
             "--".to_owned(),
             remote.to_owned(),
             format!(
-                "refs/heads/{branch}:{}",
+                "+refs/heads/{branch}:{}",
                 remote_tracking_ref(remote, branch)
             ),
         ])
@@ -539,12 +548,20 @@ impl Git {
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .current_dir(&self.cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
-            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("SSH_ASKPASS_REQUIRE", "never");
+        if env::var_os("GIT_SSH_COMMAND").is_none() {
+            command.env(
+                "GIT_SSH_COMMAND",
+                "ssh -oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes",
+            );
+        }
+        let output = command
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {

@@ -628,14 +628,6 @@ impl App {
                         format!("Push blocked: upstream config does not match {upstream}.");
                     return;
                 }
-                let expected_remote_oid =
-                    match Git::new(current_dir()).remote_head_oid(&remote, &upstream_branch) {
-                        Ok(oid) => oid,
-                        Err(error) => {
-                            self.details = format!("Unable to snapshot push remote: {error}");
-                            return;
-                        }
-                    };
                 let remote_urls = match Git::new(current_dir()).remote_push_urls(&remote) {
                     Ok(urls) => urls,
                     Err(error) => {
@@ -643,6 +635,21 @@ impl App {
                         return;
                     }
                 };
+                let push_url = match single_push_url(&remote, &remote_urls) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        self.details = error;
+                        return;
+                    }
+                };
+                let expected_remote_oid =
+                    match Git::new(current_dir()).remote_url_head_oid(push_url, &upstream_branch) {
+                        Ok(oid) => oid,
+                        Err(error) => {
+                            self.details = format!("Unable to snapshot push remote: {error}");
+                            return;
+                        }
+                    };
                 self.pending_confirmation = Some(PendingAction::Push {
                     local_branch: branch.clone(),
                     target: head_target.clone(),
@@ -662,14 +669,6 @@ impl App {
                     self.details = "Push blocked: no remotes are configured.".to_owned();
                     return;
                 };
-                let expected_remote_oid =
-                    match Git::new(current_dir()).remote_head_oid(&remote, &branch) {
-                        Ok(oid) => oid,
-                        Err(error) => {
-                            self.details = format!("Unable to snapshot push remote: {error}");
-                            return;
-                        }
-                    };
                 let remote_urls = match Git::new(current_dir()).remote_push_urls(&remote) {
                     Ok(urls) => urls,
                     Err(error) => {
@@ -677,6 +676,21 @@ impl App {
                         return;
                     }
                 };
+                let push_url = match single_push_url(&remote, &remote_urls) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        self.details = error;
+                        return;
+                    }
+                };
+                let expected_remote_oid =
+                    match Git::new(current_dir()).remote_url_head_oid(push_url, &branch) {
+                        Ok(oid) => oid,
+                        Err(error) => {
+                            self.details = format!("Unable to snapshot push remote: {error}");
+                            return;
+                        }
+                    };
                 self.pending_confirmation = Some(PendingAction::PushSetUpstream {
                     remote: remote.clone(),
                     branch: branch.clone(),
@@ -1232,6 +1246,18 @@ fn default_remote_name() -> Option<String> {
         .map(|remote| remote.name.clone())
 }
 
+fn single_push_url<'a>(remote: &str, urls: &'a [String]) -> Result<&'a str, String> {
+    match urls {
+        [url] => Ok(url),
+        [] => Err(format!(
+            "Push blocked: unable to resolve push URL for remote {remote}."
+        )),
+        _ => Err(format!(
+            "Push blocked: remote {remote} has multiple push URLs; push from bitbygit supports one destination at a time."
+        )),
+    }
+}
+
 fn validate_push_plan(
     branch: &str,
     expected_upstream: Option<&str>,
@@ -1256,13 +1282,13 @@ fn validate_push_plan(
     if status.branch.upstream.as_deref() != expected_upstream {
         return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
     }
-    if Git::new(current_dir())
+    let current_remote_urls = Git::new(current_dir())
         .remote_push_urls(remote)
-        .map_err(|error| format!("Unable to revalidate push remote URLs: {error}"))?
-        != remote_urls
-    {
+        .map_err(|error| format!("Unable to revalidate push remote URLs: {error}"))?;
+    if current_remote_urls != remote_urls {
         return Err("Push blocked: remote URLs changed since the plan was shown.".to_owned());
     }
+    single_push_url(remote, &current_remote_urls)?;
     if status.branch.behind > 0 {
         return Err("Push blocked: branch is now behind its upstream.".to_owned());
     }
@@ -1723,6 +1749,25 @@ mod tests {
         assert!(parse_prompt("git push").is_err());
         assert!(parse_prompt("push --force").is_err());
         assert!(parse_prompt("pull --ff-only").is_err());
+    }
+
+    #[test]
+    fn single_push_url_blocks_ambiguous_destinations() {
+        assert_eq!(
+            single_push_url("origin", &["ssh://example.test/repo.git".to_owned()]),
+            Ok("ssh://example.test/repo.git")
+        );
+        assert!(single_push_url("origin", &[]).is_err());
+        assert!(
+            single_push_url(
+                "origin",
+                &[
+                    "ssh://example.test/one.git".to_owned(),
+                    "ssh://example.test/two.git".to_owned(),
+                ]
+            )
+            .is_err()
+        );
     }
 
     #[test]
