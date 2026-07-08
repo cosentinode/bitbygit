@@ -36,6 +36,7 @@ name = "bitbygit-tui"
 version = "0.1.0"
 dependencies = [
  "bitbygit-git",
+ "bitbygit-store",
  "crossterm",
  "ratatui",
 ]

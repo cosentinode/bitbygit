@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use bitbygit_git::{ChangeKind, Git, GitError, GitOutput, StatusEntry, StatusEntryType};
+use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
 
@@ -105,7 +106,9 @@ pub struct App {
     selected_repo: usize,
     files: Vec<FileRow>,
     selected_file: usize,
+    file_scroll: usize,
     details: String,
+    pending_confirmation: Option<PendingAction>,
     should_quit: bool,
     last_viewport: Viewport,
 }
@@ -123,7 +126,9 @@ impl App {
             selected_repo: 0,
             files: Vec::new(),
             selected_file: 0,
+            file_scroll: 0,
             details: "No repository status loaded yet.".to_owned(),
+            pending_confirmation: None,
             should_quit: false,
             last_viewport: Viewport::default(),
         }
@@ -148,6 +153,19 @@ impl App {
             KeyCode::BackTab => self.focus = self.previous_visible_focus(),
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
+            KeyCode::Char('a') if self.focus == Focus::Status => {
+                self.pending_confirmation = Some(PendingAction::StageAll);
+                self.details = "Stage all changes? Press y to confirm or n to cancel.".to_owned();
+            }
+            KeyCode::Char('A') if self.focus == Focus::Status => {
+                self.pending_confirmation = Some(PendingAction::UnstageAll);
+                self.details = "Unstage all changes? Press y to confirm or n to cancel.".to_owned();
+            }
+            KeyCode::Char('y') if self.pending_confirmation.is_some() => self.confirm_pending(),
+            KeyCode::Char('n') if self.pending_confirmation.is_some() => {
+                self.pending_confirmation = None;
+                self.details = "Operation cancelled.".to_owned();
+            }
             KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
             KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
             KeyCode::Char(value)
@@ -235,6 +253,7 @@ impl App {
             Focus::Repos if self.selected_repo > 0 => self.selected_repo -= 1,
             Focus::Status if self.selected_file > 0 => {
                 self.selected_file -= 1;
+                self.clamp_file_scroll();
                 self.refresh_diff();
             }
             _ => {}
@@ -246,6 +265,7 @@ impl App {
             Focus::Repos if self.selected_repo + 1 < self.repos.len() => self.selected_repo += 1,
             Focus::Status if self.selected_file + 1 < self.files.len() => {
                 self.selected_file += 1;
+                self.clamp_file_scroll();
                 self.refresh_diff();
             }
             _ => {}
@@ -255,7 +275,11 @@ impl App {
     fn refresh_status(&mut self) {
         match Git::new(current_dir()).status() {
             Ok(status) => {
-                self.files = status.entries.iter().map(FileRow::from_entry).collect();
+                self.files = status
+                    .entries
+                    .iter()
+                    .flat_map(FileRow::from_entry)
+                    .collect();
                 self.files.sort_by(|left, right| {
                     left.section
                         .cmp(&right.section)
@@ -264,6 +288,7 @@ impl App {
                 if self.selected_file >= self.files.len() {
                     self.selected_file = self.files.len().saturating_sub(1);
                 }
+                self.clamp_file_scroll();
                 self.refresh_diff();
             }
             Err(error) => {
@@ -297,8 +322,9 @@ impl App {
             return;
         };
         let result = Git::new(current_dir()).stage_path(&file.path);
-        self.details = operation_message("stage", result);
+        let message = operation_message("stage", audit_operation("stage_path", &result));
         self.refresh_status();
+        self.details = message;
     }
 
     fn unstage_selected_file(&mut self) {
@@ -306,8 +332,57 @@ impl App {
             return;
         };
         let result = Git::new(current_dir()).unstage_path(&file.path);
-        self.details = operation_message("unstage", result);
+        let message = operation_message("unstage", audit_operation("unstage_path", &result));
         self.refresh_status();
+        self.details = message;
+    }
+
+    fn confirm_pending(&mut self) {
+        let Some(action) = self.pending_confirmation.take() else {
+            return;
+        };
+        let git = Git::new(current_dir());
+        let result = match action {
+            PendingAction::StageAll => git.stage_all(),
+            PendingAction::UnstageAll => git.unstage_all(),
+        };
+        let message =
+            operation_message(action.label(), audit_operation(action.operation(), &result));
+        self.refresh_status();
+        self.details = message;
+    }
+
+    fn clamp_file_scroll(&mut self) {
+        let visible_len = status_visible_len(self.last_viewport.status);
+        if self.selected_file < self.file_scroll {
+            self.file_scroll = self.selected_file;
+        }
+        let window_end = self.file_scroll.saturating_add(visible_len);
+        if self.selected_file >= window_end {
+            self.file_scroll = self.selected_file.saturating_sub(visible_len - 1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    StageAll,
+    UnstageAll,
+}
+
+impl PendingAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StageAll => "stage all",
+            Self::UnstageAll => "unstage all",
+        }
+    }
+
+    fn operation(self) -> &'static str {
+        match self {
+            Self::StageAll => "stage_all",
+            Self::UnstageAll => "unstage_all",
+        }
     }
 }
 
@@ -415,7 +490,7 @@ impl Viewport {
 fn render(app: &App, frame: &mut ratatui::Frame<'_>, areas: &Viewport) {
     frame.render_widget(Clear, frame.area());
     frame.render_widget(repo_list(app), areas.repos);
-    frame.render_widget(status_panel(app), areas.status);
+    frame.render_widget(status_panel(app, areas.status), areas.status);
     frame.render_widget(details_panel(app), areas.details);
     if areas.queue.area() > 0 {
         frame.render_widget(queue_panel(app), areas.queue);
@@ -431,8 +506,28 @@ struct FileRow {
 }
 
 impl FileRow {
-    fn from_entry(entry: &StatusEntry) -> Self {
-        let section = FileSection::from_entry(entry);
+    fn from_entry(entry: &StatusEntry) -> Vec<Self> {
+        if entry.entry_type == StatusEntryType::Conflict {
+            return vec![Self::new(entry, FileSection::Conflict)];
+        }
+        if entry.entry_type == StatusEntryType::Untracked {
+            return vec![Self::new(entry, FileSection::Untracked)];
+        }
+        if entry.entry_type == StatusEntryType::Ignored {
+            return vec![Self::new(entry, FileSection::Ignored)];
+        }
+
+        let mut rows = Vec::new();
+        if entry.index != ChangeKind::Unmodified {
+            rows.push(Self::new(entry, FileSection::Staged));
+        }
+        if entry.worktree != ChangeKind::Unmodified {
+            rows.push(Self::new(entry, FileSection::Unstaged));
+        }
+        rows
+    }
+
+    fn new(entry: &StatusEntry, section: FileSection) -> Self {
         let label = format!("{} {}", section.marker(), entry.path.to_string_lossy());
         Self {
             path: entry.path.clone(),
@@ -452,20 +547,6 @@ enum FileSection {
 }
 
 impl FileSection {
-    fn from_entry(entry: &StatusEntry) -> Self {
-        if entry.entry_type == StatusEntryType::Conflict {
-            Self::Conflict
-        } else if entry.entry_type == StatusEntryType::Untracked {
-            Self::Untracked
-        } else if entry.entry_type == StatusEntryType::Ignored {
-            Self::Ignored
-        } else if entry.index != ChangeKind::Unmodified {
-            Self::Staged
-        } else {
-            Self::Unstaged
-        }
-    }
-
     fn marker(self) -> &'static str {
         match self {
             Self::Conflict => "UU",
@@ -495,13 +576,16 @@ fn repo_list(app: &App) -> List<'_> {
     List::new(items).block(panel_block("Repos", app.focus == Focus::Repos))
 }
 
-fn status_panel(app: &App) -> Paragraph<'_> {
+fn status_panel(app: &App, area: Rect) -> Paragraph<'_> {
+    let visible_len = status_visible_len(area);
     let lines = if app.files.is_empty() {
         vec![Line::from("working tree clean or unavailable")]
     } else {
         app.files
             .iter()
             .enumerate()
+            .skip(app.file_scroll)
+            .take(visible_len)
             .map(|(index, file)| {
                 let marker = if index == app.selected_file {
                     "> "
@@ -515,6 +599,10 @@ fn status_panel(app: &App) -> Paragraph<'_> {
     Paragraph::new(lines)
         .block(panel_block("Status", app.focus == Focus::Status))
         .wrap(Wrap { trim: true })
+}
+
+fn status_visible_len(area: Rect) -> usize {
+    area.height.saturating_sub(2).max(1) as usize
 }
 
 fn details_panel(app: &App) -> Paragraph<'_> {
@@ -578,10 +666,45 @@ fn current_dir() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_error| std::path::PathBuf::from("."))
 }
 
-fn operation_message(action: &str, result: Result<GitOutput, GitError>) -> String {
+fn operation_message(action: &str, result: Result<(), String>) -> String {
     match result {
-        Ok(_output) => format!("{action} succeeded"),
+        Ok(()) => format!("{action} succeeded"),
         Err(error) => format!("{action} failed: {error}"),
+    }
+}
+
+fn audit_operation(operation: &str, result: &Result<GitOutput, GitError>) -> Result<(), String> {
+    let paths = StorePaths::from_environment().map_err(|error| {
+        let message = operation_result_message(result);
+        format!("{message}; audit failed: {error}")
+    })?;
+    audit_operation_with_paths(operation, result, paths)
+}
+
+fn audit_operation_with_paths(
+    operation: &str,
+    result: &Result<GitOutput, GitError>,
+    paths: StorePaths,
+) -> Result<(), String> {
+    let result_label = if result.is_ok() { "ok" } else { "error" };
+    let message = operation_result_message(result);
+    let entry = AuditEntry::new(None, operation, result_label, message.clone())
+        .map_err(|error| format!("{message}; audit failed: {error}"))?;
+    let store =
+        LocalStore::open(paths).map_err(|error| format!("{message}; audit failed: {error}"))?;
+    store
+        .append_audit(entry)
+        .map_err(|error| format!("{message}; audit failed: {error}"))?;
+    result
+        .as_ref()
+        .map(|_output| ())
+        .map_err(ToString::to_string)
+}
+
+fn operation_result_message(result: &Result<GitOutput, GitError>) -> String {
+    match result {
+        Ok(_output) => "completed".to_owned(),
+        Err(error) => error.to_string(),
     }
 }
 
@@ -741,6 +864,84 @@ mod tests {
     }
 
     #[test]
+    fn partial_file_creates_staged_and_unstaged_rows() {
+        let entry = StatusEntry {
+            path: std::path::PathBuf::from("file.txt"),
+            original_path: None,
+            index: ChangeKind::Modified,
+            worktree: ChangeKind::Modified,
+            entry_type: StatusEntryType::Ordinary,
+        };
+
+        let rows = FileRow::from_entry(&entry);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section, FileSection::Staged);
+        assert_eq!(rows[1].section, FileSection::Unstaged);
+    }
+
+    #[test]
+    fn status_window_follows_selected_file() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+        app.last_viewport.status = Rect::new(0, 0, 30, 5);
+        let visible_len = status_visible_len(app.last_viewport.status);
+        app.files = (0..visible_len + 5)
+            .map(|index| FileRow {
+                path: std::path::PathBuf::from(format!("file-{index}.txt")),
+                label: format!("M file-{index}.txt"),
+                section: FileSection::Unstaged,
+            })
+            .collect();
+
+        for _ in 0..visible_len + 4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+
+        assert_eq!(app.selected_file, visible_len + 4);
+        assert_eq!(app.file_scroll, 5);
+        assert!(app.selected_file < app.file_scroll + visible_len);
+    }
+
+    #[test]
+    fn stage_all_requires_confirmation() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        assert_eq!(app.pending_confirmation, Some(PendingAction::StageAll));
+        assert!(app.details.contains("Stage all changes?"));
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn successful_stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("stage-audit")?;
+        let output = std::process::Command::new("git")
+            .arg("--version")
+            .output()?;
+        let result: Result<GitOutput, GitError> = Ok(GitOutput {
+            status: output.status,
+            stdout: String::from_utf8(output.stdout)?,
+            stderr: String::from_utf8(output.stderr)?,
+        });
+
+        audit_operation_with_paths("stage_path", &result, paths.clone())?;
+
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].operation, "stage_path");
+        assert_eq!(entries[0].result, "ok");
+        assert_eq!(entries[0].message, "completed");
+        Ok(())
+    }
+
+    #[test]
     fn renders_desktop_viewport() -> Result<(), Box<dyn Error>> {
         render_with_test_backend(120, 40)
     }
@@ -830,5 +1031,17 @@ mod tests {
         })?;
 
         Ok(())
+    }
+
+    fn isolated_store_paths(name: &str) -> Result<StorePaths, Box<dyn Error>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("bitbygit-tui-{name}-{}-{now}", std::process::id()));
+        Ok(StorePaths::from_roots(
+            root.join("config"),
+            root.join("data"),
+        ))
     }
 }
