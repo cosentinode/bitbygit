@@ -451,6 +451,7 @@ impl App {
                         &remote,
                         &upstream_branch,
                         upstream_oid.as_deref(),
+                        target.oid.as_deref(),
                     )
                 }),
                 Err(error) => error,
@@ -471,6 +472,7 @@ impl App {
                             &remote,
                             &upstream_branch,
                             upstream_oid.as_deref(),
+                            target.oid.as_deref(),
                         )
                     },
                 ),

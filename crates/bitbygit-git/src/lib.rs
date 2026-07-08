@@ -144,12 +144,17 @@ impl Git {
     }
 
     pub fn remote_push_url(&self, remote: &str) -> Result<Option<String>, GitError> {
-        let push_url =
-            self.config_value(["config", "--get", &format!("remote.{remote}.pushurl")])?;
-        if push_url.is_some() {
-            return Ok(push_url);
+        match self.run_args(vec![
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            "--push".to_owned(),
+            "--".to_owned(),
+            remote.to_owned(),
+        ]) {
+            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(2) => Ok(None),
+            Err(error) => Err(error),
         }
-        self.config_value(["config", "--get", &format!("remote.{remote}.url")])
     }
 
     pub fn pull(&self) -> Result<GitOutput, GitError> {
@@ -161,8 +166,10 @@ impl Git {
         remote: &str,
         branch: &str,
         expected_upstream_oid: Option<&str>,
+        expected_head_oid: Option<&str>,
     ) -> Result<GitOutput, GitError> {
         self.ensure_remote_tracking_unchanged(remote, branch, expected_upstream_oid, "pull")?;
+        self.ensure_head_unchanged(expected_head_oid, "pull")?;
         let merge_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
             message: "pull is blocked because the upstream ref is unavailable".to_owned(),
         })?;
@@ -182,6 +189,7 @@ impl Git {
         remote: &str,
         branch: &str,
         expected_upstream_oid: Option<&str>,
+        expected_head_oid: Option<&str>,
     ) -> Result<GitOutput, GitError> {
         self.ensure_remote_tracking_unchanged(
             remote,
@@ -189,6 +197,7 @@ impl Git {
             expected_upstream_oid,
             "pull rebase",
         )?;
+        self.ensure_head_unchanged(expected_head_oid, "pull rebase")?;
         let rebase_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
             message: "pull rebase is blocked because the upstream ref is unavailable".to_owned(),
         })?;
@@ -239,6 +248,21 @@ impl Git {
             return Err(GitError::Blocked {
                 message: format!(
                     "{operation} is blocked because the remote changed since the plan was shown"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_head_unchanged(
+        &self,
+        expected_head_oid: Option<&str>,
+        operation: &str,
+    ) -> Result<(), GitError> {
+        if self.head_commit()?.as_deref() != expected_head_oid {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{operation} is blocked because HEAD changed since the plan was shown"
                 ),
             });
         }
@@ -514,7 +538,6 @@ impl Git {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never")
-            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {
@@ -634,7 +657,6 @@ impl Git {
         command.env("GIT_ASKPASS", "");
         command.env("SSH_ASKPASS", "");
         command.env("SSH_ASKPASS_REQUIRE", "never");
-        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
         if literal_pathspecs {
             command.env("GIT_LITERAL_PATHSPECS", "1");
         }
@@ -668,7 +690,6 @@ impl Git {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never")
-            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {
