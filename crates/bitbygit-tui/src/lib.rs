@@ -45,13 +45,27 @@ impl TerminalSession {
     fn enter() -> Result<Self, Box<dyn Error>> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(
+        let setup = execute!(
             stdout,
             EnterAlternateScreen,
             event::EnableMouseCapture,
             crossterm::cursor::Hide
-        )?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        )
+        .and_then(|()| Terminal::new(CrosstermBackend::new(stdout)));
+
+        let terminal = match setup {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _raw = disable_raw_mode();
+                let _cleanup = execute!(
+                    io::stdout(),
+                    crossterm::cursor::Show,
+                    event::DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
+                return Err(Box::new(error));
+            }
+        };
         Ok(Self { terminal })
     }
 
@@ -108,9 +122,10 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Tab => self.focus = self.focus.next(),
-            KeyCode::BackTab => self.focus = self.focus.previous(),
+            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') if self.focus != Focus::Prompt => self.should_quit = true,
+            KeyCode::Tab => self.focus = self.next_visible_focus(),
+            KeyCode::BackTab => self.focus = self.previous_visible_focus(),
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
             KeyCode::Char(value) if self.focus == Focus::Prompt => self.prompt.push(value),
@@ -127,9 +142,39 @@ impl App {
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(focus) = self.last_viewport.focus_at(mouse.column, mouse.row) {
                     self.focus = focus;
+                    if focus == Focus::Repos {
+                        self.select_repo_at(mouse.row);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn next_visible_focus(&self) -> Focus {
+        let order = self.visible_focus_order();
+        cycle_focus(&order, self.focus, 1)
+    }
+
+    fn previous_visible_focus(&self) -> Focus {
+        let order = self.visible_focus_order();
+        cycle_focus(&order, self.focus, -1)
+    }
+
+    fn visible_focus_order(&self) -> Vec<Focus> {
+        let mut order = vec![Focus::Repos, Focus::Status, Focus::Details];
+        if self.last_viewport.queue.area() > 0 {
+            order.push(Focus::Queue);
+        }
+        order.push(Focus::Prompt);
+        order
+    }
+
+    fn select_repo_at(&mut self, row: u16) {
+        let first_row = self.last_viewport.repos.y.saturating_add(1);
+        let index = row.saturating_sub(first_row) as usize;
+        if index < self.repos.len() {
+            self.selected_repo = index;
         }
     }
 
@@ -161,26 +206,13 @@ pub enum Focus {
     Prompt,
 }
 
-impl Focus {
-    fn next(self) -> Self {
-        match self {
-            Self::Repos => Self::Status,
-            Self::Status => Self::Details,
-            Self::Details => Self::Queue,
-            Self::Queue => Self::Prompt,
-            Self::Prompt => Self::Repos,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Repos => Self::Prompt,
-            Self::Status => Self::Repos,
-            Self::Details => Self::Status,
-            Self::Queue => Self::Details,
-            Self::Prompt => Self::Queue,
-        }
-    }
+fn cycle_focus(order: &[Focus], current: Focus, offset: isize) -> Focus {
+    let Some(index) = order.iter().position(|focus| *focus == current) else {
+        return order.first().copied().unwrap_or(Focus::Repos);
+    };
+    let len = order.len() as isize;
+    let next = (index as isize + offset).rem_euclid(len) as usize;
+    order[next]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -367,12 +399,25 @@ mod tests {
     #[test]
     fn tab_cycles_visible_focus() {
         let mut app = App::new();
+        app.last_viewport = Viewport::split(Rect::new(0, 0, 120, 40));
         assert_eq!(app.focus(), Focus::Repos);
 
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus(), Focus::Status);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus(), Focus::Details);
+    }
+
+    #[test]
+    fn compact_focus_cycle_skips_hidden_queue() {
+        let mut app = App::new();
+        app.last_viewport = Viewport::split(Rect::new(0, 0, 40, 12));
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(app.focus(), Focus::Prompt);
     }
 
     #[test]
@@ -392,6 +437,16 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
 
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn q_is_text_when_prompt_is_focused() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        app.handle_key(key(KeyCode::Char('q')));
+
+        assert_eq!(app.prompt, "q");
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -425,6 +480,21 @@ mod tests {
         }));
 
         assert_eq!(app.focus(), Focus::Prompt);
+    }
+
+    #[test]
+    fn mouse_click_selects_repo_row() {
+        let mut app = App::new();
+        app.last_viewport = Viewport::split(Rect::new(0, 0, 100, 30));
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.last_viewport.repos.x + 1,
+            row: app.last_viewport.repos.y + 2,
+            modifiers: KeyModifiers::empty(),
+        }));
+
+        assert_eq!(app.focus(), Focus::Repos);
+        assert_eq!(app.selected_repo, 1);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
