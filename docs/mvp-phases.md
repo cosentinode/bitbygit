@@ -80,7 +80,7 @@ Success condition:
 
 Status:
 
-- in progress
+- merged
 
 Must have:
 
@@ -94,6 +94,10 @@ Success condition:
 - the app has a usable one-viewport shell that can host real Git workflows
 
 ## Phase 5: Status, staging, and diff views
+
+Status:
+
+- in progress
 
 Must have:
 

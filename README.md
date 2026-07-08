@@ -29,7 +29,7 @@ keeping risky operations visible, typed, previewed, and confirmed.
 
 ## Current Status
 
-The repository is in Phase 4 responsive TUI shell work. See
+The repository is in Phase 5 status, staging, and diff view work. See
 [`docs/mvp-phases.md`](docs/mvp-phases.md) for the implementation roadmap.
 
 ## Development

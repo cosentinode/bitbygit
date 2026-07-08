@@ -15,11 +15,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+use bitbygit_git::{ChangeKind, Git, GitError, GitOutput, StatusEntry, StatusEntryType};
+
 const MAX_PROMPT_LEN: usize = 512;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
     let mut app = App::new();
+    app.load_current_dir();
 
     loop {
         terminal.draw(|frame| {
@@ -100,6 +103,9 @@ pub struct App {
     prompt: String,
     repos: Vec<String>,
     selected_repo: usize,
+    files: Vec<FileRow>,
+    selected_file: usize,
+    details: String,
     should_quit: bool,
     last_viewport: Viewport,
 }
@@ -115,6 +121,9 @@ impl App {
                 "recent repositories".to_owned(),
             ],
             selected_repo: 0,
+            files: Vec::new(),
+            selected_file: 0,
+            details: "No repository status loaded yet.".to_owned(),
             should_quit: false,
             last_viewport: Viewport::default(),
         }
@@ -122,6 +131,10 @@ impl App {
 
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    pub fn load_current_dir(&mut self) {
+        self.refresh_status();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -135,6 +148,8 @@ impl App {
             KeyCode::BackTab => self.focus = self.previous_visible_focus(),
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
+            KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
+            KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
             KeyCode::Char(value)
                 if self.focus == Focus::Prompt
                     && prompt_accepts_modifiers(key.modifiers)
@@ -216,15 +231,83 @@ impl App {
     }
 
     fn move_selection_up(&mut self) {
-        if self.focus == Focus::Repos && self.selected_repo > 0 {
-            self.selected_repo -= 1;
+        match self.focus {
+            Focus::Repos if self.selected_repo > 0 => self.selected_repo -= 1,
+            Focus::Status if self.selected_file > 0 => {
+                self.selected_file -= 1;
+                self.refresh_diff();
+            }
+            _ => {}
         }
     }
 
     fn move_selection_down(&mut self) {
-        if self.focus == Focus::Repos && self.selected_repo + 1 < self.repos.len() {
-            self.selected_repo += 1;
+        match self.focus {
+            Focus::Repos if self.selected_repo + 1 < self.repos.len() => self.selected_repo += 1,
+            Focus::Status if self.selected_file + 1 < self.files.len() => {
+                self.selected_file += 1;
+                self.refresh_diff();
+            }
+            _ => {}
         }
+    }
+
+    fn refresh_status(&mut self) {
+        match Git::new(current_dir()).status() {
+            Ok(status) => {
+                self.files = status.entries.iter().map(FileRow::from_entry).collect();
+                self.files.sort_by(|left, right| {
+                    left.section
+                        .cmp(&right.section)
+                        .then(left.path.cmp(&right.path))
+                });
+                if self.selected_file >= self.files.len() {
+                    self.selected_file = self.files.len().saturating_sub(1);
+                }
+                self.refresh_diff();
+            }
+            Err(error) => {
+                self.files.clear();
+                self.selected_file = 0;
+                self.details = format!("Unable to read repository status: {error}");
+            }
+        }
+    }
+
+    fn refresh_diff(&mut self) {
+        let Some(file) = self.files.get(self.selected_file) else {
+            self.details = "No changed file selected.".to_owned();
+            return;
+        };
+        match Git::new(current_dir()).diff_path(&file.path, file.section == FileSection::Staged) {
+            Ok(diff) if diff.is_empty() && file.section == FileSection::Untracked => {
+                self.details =
+                    "Untracked file; stage it to include it in the next commit.".to_owned();
+            }
+            Ok(diff) if diff.is_empty() => {
+                self.details = "No textual diff for selected file.".to_owned();
+            }
+            Ok(diff) => self.details = diff,
+            Err(error) => self.details = format!("Unable to render diff: {error}"),
+        }
+    }
+
+    fn stage_selected_file(&mut self) {
+        let Some(file) = self.files.get(self.selected_file) else {
+            return;
+        };
+        let result = Git::new(current_dir()).stage_path(&file.path);
+        self.details = operation_message("stage", result);
+        self.refresh_status();
+    }
+
+    fn unstage_selected_file(&mut self) {
+        let Some(file) = self.files.get(self.selected_file) else {
+            return;
+        };
+        let result = Git::new(current_dir()).unstage_path(&file.path);
+        self.details = operation_message("unstage", result);
+        self.refresh_status();
     }
 }
 
@@ -340,6 +423,60 @@ fn render(app: &App, frame: &mut ratatui::Frame<'_>, areas: &Viewport) {
     frame.render_widget(prompt_panel(app), areas.prompt);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileRow {
+    path: std::path::PathBuf,
+    label: String,
+    section: FileSection,
+}
+
+impl FileRow {
+    fn from_entry(entry: &StatusEntry) -> Self {
+        let section = FileSection::from_entry(entry);
+        let label = format!("{} {}", section.marker(), entry.path.to_string_lossy());
+        Self {
+            path: entry.path.clone(),
+            label,
+            section,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FileSection {
+    Conflict,
+    Staged,
+    Unstaged,
+    Untracked,
+    Ignored,
+}
+
+impl FileSection {
+    fn from_entry(entry: &StatusEntry) -> Self {
+        if entry.entry_type == StatusEntryType::Conflict {
+            Self::Conflict
+        } else if entry.entry_type == StatusEntryType::Untracked {
+            Self::Untracked
+        } else if entry.entry_type == StatusEntryType::Ignored {
+            Self::Ignored
+        } else if entry.index != ChangeKind::Unmodified {
+            Self::Staged
+        } else {
+            Self::Unstaged
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Conflict => "UU",
+            Self::Staged => "S ",
+            Self::Unstaged => "M ",
+            Self::Untracked => "??",
+            Self::Ignored => "!!",
+        }
+    }
+}
+
 fn repo_list(app: &App) -> List<'_> {
     let items = app
         .repos
@@ -359,24 +496,29 @@ fn repo_list(app: &App) -> List<'_> {
 }
 
 fn status_panel(app: &App) -> Paragraph<'_> {
-    let lines = [
-        Line::from("branch: develop"),
-        Line::from("working tree: clean"),
-        Line::from("remote: origin"),
-        Line::from("sync: up to date"),
-    ];
-    Paragraph::new(lines.to_vec())
+    let lines = if app.files.is_empty() {
+        vec![Line::from("working tree clean or unavailable")]
+    } else {
+        app.files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let marker = if index == app.selected_file {
+                    "> "
+                } else {
+                    "  "
+                };
+                Line::from(format!("{marker}{}", file.label))
+            })
+            .collect::<Vec<_>>()
+    };
+    Paragraph::new(lines)
         .block(panel_block("Status", app.focus == Focus::Status))
         .wrap(Wrap { trim: true })
 }
 
 fn details_panel(app: &App) -> Paragraph<'_> {
-    let text = vec![
-        Line::from("Welcome to bitbygit."),
-        Line::from("This shell is wired for navigation first."),
-        Line::from("Git actions will enter through typed operations."),
-    ];
-    Paragraph::new(text)
+    Paragraph::new(app.details.clone())
         .block(panel_block("Details", app.focus == Focus::Details))
         .wrap(Wrap { trim: true })
 }
@@ -430,6 +572,17 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
+}
+
+fn current_dir() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_error| std::path::PathBuf::from("."))
+}
+
+fn operation_message(action: &str, result: Result<GitOutput, GitError>) -> String {
+    match result {
+        Ok(_output) => format!("{action} succeeded"),
+        Err(error) => format!("{action} failed: {error}"),
+    }
 }
 
 #[cfg(test)]

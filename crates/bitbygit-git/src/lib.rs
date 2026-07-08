@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::string::FromUtf8Error;
 
@@ -57,6 +57,36 @@ impl Git {
         parse_status_bytes(&output.stdout)
     }
 
+    pub fn stage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
+        self.run_path_args(["add"], Some(path))
+    }
+
+    pub fn unstage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
+        self.run_path_args(["restore", "--staged"], Some(path))
+    }
+
+    pub fn stage_all(&self) -> Result<GitOutput, GitError> {
+        self.run(["add", "--all"])
+    }
+
+    pub fn unstage_all(&self) -> Result<GitOutput, GitError> {
+        self.run_path_args(["restore", "--staged"], Some(Path::new(".")))
+    }
+
+    pub fn diff_path(&self, path: &Path, staged: bool) -> Result<String, GitError> {
+        let args = if staged {
+            vec![
+                OsString::from("diff"),
+                OsString::from("--cached"),
+                OsString::from("--"),
+            ]
+        } else {
+            vec![OsString::from("diff"), OsString::from("--")]
+        };
+        let output = self.run_os_args(args, Some(path))?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn run<const N: usize>(&self, args: [&str; N]) -> Result<GitOutput, GitError> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         self.run_args(args)
@@ -96,6 +126,72 @@ impl Git {
             status: output.status,
             stdout,
             stderr,
+        })
+    }
+
+    fn run_path_args<const N: usize>(
+        &self,
+        args: [&str; N],
+        path: Option<&Path>,
+    ) -> Result<GitOutput, GitError> {
+        let mut os_args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        if let Some(path) = path {
+            os_args.push(OsString::from("--"));
+            os_args.push(path.as_os_str().to_owned());
+        }
+        let output = self.run_os_args(os_args, None)?;
+        let stdout = String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stdout,
+            source,
+        })?;
+        let stderr = String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stderr,
+            source,
+        })?;
+        Ok(GitOutput {
+            status: output.status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn run_os_args(
+        &self,
+        mut args: Vec<OsString>,
+        path: Option<&Path>,
+    ) -> Result<RawProcessOutput, GitError> {
+        if let Some(path) = path {
+            args.push(path.as_os_str().to_owned());
+        }
+        let display_args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let output = Command::new("git")
+            .current_dir(&self.cwd)
+            .args(&args)
+            .output()
+            .map_err(|source| GitError::Io {
+                args: display_args.clone(),
+                source,
+            })?;
+
+        if !output.status.success() {
+            return Err(GitError::GitFailed {
+                args: display_args,
+                status: output.status,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(RawProcessOutput {
+            args: display_args,
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
     }
 
@@ -143,6 +239,14 @@ pub struct GitOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawGitOutput {
     stdout: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawProcessOutput {
+    args: Vec<String>,
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -970,6 +1074,67 @@ mod tests {
         let result = Git::new(repo.path()).upstream();
 
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stages_and_unstages_selected_path() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+
+        let git = Git::new(repo.path());
+        git.stage_path(Path::new("README.md"))?;
+        assert_eq!(git.status()?.staged_files().len(), 1);
+
+        git.unstage_path(Path::new("README.md"))?;
+        assert_eq!(git.status()?.staged_files().len(), 0);
+        assert_eq!(git.status()?.unstaged_files().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stages_and_unstages_all_paths() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("one.txt", "one\n")?;
+        repo.write("two.txt", "two\n")?;
+
+        let git = Git::new(repo.path());
+        git.stage_all()?;
+        assert_eq!(git.status()?.staged_files().len(), 2);
+
+        git.unstage_all()?;
+        assert_eq!(git.status()?.staged_files().len(), 0);
+        assert_eq!(git.status()?.untracked_files().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn returns_diff_for_selected_path() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+
+        let diff = Git::new(repo.path()).diff_path(Path::new("README.md"), false)?;
+
+        assert!(diff.contains("-initial"));
+        assert!(diff.contains("+changed"));
         Ok(())
     }
 
