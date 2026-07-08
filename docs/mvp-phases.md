@@ -97,7 +97,7 @@ Success condition:
 
 Status:
 
-- in progress
+- merged
 
 Must have:
 
@@ -110,6 +110,10 @@ Success condition:
 - users can inspect and prepare a commit from the TUI
 
 ## Phase 6: Guarded commit workflow
+
+Status:
+
+- in progress
 
 Must have:
 

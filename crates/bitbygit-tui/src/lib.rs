@@ -173,6 +173,7 @@ impl App {
             }
             KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
             KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
+            KeyCode::Enter if self.focus == Focus::Prompt => self.submit_prompt(),
             KeyCode::Char(value)
                 if self.focus == Focus::Prompt
                     && prompt_accepts_modifiers(key.modifiers)
@@ -364,15 +365,55 @@ impl App {
         let Some(action) = self.pending_confirmation.take() else {
             return;
         };
-        let message = run_audited_git_operation(action.label(), action.operation(), || {
-            let git = Git::new(current_dir());
-            match action {
-                PendingAction::StageAll => git.stage_all(),
-                PendingAction::UnstageAll => git.unstage_all(),
+        let message = match action {
+            action @ (PendingAction::StageAll | PendingAction::UnstageAll) => {
+                run_audited_git_operation(action.label(), action.operation(), || {
+                    let git = Git::new(current_dir());
+                    match action {
+                        PendingAction::StageAll => git.stage_all(),
+                        PendingAction::UnstageAll => git.unstage_all(),
+                        PendingAction::Commit { .. } => unreachable!(),
+                    }
+                })
             }
-        });
+            PendingAction::Commit { message, .. } => {
+                run_audited_git_operation_with_output("commit", "commit", || {
+                    Git::new(current_dir()).commit(&message)
+                })
+            }
+        };
         self.refresh_status();
         self.details = message;
+    }
+
+    fn submit_prompt(&mut self) {
+        let message = match parse_commit_prompt(&self.prompt) {
+            Ok(message) => message,
+            Err(error) => {
+                self.details = error;
+                return;
+            }
+        };
+        let status = match Git::new(current_dir()).status() {
+            Ok(status) => status,
+            Err(error) => {
+                self.details = format!("Unable to prepare commit plan: {error}");
+                return;
+            }
+        };
+        let staged_count = status.staged_files().len();
+        if staged_count == 0 {
+            self.details = "Commit blocked: there are no staged changes.".to_owned();
+            return;
+        }
+
+        self.pending_confirmation = Some(PendingAction::Commit {
+            message: message.clone(),
+        });
+        self.prompt.clear();
+        self.details = format!(
+            "Commit plan:\n- commit {staged_count} staged file(s)\n- message: {message}\nPress y to commit or n to cancel."
+        );
     }
 
     fn cancel_pending(&mut self) {
@@ -396,24 +437,27 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAction {
     StageAll,
     UnstageAll,
+    Commit { message: String },
 }
 
 impl PendingAction {
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Self::StageAll => "stage all",
             Self::UnstageAll => "unstage all",
+            Self::Commit { .. } => "commit",
         }
     }
 
-    fn operation(self) -> &'static str {
+    fn operation(&self) -> &'static str {
         match self {
             Self::StageAll => "stage_all",
             Self::UnstageAll => "unstage_all",
+            Self::Commit { .. } => "commit",
         }
     }
 }
@@ -781,6 +825,25 @@ fn run_audited_git_operation(
     operation_message(action, audit.finish(&result))
 }
 
+fn run_audited_git_operation_with_output(
+    action: &str,
+    operation: &str,
+    run: impl FnOnce() -> Result<GitOutput, GitError>,
+) -> String {
+    let audit = match begin_audit_operation(operation) {
+        Ok(audit) => audit,
+        Err(error) => return operation_message(action, Err(error)),
+    };
+    let result = run();
+    let output = git_result_output(&result);
+    match audit.finish(&result) {
+        Ok(()) if output.is_empty() => format!("{action} succeeded"),
+        Ok(()) => format!("{action} succeeded:\n{output}"),
+        Err(error) if output.is_empty() => format!("{action} failed: {error}"),
+        Err(error) => format!("{action} failed: {error}\n{output}"),
+    }
+}
+
 fn begin_audit_operation(operation: &str) -> Result<PendingAudit, String> {
     let paths = StorePaths::from_environment()
         .map_err(|error| format!("audit failed before operation: {error}"))?;
@@ -830,6 +893,59 @@ fn operation_result_message(result: &Result<GitOutput, GitError>) -> String {
         Ok(_output) => "completed".to_owned(),
         Err(error) => error.to_string(),
     }
+}
+
+fn git_result_output(result: &Result<GitOutput, GitError>) -> String {
+    match result {
+        Ok(output) => [output.stdout.trim(), output.stderr.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(error) => error.to_string(),
+    }
+}
+
+fn parse_commit_prompt(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower != "commit" && !lower.starts_with("commit ") {
+        return Err("Unsupported prompt. Try: commit -m \"message\"".to_owned());
+    }
+    let Some(rest) = trimmed.get("commit".len()..) else {
+        return Err("Unsupported prompt. Try: commit -m \"message\"".to_owned());
+    };
+    let mut message = rest.trim_start();
+    if message.is_empty() {
+        return Err("Commit message required. Try: commit -m \"message\"".to_owned());
+    }
+    if message == "-m" {
+        message = "";
+    } else if let Some(after_flag) = message.strip_prefix("-m ") {
+        message = after_flag.trim_start();
+    }
+    parse_commit_message(message)
+}
+
+fn parse_commit_message(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Commit message required. Try: commit -m \"message\"".to_owned());
+    }
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let Some(end) = rest.find('"') else {
+            return Err("Unclosed commit message quote.".to_owned());
+        };
+        if !rest[end + 1..].trim().is_empty() {
+            return Err("Unexpected text after commit message.".to_owned());
+        }
+        let message = &rest[..end];
+        if message.trim().is_empty() {
+            return Err("Commit message cannot be empty.".to_owned());
+        }
+        return Ok(message.to_owned());
+    }
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -966,6 +1082,27 @@ mod tests {
         app.handle_key(key(KeyCode::Char('\u{00e9}')));
 
         assert_eq!(app.prompt.len(), MAX_PROMPT_LEN - 1);
+    }
+
+    #[test]
+    fn parses_commit_prompt_with_message() {
+        assert_eq!(
+            parse_commit_prompt("commit -m \"fix auth and routing\""),
+            Ok("fix auth and routing".to_owned())
+        );
+        assert_eq!(
+            parse_commit_prompt("commit ship staged work"),
+            Ok("ship staged work".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_commit_prompts() {
+        assert!(parse_commit_prompt("commit").is_err());
+        assert!(parse_commit_prompt("commit -m \"").is_err());
+        assert!(parse_commit_prompt("commit -m \"message\" trailing").is_err());
+        assert!(parse_commit_prompt("commitment -m \"message\"").is_err());
+        assert!(parse_commit_prompt("git commit -m \"message\"").is_err());
     }
 
     #[test]

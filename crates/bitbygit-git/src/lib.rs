@@ -94,6 +94,14 @@ impl Git {
         self.run(["restore", "--staged", ":/"])
     }
 
+    pub fn commit(&self, message: &str) -> Result<GitOutput, GitError> {
+        self.run_args(vec![
+            "commit".to_owned(),
+            "-m".to_owned(),
+            message.to_owned(),
+        ])
+    }
+
     pub fn diff_path(&self, path: &Path, staged: bool) -> Result<String, GitError> {
         self.diff_paths(&[path.to_path_buf()], staged)
     }
@@ -1243,6 +1251,37 @@ mod tests {
         git.unstage_paths(&paths)?;
 
         assert_eq!(git.status()?.staged_files().len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn commits_staged_changes_with_message() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+
+        let output = Git::new(repo.path()).commit("initial commit")?;
+
+        assert!(output.stdout.contains("initial commit"));
+        assert!(Git::new(repo.path()).status()?.is_clean());
+        Ok(())
+    }
+
+    #[test]
+    fn commit_message_is_passed_without_shell_execution() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+
+        Git::new(repo.path()).commit("literal $(touch owned)")?;
+
+        assert!(!repo.path().join("owned").exists());
         Ok(())
     }
 
