@@ -17,9 +17,9 @@ impl Git {
 
     pub fn repository(&self) -> Result<Repository, GitError> {
         let root = self.repo_root()?;
-        let branch = self.branch_state()?;
         let remotes = self.remotes()?;
         let status = self.status()?;
+        let branch = status.branch.clone();
 
         Ok(Repository {
             root,
@@ -31,7 +31,7 @@ impl Git {
 
     pub fn repo_root(&self) -> Result<PathBuf, GitError> {
         let output = self.run(["rev-parse", "--show-toplevel"])?;
-        Ok(PathBuf::from(output.stdout.trim()))
+        Ok(PathBuf::from(strip_line_ending(&output.stdout)))
     }
 
     pub fn branch_state(&self) -> Result<BranchState, GitError> {
@@ -46,18 +46,20 @@ impl Git {
 
     pub fn upstream(&self) -> Result<Option<String>, GitError> {
         match self.run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
-            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
-            Err(GitError::GitFailed { .. }) => Ok(None),
+            Ok(output) => Ok(Some(strip_line_ending(&output.stdout).to_owned())),
+            Err(GitError::GitFailed { stderr, .. }) if is_missing_upstream_error(&stderr) => {
+                Ok(None)
+            }
             Err(error) => Err(error),
         }
     }
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {
-        let output = self.run(["status", "--porcelain=v2", "--branch"])?;
+        let output = self.run(["status", "--porcelain=v2", "--branch", "-z"])?;
         parse_status(&output.stdout)
     }
 
-    pub fn run<const N: usize>(&self, args: [&str; N]) -> Result<GitOutput, GitError> {
+    fn run<const N: usize>(&self, args: [&str; N]) -> Result<GitOutput, GitError> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         self.run_args(args)
     }
@@ -199,6 +201,7 @@ pub struct BranchState {
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    pub unborn: bool,
 }
 
 impl Default for BranchState {
@@ -208,6 +211,7 @@ impl Default for BranchState {
             upstream: None,
             ahead: 0,
             behind: 0,
+            unborn: false,
         }
     }
 }
@@ -240,7 +244,12 @@ impl WorktreeStatus {
     pub fn staged_files(&self) -> Vec<&StatusEntry> {
         self.entries
             .iter()
-            .filter(|entry| entry.index != ChangeKind::Unmodified)
+            .filter(|entry| {
+                matches!(
+                    entry.entry_type,
+                    StatusEntryType::Ordinary | StatusEntryType::Renamed
+                ) && entry.index != ChangeKind::Unmodified
+            })
             .collect()
     }
 
@@ -304,13 +313,28 @@ pub enum ChangeKind {
 }
 
 pub fn parse_status(input: &str) -> Result<WorktreeStatus, GitError> {
+    if input.contains('\0') {
+        return parse_status_records(input.split('\0').filter(|record| !record.is_empty()), true);
+    }
+
+    parse_status_records(input.lines(), false)
+}
+
+fn parse_status_records<'a>(
+    records: impl IntoIterator<Item = &'a str>,
+    nul_delimited: bool,
+) -> Result<WorktreeStatus, GitError> {
     let mut branch = BranchState::default();
     let mut oid = None;
     let mut entries = Vec::new();
+    let mut records = records.into_iter();
 
-    for line in input.lines() {
+    while let Some(line) = records.next() {
         if let Some(value) = line.strip_prefix("# branch.oid ") {
             oid = Some(value.to_owned());
+            if value == "(initial)" {
+                branch.unborn = true;
+            }
             continue;
         }
 
@@ -363,7 +387,16 @@ pub fn parse_status(input: &str) -> Result<WorktreeStatus, GitError> {
         }
 
         if line.starts_with("2 ") {
-            entries.push(parse_renamed_entry(line)?);
+            let original_path = if nul_delimited {
+                Some(
+                    records
+                        .next()
+                        .ok_or_else(|| parse_error("renamed entry missing original path"))?,
+                )
+            } else {
+                None
+            };
+            entries.push(parse_renamed_entry(line, original_path)?);
             continue;
         }
 
@@ -415,19 +448,22 @@ fn parse_ordinary_entry(line: &str) -> Result<StatusEntry, GitError> {
     })
 }
 
-fn parse_renamed_entry(line: &str) -> Result<StatusEntry, GitError> {
+fn parse_renamed_entry(line: &str, original_path: Option<&str>) -> Result<StatusEntry, GitError> {
     let parts = line.splitn(10, ' ').collect::<Vec<_>>();
     let xy = parts
         .get(1)
         .copied()
         .ok_or_else(|| parse_error("renamed entry missing status"))?;
-    let path_pair = parts
+    let path = parts
         .get(9)
         .copied()
         .ok_or_else(|| parse_error("renamed entry missing path"))?;
-    let (path, original_path) = path_pair
-        .split_once('\t')
-        .ok_or_else(|| parse_error("renamed entry missing original path"))?;
+    let (path, original_path) = match original_path {
+        Some(original_path) => (path, original_path),
+        None => path
+            .split_once('\t')
+            .ok_or_else(|| parse_error("renamed entry missing original path"))?,
+    };
     let (index, worktree) = parse_xy(xy)?;
 
     Ok(StatusEntry {
@@ -506,6 +542,16 @@ fn parse_remotes(input: &str) -> Vec<Remote> {
     }
 
     remotes.into_values().collect()
+}
+
+fn strip_line_ending(value: &str) -> &str {
+    value.trim_end_matches(['\r', '\n'])
+}
+
+fn is_missing_upstream_error(stderr: &str) -> bool {
+    stderr.contains("no upstream configured")
+        || stderr.contains("no upstream branch")
+        || stderr.contains("ambiguous argument '@{u}'")
 }
 
 fn parse_error(message: &str) -> GitError {
@@ -588,8 +634,71 @@ mod tests {
         )?;
 
         assert_eq!(status.conflicted_files().len(), 1);
+        assert_eq!(status.staged_files().len(), 0);
         assert_eq!(status.entries[0].entry_type, StatusEntryType::Conflict);
         Ok(())
+    }
+
+    #[test]
+    fn parses_detached_head() -> Result<(), Box<dyn Error>> {
+        let status = parse_status("# branch.oid abc123\n# branch.head (detached)\n")?;
+
+        assert_eq!(status.branch.head, Head::Detached("abc123".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_unborn_branch() -> Result<(), Box<dyn Error>> {
+        let status = parse_status("# branch.oid (initial)\n# branch.head main\n")?;
+
+        assert_eq!(status.branch.head, Head::Branch("main".to_owned()));
+        assert!(status.branch.unborn);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_nul_delimited_raw_paths() -> Result<(), Box<dyn Error>> {
+        let status = parse_status("# branch.head main\0? café.txt\0? tab\tname.txt\0")?;
+
+        assert_eq!(status.untracked_files().len(), 2);
+        assert_eq!(status.entries[0].path, "café.txt");
+        assert_eq!(status.entries[1].path, "tab\tname.txt");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_nul_delimited_rename() -> Result<(), Box<dyn Error>> {
+        let status = parse_status(concat!(
+            "# branch.head main\0",
+            "2 R. N... 100644 100644 100644 abc def R100 new\tname.txt\0",
+            "old name.txt\0"
+        ))?;
+
+        assert_eq!(status.entries[0].entry_type, StatusEntryType::Renamed);
+        assert_eq!(status.entries[0].path, "new\tname.txt");
+        assert_eq!(
+            status.entries[0].original_path,
+            Some("old name.txt".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_remotes() {
+        let remotes = parse_remotes(
+            "origin\thttps://github.com/cosentinode/bitbygit.git (fetch)\norigin\tgit@github.com:cosentinode/bitbygit.git (push)\n",
+        );
+
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "origin");
+        assert_eq!(
+            remotes[0].fetch_url,
+            Some("https://github.com/cosentinode/bitbygit.git".to_owned())
+        );
+        assert_eq!(
+            remotes[0].push_url,
+            Some("git@github.com:cosentinode/bitbygit.git".to_owned())
+        );
     }
 
     #[test]
@@ -638,6 +747,75 @@ mod tests {
 
         assert_eq!(status.conflicted_files().len(), 1);
         assert_eq!(status.conflicted_files()[0].path, "conflict.txt");
+        Ok(())
+    }
+
+    #[test]
+    fn reads_raw_paths_from_temp_repo() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.write("café.txt", "unicode\n")?;
+        repo.write("tab\tname.txt", "tab\n")?;
+
+        let status = Git::new(repo.path()).status()?;
+
+        assert_eq!(status.untracked_files().len(), 2);
+        assert!(status.entries.iter().any(|entry| entry.path == "café.txt"));
+        assert!(
+            status
+                .entries
+                .iter()
+                .any(|entry| entry.path == "tab\tname.txt")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_missing_is_none() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+
+        assert_eq!(Git::new(repo.path()).upstream()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_present_is_returned() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run([
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ])?;
+        repo.run(["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+        repo.run(["branch", "--set-upstream-to", "origin/main"])?;
+
+        assert_eq!(
+            Git::new(repo.path()).upstream()?,
+            Some("origin/main".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_invalid_repo_is_error() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+
+        let result = Git::new(repo.path()).upstream();
+
+        assert!(result.is_err());
         Ok(())
     }
 
