@@ -29,6 +29,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         terminal.draw(|frame| {
             let areas = Viewport::split(frame.area());
             app.ensure_visible_focus(&areas);
+            app.clamp_file_scroll_for(areas.status);
             render(&app, frame, &areas);
             app.last_viewport = areas;
         })?;
@@ -318,9 +319,13 @@ impl App {
     }
 
     fn stage_selected_file(&mut self) {
-        let Some(file) = self.files.get(self.selected_file) else {
+        let Some(file) = self.files.get(self.selected_file).cloned() else {
             return;
         };
+        if !file.can_stage() {
+            self.details = "Selected row has no unstaged changes to stage.".to_owned();
+            return;
+        }
         let result = Git::new(current_dir()).stage_path(&file.path);
         let message = operation_message("stage", audit_operation("stage_path", &result));
         self.refresh_status();
@@ -328,9 +333,13 @@ impl App {
     }
 
     fn unstage_selected_file(&mut self) {
-        let Some(file) = self.files.get(self.selected_file) else {
+        let Some(file) = self.files.get(self.selected_file).cloned() else {
             return;
         };
+        if !file.can_unstage() {
+            self.details = "Selected row has no staged changes to unstage.".to_owned();
+            return;
+        }
         let result = Git::new(current_dir()).unstage_path(&file.path);
         let message = operation_message("unstage", audit_operation("unstage_path", &result));
         self.refresh_status();
@@ -353,7 +362,11 @@ impl App {
     }
 
     fn clamp_file_scroll(&mut self) {
-        let visible_len = status_visible_len(self.last_viewport.status);
+        self.clamp_file_scroll_for(self.last_viewport.status);
+    }
+
+    fn clamp_file_scroll_for(&mut self, area: Rect) {
+        let visible_len = status_visible_len(area);
         if self.selected_file < self.file_scroll {
             self.file_scroll = self.selected_file;
         }
@@ -528,12 +541,28 @@ impl FileRow {
     }
 
     fn new(entry: &StatusEntry, section: FileSection) -> Self {
-        let label = format!("{} {}", section.marker(), entry.path.to_string_lossy());
+        let label = format!(
+            "{} {} {}",
+            section.marker(),
+            change_label(entry, section),
+            path_label(entry)
+        );
         Self {
             path: entry.path.clone(),
             label,
             section,
         }
+    }
+
+    fn can_stage(&self) -> bool {
+        matches!(
+            self.section,
+            FileSection::Unstaged | FileSection::Untracked | FileSection::Conflict
+        )
+    }
+
+    fn can_unstage(&self) -> bool {
+        self.section == FileSection::Staged
     }
 }
 
@@ -555,6 +584,42 @@ impl FileSection {
             Self::Untracked => "??",
             Self::Ignored => "!!",
         }
+    }
+}
+
+fn change_label(entry: &StatusEntry, section: FileSection) -> &'static str {
+    match section {
+        FileSection::Conflict => "U",
+        FileSection::Staged => change_kind_label(entry.index),
+        FileSection::Unstaged => change_kind_label(entry.worktree),
+        FileSection::Untracked => "?",
+        FileSection::Ignored => "!",
+    }
+}
+
+fn change_kind_label(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Unmodified => ".",
+        ChangeKind::Modified => "M",
+        ChangeKind::Added => "A",
+        ChangeKind::Deleted => "D",
+        ChangeKind::Renamed => "R",
+        ChangeKind::Copied => "C",
+        ChangeKind::Unmerged => "U",
+        ChangeKind::Untracked => "?",
+        ChangeKind::Ignored => "!",
+        ChangeKind::Unknown(_code) => "?",
+    }
+}
+
+fn path_label(entry: &StatusEntry) -> String {
+    match &entry.original_path {
+        Some(original_path) => format!(
+            "{} -> {}",
+            original_path.to_string_lossy(),
+            entry.path.to_string_lossy()
+        ),
+        None => entry.path.to_string_lossy().into_owned(),
     }
 }
 
@@ -878,6 +943,34 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].section, FileSection::Staged);
         assert_eq!(rows[1].section, FileSection::Unstaged);
+        assert!(!rows[0].can_stage());
+        assert!(rows[0].can_unstage());
+        assert!(rows[1].can_stage());
+        assert!(!rows[1].can_unstage());
+    }
+
+    #[test]
+    fn rename_and_delete_rows_show_change_details() {
+        let renamed = StatusEntry {
+            path: std::path::PathBuf::from("new.txt"),
+            original_path: Some(std::path::PathBuf::from("old.txt")),
+            index: ChangeKind::Renamed,
+            worktree: ChangeKind::Unmodified,
+            entry_type: StatusEntryType::Renamed,
+        };
+        let deleted = StatusEntry {
+            path: std::path::PathBuf::from("deleted.txt"),
+            original_path: None,
+            index: ChangeKind::Unmodified,
+            worktree: ChangeKind::Deleted,
+            entry_type: StatusEntryType::Ordinary,
+        };
+
+        let renamed_rows = FileRow::from_entry(&renamed);
+        let deleted_rows = FileRow::from_entry(&deleted);
+
+        assert!(renamed_rows[0].label.contains("R old.txt -> new.txt"));
+        assert!(deleted_rows[0].label.contains("D deleted.txt"));
     }
 
     #[test]
@@ -904,6 +997,26 @@ mod tests {
     }
 
     #[test]
+    fn status_window_reclamps_after_resize() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+        app.last_viewport.status = Rect::new(0, 0, 30, 10);
+        app.files = (0..10)
+            .map(|index| FileRow {
+                path: std::path::PathBuf::from(format!("file-{index}.txt")),
+                label: format!("M file-{index}.txt"),
+                section: FileSection::Unstaged,
+            })
+            .collect();
+        app.selected_file = 7;
+        app.clamp_file_scroll();
+
+        app.clamp_file_scroll_for(Rect::new(0, 0, 30, 3));
+
+        assert_eq!(app.file_scroll, 7);
+    }
+
+    #[test]
     fn stage_all_requires_confirmation() {
         let mut app = App::new();
         app.focus = Focus::Status;
@@ -920,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
+    fn stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
         let paths = isolated_store_paths("stage-audit")?;
         let output = std::process::Command::new("git")
             .arg("--version")
@@ -931,13 +1044,35 @@ mod tests {
             stderr: String::from_utf8(output.stderr)?,
         });
 
-        audit_operation_with_paths("stage_path", &result, paths.clone())?;
+        for operation in ["stage_path", "unstage_path", "stage_all", "unstage_all"] {
+            audit_operation_with_paths(operation, &result, paths.clone())?;
+        }
 
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].operation, "stage_path");
-        assert_eq!(entries[0].result, "ok");
-        assert_eq!(entries[0].message, "completed");
+        assert_eq!(entries[1].operation, "unstage_path");
+        assert_eq!(entries[2].operation, "stage_all");
+        assert_eq!(entries[3].operation, "unstage_all");
+        assert!(entries.iter().all(|entry| entry.result == "ok"));
+        assert!(entries.iter().all(|entry| entry.message == "completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("failed-stage-audit")?;
+        let result = Git::new("/definitely/not/a/bitbygit/repo").stage_all();
+
+        let audit_result = audit_operation_with_paths("stage_all", &result, paths.clone());
+
+        assert!(result.is_err());
+        assert!(audit_result.is_err());
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].operation, "stage_all");
+        assert_eq!(entries[0].result, "error");
+        assert_ne!(entries[0].message, "completed");
         Ok(())
     }
 

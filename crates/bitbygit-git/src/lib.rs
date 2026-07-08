@@ -62,6 +62,13 @@ impl Git {
     }
 
     pub fn unstage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
+        if self.is_unborn()? {
+            return self.run_path_args(
+                ["rm", "--cached", "--ignore-unmatch", "-r"],
+                Some(path),
+                true,
+            );
+        }
         self.run_path_args(["restore", "--staged"], Some(path), true)
     }
 
@@ -70,6 +77,9 @@ impl Git {
     }
 
     pub fn unstage_all(&self) -> Result<GitOutput, GitError> {
+        if self.is_unborn()? {
+            return self.run(["rm", "--cached", "--ignore-unmatch", "-r", ":/"]);
+        }
         self.run(["restore", "--staged", ":/"])
     }
 
@@ -90,6 +100,10 @@ impl Git {
     fn run<const N: usize>(&self, args: [&str; N]) -> Result<GitOutput, GitError> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         self.run_args(args)
+    }
+
+    fn is_unborn(&self) -> Result<bool, GitError> {
+        Ok(self.branch_state()?.unborn)
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
@@ -1124,6 +1138,39 @@ mod tests {
     }
 
     #[test]
+    fn unstages_selected_path_in_unborn_repository() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+
+        let git = Git::new(repo.path());
+        git.unstage_path(Path::new("README.md"))?;
+
+        let status = git.status()?;
+        assert_eq!(status.staged_files().len(), 0);
+        assert_eq!(status.untracked_files().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unstages_all_paths_in_unborn_repository() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.write("one.txt", "one\n")?;
+        repo.write("two.txt", "two\n")?;
+        repo.run(["add", "one.txt", "two.txt"])?;
+
+        let git = Git::new(repo.path());
+        git.unstage_all()?;
+
+        let status = git.status()?;
+        assert_eq!(status.staged_files().len(), 0);
+        assert_eq!(status.untracked_files().len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn returns_diff_for_selected_path() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         repo.run(["init", "-b", "main"])?;
@@ -1142,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_selected_path_treats_pathspec_magic_as_literal() -> Result<(), Box<dyn Error>> {
+    fn selected_path_operations_treat_pathspec_magic_as_literal() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         repo.run(["init", "-b", "main"])?;
         repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
@@ -1155,6 +1202,10 @@ mod tests {
         repo.write(":(glob)*", "changed\n")?;
 
         let git = Git::new(repo.path());
+        let diff = git.diff_path(Path::new(":(glob)*"), false)?;
+        assert!(diff.contains("-literal"));
+        assert!(!diff.contains("-initial"));
+
         git.stage_path(Path::new(":(glob)*"))?;
         let status = git.status()?;
 
@@ -1162,6 +1213,11 @@ mod tests {
         assert_eq!(status.unstaged_files().len(), 1);
         assert_eq!(status.staged_files()[0].path, PathBuf::from(":(glob)*"));
         assert_eq!(status.unstaged_files()[0].path, PathBuf::from("README.md"));
+
+        git.unstage_path(Path::new(":(glob)*"))?;
+        let status = git.status()?;
+        assert_eq!(status.staged_files().len(), 0);
+        assert_eq!(status.unstaged_files().len(), 2);
         Ok(())
     }
 
