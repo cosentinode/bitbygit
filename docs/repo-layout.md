@@ -32,6 +32,7 @@ bitbygit/
     guardrails.md
     mvp-phases.md
     repo-layout.md
+    tui-smoke-test.md
 
   scripts/
     setup-dev.sh

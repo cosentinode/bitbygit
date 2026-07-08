@@ -151,7 +151,11 @@ impl App {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+            {
+                self.handle_key(key);
+            }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(focus) = self.last_viewport.focus_at(mouse.column, mouse.row) {
                     self.focus = focus;
@@ -432,6 +436,7 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseEvent};
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn tab_cycles_visible_focus() {
@@ -519,6 +524,19 @@ mod tests {
     }
 
     #[test]
+    fn key_repeat_events_are_handled() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        app.handle_event(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        )));
+
+        assert_eq!(app.prompt, "x");
+    }
+
+    #[test]
     fn modified_prompt_chords_are_ignored() {
         let mut app = App::new();
         app.focus = Focus::Prompt;
@@ -567,6 +585,21 @@ mod tests {
 
         assert_eq!(viewport.queue.area(), 0);
         assert!(viewport.prompt.height > 0);
+    }
+
+    #[test]
+    fn renders_desktop_viewport() -> Result<(), Box<dyn Error>> {
+        render_with_test_backend(120, 40)
+    }
+
+    #[test]
+    fn renders_compact_viewport() -> Result<(), Box<dyn Error>> {
+        render_with_test_backend(40, 12)
+    }
+
+    #[test]
+    fn renders_tiny_viewport() -> Result<(), Box<dyn Error>> {
+        render_with_test_backend(20, 8)
     }
 
     #[test]
@@ -630,5 +663,19 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn render_with_test_backend(width: u16, height: u16) -> Result<(), Box<dyn Error>> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::new();
+
+        terminal.draw(|frame| {
+            let viewport = Viewport::split(frame.area());
+            app.ensure_visible_focus(&viewport);
+            render(&app, frame, &viewport);
+        })?;
+
+        Ok(())
     }
 }
