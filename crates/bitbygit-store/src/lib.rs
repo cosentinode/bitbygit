@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
-use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
@@ -69,8 +70,7 @@ impl LocalStore {
         let now = now_secs()?;
         let id = RepoId::from_path(&root);
         let mut records = self.load_registry_map()?;
-        let mut state = self.load_state()?;
-        let old_records = records.clone();
+        let _state = self.load_state()?;
         let record = if let Some(record) = records.get_mut(&id) {
             if record.path != root {
                 return Err(StoreError::RepositoryIdCollision {
@@ -91,31 +91,22 @@ impl LocalStore {
             records.insert(id, record.clone());
             record
         };
-        push_recent(&mut state.recent_repos, record.id.clone());
 
         self.save_registry(records.into_values())?;
-        if let Err(error) = self.save_state(&state) {
-            self.save_registry(old_records.into_values())?;
-            return Err(error);
-        }
         Ok(record)
     }
 
     pub fn remove_repository(&self, id: &RepoId) -> Result<Option<RepositoryRecord>, StoreError> {
         let mut records = self.load_registry_map()?;
         let mut state = self.load_state()?;
-        let old_records = records.clone();
         let removed = records.remove(id);
         if state.active_repo.as_ref() == Some(id) {
             state.active_repo = None;
         }
         state.recent_repos.retain(|repo_id| repo_id != id);
 
+        self.save_state(&state)?;
         self.save_registry(records.into_values())?;
-        if let Err(error) = self.save_state(&state) {
-            self.save_registry(old_records.into_values())?;
-            return Err(error);
-        }
 
         Ok(removed)
     }
@@ -531,12 +522,12 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
 
 #[cfg(windows)]
 fn replace_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if path.exists() {
+        let _bytes = fs::copy(tmp_path, path)?;
+        fs::remove_file(tmp_path)
+    } else {
+        fs::rename(tmp_path, path)
     }
-    fs::rename(tmp_path, path)
 }
 
 #[cfg(not(windows))]
@@ -667,34 +658,40 @@ fn format_state(state: &AppState) -> String {
 
 fn parse_audit_entries(contents: &str) -> Result<Vec<AuditEntry>, StoreError> {
     let mut entries = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
+    let lines = contents.lines().collect::<Vec<_>>();
+    let line_count = lines.len();
+    for (index, line) in lines.into_iter().enumerate() {
         if line.is_empty() {
             continue;
         }
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() != 5 {
-            if index + 1 == contents.lines().count() {
-                break;
-            }
-            return Err(parse_store_error(format!(
-                "audit line {} has {} fields",
-                index + 1,
-                fields.len()
-            )));
+        match parse_audit_entry(line, index + 1) {
+            Ok(entry) => entries.push(entry),
+            Err(_) if index + 1 == line_count => break,
+            Err(error) => return Err(error),
         }
-        entries.push(AuditEntry {
-            timestamp: parse_u64(fields[0], "timestamp")?,
-            repo_id: if fields[1] == "-" {
-                None
-            } else {
-                Some(RepoId::parse(fields[1])?)
-            },
-            operation: decode_string(fields[2])?,
-            result: decode_string(fields[3])?,
-            message: decode_string(fields[4])?,
-        });
     }
     Ok(entries)
+}
+
+fn parse_audit_entry(line: &str, line_number: usize) -> Result<AuditEntry, StoreError> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 5 {
+        return Err(parse_store_error(format!(
+            "audit line {line_number} has {} fields",
+            fields.len()
+        )));
+    }
+    Ok(AuditEntry {
+        timestamp: parse_u64(fields[0], "timestamp")?,
+        repo_id: if fields[1] == "-" {
+            None
+        } else {
+            Some(RepoId::parse(fields[1])?)
+        },
+        operation: decode_string(fields[2])?,
+        result: decode_string(fields[3])?,
+        message: decode_string(fields[4])?,
+    })
 }
 
 fn format_audit_entry(entry: &AuditEntry) -> String {
@@ -941,6 +938,20 @@ mod tests {
         store.append_audit(entry.clone())?;
         let mut contents = fs::read_to_string(&store.paths().audit_file)?;
         contents.push_str("truncated\tline\n");
+        fs::write(&store.paths().audit_file, contents)?;
+
+        assert_eq!(store.list_audit_entries()?, vec![entry]);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_reader_ignores_final_line_with_corrupt_fields() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        let entry = AuditEntry::new(None, "refresh", "ok", "ready")?;
+        store.append_audit(entry.clone())?;
+        let mut contents = fs::read_to_string(&store.paths().audit_file)?;
+        contents.push_str("not-a-number\t-\tzz\tzz\tzz\n");
         fs::write(&store.paths().audit_file, contents)?;
 
         assert_eq!(store.list_audit_entries()?, vec![entry]);
