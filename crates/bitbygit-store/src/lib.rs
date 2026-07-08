@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -121,19 +122,24 @@ impl LocalStore {
     pub fn list_repository_statuses(&self) -> Result<Vec<RepositoryStatus>, StoreError> {
         self.list_repositories()?
             .into_iter()
-            .map(|record| {
-                let status = match bitbygit_git::Git::new(&record.path).repo_root() {
-                    Ok(root) if root == record.path => RepositoryHealth::Valid,
-                    Ok(root) => RepositoryHealth::Invalid {
-                        message: format!("repository root moved to {}", root.display()),
-                    },
-                    Err(error) => RepositoryHealth::Invalid {
-                        message: error.to_string(),
-                    },
-                };
-                Ok(RepositoryStatus { record, status })
-            })
+            .map(|record| self.repository_status(record))
             .collect()
+    }
+
+    pub fn repository_status(
+        &self,
+        record: RepositoryRecord,
+    ) -> Result<RepositoryStatus, StoreError> {
+        let status = match bitbygit_git::Git::new(&record.path).repo_root() {
+            Ok(root) if root == record.path => RepositoryHealth::Valid,
+            Ok(root) => RepositoryHealth::Invalid {
+                message: format!("repository root moved to {}", root.display()),
+            },
+            Err(error) => RepositoryHealth::Invalid {
+                message: error.to_string(),
+            },
+        };
+        Ok(RepositoryStatus { record, status })
     }
 
     pub fn load_state(&self) -> Result<AppState, StoreError> {
@@ -141,7 +147,7 @@ impl LocalStore {
         let Some(contents) = contents else {
             return Ok(AppState::default());
         };
-        parse_state(&contents)
+        parse_state(&contents).map_err(|error| attach_parse_path(error, &self.paths.state_file))
     }
 
     pub fn set_active_repository(&self, id: Option<RepoId>) -> Result<(), StoreError> {
@@ -165,9 +171,20 @@ impl LocalStore {
             })?;
         }
 
-        let mut entries = self.list_audit_entries()?;
-        entries.push(entry);
-        write_atomic(&self.paths.audit_file, &format_audit_entries(&entries))
+        let line = format_audit_entry(&entry);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.paths.audit_file)
+            .map_err(|source| StoreError::Io {
+                path: self.paths.audit_file.clone(),
+                source,
+            })?;
+        file.write_all(line.as_bytes())
+            .map_err(|source| StoreError::Io {
+                path: self.paths.audit_file.clone(),
+                source,
+            })
     }
 
     pub fn list_audit_entries(&self) -> Result<Vec<AuditEntry>, StoreError> {
@@ -176,6 +193,7 @@ impl LocalStore {
             return Ok(Vec::new());
         };
         parse_audit_entries(&contents)
+            .map_err(|error| attach_parse_path(error, &self.paths.audit_file))
     }
 
     fn touch_recent(&self, id: &RepoId) -> Result<(), StoreError> {
@@ -202,6 +220,7 @@ impl LocalStore {
             return Ok(BTreeMap::new());
         };
         parse_registry(&contents)
+            .map_err(|error| attach_parse_path(error, &self.paths.registry_file))
     }
 
     fn save_registry(
@@ -519,20 +538,18 @@ fn parse_audit_entries(contents: &str) -> Result<Vec<AuditEntry>, StoreError> {
     Ok(entries)
 }
 
-fn format_audit_entries(entries: &[AuditEntry]) -> String {
+fn format_audit_entry(entry: &AuditEntry) -> String {
     let mut output = String::new();
-    for entry in entries {
-        output.push_str(&entry.timestamp.to_string());
-        output.push('\t');
-        output.push_str(entry.repo_id.as_ref().map(RepoId::as_str).unwrap_or("-"));
-        output.push('\t');
-        output.push_str(&encode_string(&entry.operation));
-        output.push('\t');
-        output.push_str(&encode_string(&entry.result));
-        output.push('\t');
-        output.push_str(&encode_string(&entry.message));
-        output.push('\n');
-    }
+    output.push_str(&entry.timestamp.to_string());
+    output.push('\t');
+    output.push_str(entry.repo_id.as_ref().map(RepoId::as_str).unwrap_or("-"));
+    output.push('\t');
+    output.push_str(&encode_string(&entry.operation));
+    output.push('\t');
+    output.push_str(&encode_string(&entry.result));
+    output.push('\t');
+    output.push_str(&encode_string(&entry.message));
+    output.push('\n');
     output
 }
 
@@ -546,6 +563,19 @@ fn parse_store_error(message: String) -> StoreError {
     StoreError::Parse {
         path: None,
         message,
+    }
+}
+
+fn attach_parse_path(error: StoreError, file_path: &Path) -> StoreError {
+    match error {
+        StoreError::Parse {
+            path: None,
+            message,
+        } => StoreError::Parse {
+            path: Some(file_path.to_path_buf()),
+            message,
+        },
+        other => other,
     }
 }
 
@@ -727,6 +757,21 @@ mod tests {
         store.append_audit(entry.clone())?;
 
         assert_eq!(fixture.store()?.list_audit_entries()?, vec![entry]);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_state_parse_error_includes_file_path() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        fs::write(&store.paths().state_file, "bad-line\n")?;
+
+        let result = store.load_state();
+
+        assert!(matches!(
+            result,
+            Err(StoreError::Parse { path: Some(_), .. })
+        ));
         Ok(())
     }
 
