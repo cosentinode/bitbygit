@@ -11,6 +11,7 @@ use std::string::FromUtf8Error;
 use std::os::unix::ffi::OsStringExt;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const COMMIT_HOOKS: &[&str] = &[
     "pre-commit",
     "prepare-commit-msg",
@@ -105,18 +106,24 @@ impl Git {
 
     pub fn commit(&self, message: &str) -> Result<GitOutput, GitError> {
         let staged_tree = self.staged_tree()?;
-        let head = self.head_commit()?;
-        self.commit_staged_tree(message, &staged_tree, head.as_deref())
+        let target = self.head_target()?;
+        self.commit_staged_tree(message, &staged_tree, &target)
     }
 
     pub fn commit_staged_tree(
         &self,
         message: &str,
         staged_tree: &str,
-        expected_head: Option<&str>,
+        target: &HeadTarget,
     ) -> Result<GitOutput, GitError> {
+        if self.head_target()? != *target {
+            return Err(GitError::Blocked {
+                message: "guarded commit is blocked because the target ref changed".to_owned(),
+            });
+        }
+        self.ensure_staged_tree_is_not_empty_commit(staged_tree, target)?;
         self.ensure_guarded_commit_supported()?;
-        let parent = expected_head.map(ToOwned::to_owned);
+        let parent = target.oid.clone();
         let mut commit_args = vec!["commit-tree".to_owned(), staged_tree.to_owned()];
         if let Some(parent) = &parent {
             commit_args.push("-p".to_owned());
@@ -137,7 +144,7 @@ impl Git {
             "update-ref".to_owned(),
             "-m".to_owned(),
             "bitbygit commit".to_owned(),
-            "HEAD".to_owned(),
+            target.reference.as_deref().unwrap_or("HEAD").to_owned(),
             commit_id.clone(),
         ];
         update_args.push(parent.unwrap_or_else(|| ZERO_OID.to_owned()));
@@ -197,6 +204,44 @@ impl Git {
                 .trim()
                 .to_owned(),
         ))
+    }
+
+    pub fn head_target(&self) -> Result<HeadTarget, GitError> {
+        Ok(HeadTarget {
+            oid: self.head_commit()?,
+            reference: self.symbolic_head()?,
+        })
+    }
+
+    fn symbolic_head(&self) -> Result<Option<String>, GitError> {
+        match self.run(["symbolic-ref", "--quiet", "HEAD"]) {
+            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn ensure_staged_tree_is_not_empty_commit(
+        &self,
+        staged_tree: &str,
+        target: &HeadTarget,
+    ) -> Result<(), GitError> {
+        let parent_tree = match &target.oid {
+            Some(parent) => self
+                .run_args(vec!["rev-parse".to_owned(), format!("{parent}^{{tree}}")])?
+                .stdout
+                .trim()
+                .to_owned(),
+            None => EMPTY_TREE_OID.to_owned(),
+        };
+
+        if parent_tree == staged_tree {
+            return Err(GitError::Blocked {
+                message: "guarded commit is blocked because there are no staged changes".to_owned(),
+            });
+        }
+
+        Ok(())
     }
 
     fn ensure_guarded_commit_supported(&self) -> Result<(), GitError> {
@@ -449,6 +494,12 @@ pub struct GitOutput {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadTarget {
+    pub oid: Option<String>,
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1453,11 +1504,11 @@ mod tests {
         repo.run(["add", "README.md"])?;
         let git = Git::new(repo.path());
         let confirmed_tree = git.staged_tree()?;
-        let confirmed_head = git.head_commit()?;
+        let target = git.head_target()?;
 
         repo.write("injected.txt", "not confirmed\n")?;
         repo.run(["add", "injected.txt"])?;
-        git.commit_staged_tree("initial commit", &confirmed_tree, confirmed_head.as_deref())?;
+        git.commit_staged_tree("initial commit", &confirmed_tree, &target)?;
 
         let files = repo.git_stdout(["ls-tree", "--name-only", "HEAD"])?;
         assert!(files.contains("README.md"));
@@ -1479,7 +1530,8 @@ mod tests {
         repo.run(["add", "README.md"])?;
         let git = Git::new(repo.path());
         let confirmed_tree = git.staged_tree()?;
-        let Some(confirmed_head) = git.head_commit()? else {
+        let target = git.head_target()?;
+        let Some(confirmed_head) = target.oid.clone() else {
             return Err("expected repository to have HEAD".into());
         };
         let base_tree = repo.git_stdout(["rev-parse", "HEAD^{tree}"])?;
@@ -1493,14 +1545,66 @@ mod tests {
         ])?;
         repo.run_args(&["update-ref", "HEAD", external_commit.trim()])?;
 
-        let result = git.commit_staged_tree("confirmed", &confirmed_tree, Some(&confirmed_head));
+        let result = git.commit_staged_tree("confirmed", &confirmed_tree, &target);
 
         let Err(error) = result else {
             return Err("expected stale HEAD rejection".into());
         };
-        assert!(matches!(error, GitError::GitFailed { .. }));
+        assert!(error.to_string().contains("target ref changed"));
         let head = repo.git_stdout(["rev-parse", "HEAD"])?;
         assert_eq!(head.trim(), external_commit.trim());
+        Ok(())
+    }
+
+    #[test]
+    fn commit_staged_tree_rejects_changed_head_ref() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+        repo.run(["add", "README.md"])?;
+        let git = Git::new(repo.path());
+        let confirmed_tree = git.staged_tree()?;
+        let target = git.head_target()?;
+        repo.run(["branch", "other"])?;
+        repo.run(["checkout", "other"])?;
+
+        let result = git.commit_staged_tree("confirmed", &confirmed_tree, &target);
+
+        let Err(error) = result else {
+            return Err("expected stale ref rejection".into());
+        };
+        assert!(error.to_string().contains("target ref changed"));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "other"])?.trim(),
+            target.oid.as_deref().unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_staged_tree_blocks_empty_commit() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        let git = Git::new(repo.path());
+        let tree = git.staged_tree()?;
+        let target = git.head_target()?;
+
+        let result = git.commit_staged_tree("empty", &tree, &target);
+
+        let Err(error) = result else {
+            return Err("expected empty commit guardrail".into());
+        };
+        assert!(error.to_string().contains("no staged changes"));
         Ok(())
     }
 
@@ -1515,9 +1619,9 @@ mod tests {
         repo.run(["add", "README.md"])?;
         let git = Git::new(repo.path());
         let tree = git.staged_tree()?;
-        let head = git.head_commit()?;
+        let target = git.head_target()?;
 
-        let result = git.commit_staged_tree("initial", &tree, head.as_deref());
+        let result = git.commit_staged_tree("initial", &tree, &target);
 
         let Err(error) = result else {
             return Err("expected gpgsign guardrail".into());
@@ -1544,9 +1648,9 @@ mod tests {
         fs::set_permissions(&hook, permissions)?;
         let git = Git::new(repo.path());
         let tree = git.staged_tree()?;
-        let head = git.head_commit()?;
+        let target = git.head_target()?;
 
-        let result = git.commit_staged_tree("initial", &tree, head.as_deref());
+        let result = git.commit_staged_tree("initial", &tree, &target);
 
         let Err(error) = result else {
             return Err("expected hook guardrail".into());

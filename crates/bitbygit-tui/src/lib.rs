@@ -15,7 +15,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use bitbygit_git::{ChangeKind, Git, GitError, GitOutput, StatusEntry, StatusEntryType};
+use bitbygit_git::{
+    ChangeKind, Git, GitError, GitOutput, HeadTarget, StatusEntry, StatusEntryType,
+};
 use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
@@ -380,24 +382,24 @@ impl App {
                 message,
                 staged_items,
                 staged_tree,
-                head,
+                target,
             } => match Git::new(current_dir()).status() {
                 Ok(current_status) if staged_plan_items(&current_status.entries) == staged_items =>
                 {
                     let git = Git::new(current_dir());
-                    match (git.staged_tree(), git.head_commit()) {
-                        (Ok(current_tree), Ok(current_head))
-                            if current_tree == staged_tree && current_head == head =>
+                    match (git.staged_tree(), git.head_target()) {
+                        (Ok(current_tree), Ok(current_target))
+                            if current_tree == staged_tree && current_target == target =>
                         {
                             run_audited_git_operation_with_output("commit", "commit", || {
                                 Git::new(current_dir()).commit_staged_tree(
                                     &message,
                                     &staged_tree,
-                                    head.as_deref(),
+                                    &target,
                                 )
                             })
                         }
-                        (Ok(_current_tree), Ok(_current_head)) => "Commit blocked: repository state changed since the plan was shown. Re-run the commit prompt.".to_owned(),
+                        (Ok(_current_tree), Ok(_current_target)) => "Commit blocked: repository state changed since the plan was shown. Re-run the commit prompt.".to_owned(),
                         (Err(error), _) => format!("Unable to validate staged content: {error}"),
                         (_, Err(error)) => format!("Unable to validate commit target: {error}"),
                     }
@@ -438,8 +440,8 @@ impl App {
                 return;
             }
         };
-        let head = match git.head_commit() {
-            Ok(head) => head,
+        let target = match git.head_target() {
+            Ok(target) => target,
             Err(error) => {
                 self.details = format!("Unable to snapshot commit target: {error}");
                 return;
@@ -451,7 +453,7 @@ impl App {
             message: message.clone(),
             staged_items,
             staged_tree,
-            head,
+            target,
         });
         self.prompt.clear();
         self.details = format!(
@@ -488,7 +490,7 @@ enum PendingAction {
         message: String,
         staged_items: Vec<String>,
         staged_tree: String,
-        head: Option<String>,
+        target: HeadTarget,
     },
 }
 

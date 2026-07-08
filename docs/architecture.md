@@ -90,7 +90,8 @@ before supporting concurrent app instances.
 ## Git Boundary
 
 The MVP uses system `git` instead of a Git library. This preserves user Git
-configuration, credential helpers, signing, hooks, and SSH setup. See
+configuration, credential helpers, signing, hooks, and SSH setup where
+compatible with operation guardrails. See
 [`adr/0001-system-git-first.md`](adr/0001-system-git-first.md).
 
 Git commands must be executed through typed wrappers with argument arrays.
