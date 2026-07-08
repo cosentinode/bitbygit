@@ -203,7 +203,11 @@ impl LocalStore {
             .map_err(|source| StoreError::Io {
                 path: self.paths.audit_file.clone(),
                 source,
-            })
+            })?;
+        file.sync_all().map_err(|source| StoreError::Io {
+            path: self.paths.audit_file.clone(),
+            source,
+        })
     }
 
     pub fn list_audit_entries(&self) -> Result<Vec<AuditEntry>, StoreError> {
@@ -501,7 +505,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
             });
         }
 
-        if let Err(source) = fs::rename(&tmp_path, path) {
+        if let Err(source) = replace_file(&tmp_path, path) {
             let _cleanup = fs::remove_file(&tmp_path);
             return Err(StoreError::Io {
                 path: path.to_path_buf(),
@@ -523,6 +527,21 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
             )
         }),
     })
+}
+
+#[cfg(windows)]
+fn replace_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(tmp_path, path)
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(tmp_path, path)
 }
 
 #[cfg(unix)]
@@ -654,6 +673,9 @@ fn parse_audit_entries(contents: &str) -> Result<Vec<AuditEntry>, StoreError> {
         }
         let fields = line.split('\t').collect::<Vec<_>>();
         if fields.len() != 5 {
+            if index + 1 == contents.lines().count() {
+                break;
+            }
             return Err(parse_store_error(format!(
                 "audit line {} has {} fields",
                 index + 1,
@@ -912,6 +934,48 @@ mod tests {
     }
 
     #[test]
+    fn audit_reader_keeps_valid_entries_before_truncated_tail() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        let entry = AuditEntry::new(None, "refresh", "ok", "ready")?;
+        store.append_audit(entry.clone())?;
+        let mut contents = fs::read_to_string(&store.paths().audit_file)?;
+        contents.push_str("truncated\tline\n");
+        fs::write(&store.paths().audit_file, contents)?;
+
+        assert_eq!(store.list_audit_entries()?, vec![entry]);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_state_rewrites_replace_existing_file() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        let record = store.add_repository(repo.path())?;
+
+        store.set_active_repository(Some(record.id.clone()))?;
+        store.set_active_repository(None)?;
+
+        assert_eq!(store.load_state()?.active_repo, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_preserves_non_utf8_repository_roots() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo_with_raw_suffix(b"repo-\xff")?;
+        let store = fixture.store()?;
+
+        let record = store.add_repository(repo.path())?;
+        let reloaded = fixture.store()?.list_repositories()?;
+
+        assert_eq!(reloaded, vec![record]);
+        Ok(())
+    }
+
+    #[test]
     fn corrupt_state_parse_error_includes_file_path() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new()?;
         let store = fixture.store()?;
@@ -1075,6 +1139,17 @@ mod tests {
 
         fn git_repo(&self, name: &str) -> Result<GitRepo, Box<dyn Error>> {
             let path = self.path.join(name);
+            self.init_git_repo(path)
+        }
+
+        #[cfg(unix)]
+        fn git_repo_with_raw_suffix(&self, suffix: &[u8]) -> Result<GitRepo, Box<dyn Error>> {
+            let mut name = Vec::from(b"repo-" as &[u8]);
+            name.extend_from_slice(suffix);
+            self.init_git_repo(self.path.join(OsString::from_vec(name)))
+        }
+
+        fn init_git_repo(&self, path: PathBuf) -> Result<GitRepo, Box<dyn Error>> {
             fs::create_dir_all(&path)?;
             run_git(&path, ["init", "-b", "main"])?;
             run_git(&path, ["config", "user.email", "bitbygit@example.invalid"])?;
