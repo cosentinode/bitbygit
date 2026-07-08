@@ -39,6 +39,11 @@ impl StorePaths {
 }
 
 #[derive(Debug, Clone)]
+/// File-backed local state store.
+///
+/// This MVP store is single-writer by design. Callers should route mutations
+/// through one app runtime; multi-process locking belongs with a later
+/// concurrent runtime phase.
 pub struct LocalStore {
     paths: StorePaths,
 }
@@ -883,6 +888,22 @@ mod tests {
             statuses[0].status,
             RepositoryHealth::Invalid { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_repository_is_reported_as_invalid_without_breaking_list()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        let record = store.add_repository(repo.path())?;
+        fs::remove_dir_all(repo.path())?;
+
+        let status = store.repository_status_by_id(&record.id)?;
+
+        assert_eq!(status.record.id, record.id);
+        assert!(matches!(status.status, RepositoryHealth::Invalid { .. }));
         Ok(())
     }
 

@@ -83,6 +83,10 @@ The executor may run processes, but only from validated operation plans.
 Future phases should add crates only when the boundary is useful in practice.
 Likely future crates include `bitbygit-tui` and `bitbygit-gh`.
 
+The initial store is a single-writer file-backed store. The TUI should route
+mutations through one runtime owner; multi-process locking is a later concern
+before supporting concurrent app instances.
+
 ## Git Boundary
 
 The MVP uses system `git` instead of a Git library. This preserves user Git
