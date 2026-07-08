@@ -112,7 +112,14 @@ impl LocalStore {
     }
 
     pub fn list_repositories(&self) -> Result<Vec<RepositoryRecord>, StoreError> {
-        Ok(self.load_registry_map()?.into_values().collect())
+        let mut records = self.load_registry_map()?.into_values().collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.added_at.cmp(&right.added_at))
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(records)
     }
 
     /// Checks every registered repository synchronously.
@@ -495,9 +502,10 @@ fn read_snapshot_optional(
     }
 
     if saw_snapshot {
-        return Err(parse_store_error(
-            "no valid store snapshot found".to_owned(),
-        ));
+        return Err(StoreError::Parse {
+            path: Some(path.to_path_buf()),
+            message: "no valid store snapshot found".to_owned(),
+        });
     }
 
     Ok(Some(contents))
@@ -511,6 +519,8 @@ fn write_snapshot(path: &Path, contents: &str) -> Result<(), StoreError> {
         })?;
     }
 
+    // Append-only snapshots avoid cross-platform replace semantics. A later
+    // compaction pass can safely rewrite history once file locking exists.
     let line = format!(
         "snapshot\t{}\t{}\n",
         contents.len(),
@@ -638,7 +648,7 @@ fn parse_audit_entries(contents: &str) -> Result<Vec<AuditEntry>, StoreError> {
         }
         match parse_audit_entry(line, index + 1) {
             Ok(entry) => entries.push(entry),
-            Err(_) if index + 1 == line_count => break,
+            Err(_) if index + 1 == line_count && !contents.ends_with('\n') => break,
             Err(error) => return Err(error),
         }
     }
@@ -909,7 +919,7 @@ mod tests {
         let entry = AuditEntry::new(None, "refresh", "ok", "ready")?;
         store.append_audit(entry.clone())?;
         let mut contents = fs::read_to_string(&store.paths().audit_file)?;
-        contents.push_str("truncated\tline\n");
+        contents.push_str("truncated\tline");
         fs::write(&store.paths().audit_file, contents)?;
 
         assert_eq!(store.list_audit_entries()?, vec![entry]);
@@ -923,10 +933,27 @@ mod tests {
         let entry = AuditEntry::new(None, "refresh", "ok", "ready")?;
         store.append_audit(entry.clone())?;
         let mut contents = fs::read_to_string(&store.paths().audit_file)?;
-        contents.push_str("not-a-number\t-\tzz\tzz\tzz\n");
+        contents.push_str("not-a-number\t-\tzz\tzz\tzz");
         fs::write(&store.paths().audit_file, contents)?;
 
         assert_eq!(store.list_audit_entries()?, vec![entry]);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_reader_rejects_newline_terminated_corruption() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        let entry = AuditEntry::new(None, "refresh", "ok", "ready")?;
+        store.append_audit(entry)?;
+        let mut contents = fs::read_to_string(&store.paths().audit_file)?;
+        contents.push_str("not-a-number\t-\tzz\tzz\tzz\n");
+        fs::write(&store.paths().audit_file, contents)?;
+
+        assert!(matches!(
+            store.list_audit_entries(),
+            Err(StoreError::Parse { .. })
+        ));
         Ok(())
     }
 
