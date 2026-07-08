@@ -18,13 +18,17 @@ or responsive layout behavior.
    should not insert prompt text, and `q` should be inserted rather than exit.
 8. With staged changes present, focus the prompt, enter `commit -m "smoke test"`,
    and confirm the visible commit plan can be cancelled with `n`.
-9. Press `Esc`, `q` outside the prompt, and `Ctrl+C` in separate runs; each should
-   exit cleanly.
-10. After exit, confirm the shell prompt, cursor, mouse behavior, and terminal echo
-   are restored.
+9. Focus the prompt and enter `fetch` in a repository with a remote; confirm it
+   runs and refreshes status.
+10. Focus the prompt and enter `push`, `pull`, and `pull --rebase`; confirm
+    visible risky plans can be cancelled with `n`.
+11. Press `Esc`, `q` outside the prompt, and `Ctrl+C` in separate runs; each should
+    exit cleanly.
+12. After exit, confirm the shell prompt, cursor, mouse behavior, and terminal echo
+    are restored.
 
 ## Automated Coverage
 
 Unit tests cover focus cycling, compact layout behavior, prompt input guards,
-mouse focus/selection, guarded commit prompt parsing, and render smoke tests with
-`ratatui`'s test backend.
+mouse focus/selection, guarded commit and sync prompt parsing, branch summaries,
+and render smoke tests with `ratatui`'s test backend.

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
@@ -60,6 +61,240 @@ impl Git {
 
     pub fn upstream(&self) -> Result<Option<String>, GitError> {
         Ok(self.status()?.branch.upstream)
+    }
+
+    pub fn fetch_default_remote(&self) -> Result<GitOutput, GitError> {
+        self.run(["fetch"])
+    }
+
+    pub fn push_current_branch(
+        &self,
+        remote: &str,
+        branch: &str,
+        source_oid: &str,
+        expected_remote_oid: Option<&str>,
+    ) -> Result<GitOutput, GitError> {
+        self.ensure_push_is_fast_forward(source_oid, expected_remote_oid)?;
+        let mut args = vec![
+            "push".to_owned(),
+            force_with_lease_arg(branch, expected_remote_oid),
+        ];
+        args.extend([
+            "--".to_owned(),
+            remote.to_owned(),
+            format!("{source_oid}:refs/heads/{branch}"),
+        ]);
+        self.run_args(args)
+    }
+
+    pub fn push_current_branch_set_upstream(
+        &self,
+        remote: &str,
+        branch: &str,
+        source_oid: &str,
+        expected_remote_oid: Option<&str>,
+    ) -> Result<GitOutput, GitError> {
+        let push = self.push_current_branch(remote, branch, source_oid, expected_remote_oid)?;
+        let upstream = self.run_args(vec![
+            "branch".to_owned(),
+            format!("--set-upstream-to={}", remote_tracking_ref(remote, branch)),
+            branch.to_owned(),
+        ])?;
+        Ok(combine_outputs(push, upstream))
+    }
+
+    fn ensure_push_is_fast_forward(
+        &self,
+        source_oid: &str,
+        expected_remote_oid: Option<&str>,
+    ) -> Result<(), GitError> {
+        let Some(expected_remote_oid) = expected_remote_oid else {
+            return Ok(());
+        };
+        match self.run_args(vec![
+            "merge-base".to_owned(),
+            "--is-ancestor".to_owned(),
+            expected_remote_oid.to_owned(),
+            source_oid.to_owned(),
+        ]) {
+            Ok(_output) => Ok(()),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => {
+                Err(GitError::Blocked {
+                    message: "push is blocked because it would not fast-forward the planned remote"
+                        .to_owned(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn remote_head_oid(&self, remote: &str, branch: &str) -> Result<Option<String>, GitError> {
+        self.head_oid_at(remote, branch)
+    }
+
+    pub fn remote_url_head_oid(&self, url: &str, branch: &str) -> Result<Option<String>, GitError> {
+        self.head_oid_at(url, branch)
+    }
+
+    fn head_oid_at(&self, target: &str, branch: &str) -> Result<Option<String>, GitError> {
+        let output = self.run_args(vec![
+            "ls-remote".to_owned(),
+            "--heads".to_owned(),
+            "--".to_owned(),
+            target.to_owned(),
+            format!("refs/heads/{branch}"),
+        ])?;
+        Ok(output
+            .stdout
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .map(ToOwned::to_owned))
+    }
+
+    pub fn remote_push_urls(&self, remote: &str) -> Result<Vec<String>, GitError> {
+        match self.run_args(vec![
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            "--push".to_owned(),
+            "--all".to_owned(),
+            "--".to_owned(),
+            remote.to_owned(),
+        ]) {
+            Ok(output) => Ok(output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(2) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn pull(&self) -> Result<GitOutput, GitError> {
+        self.run(["pull", "--ff-only"])
+    }
+
+    pub fn pull_ff_only_from(
+        &self,
+        remote: &str,
+        branch: &str,
+        expected_upstream_oid: Option<&str>,
+        expected_target: &HeadTarget,
+    ) -> Result<GitOutput, GitError> {
+        self.ensure_remote_tracking_unchanged(remote, branch, expected_upstream_oid, "pull")?;
+        self.ensure_head_target_unchanged(expected_target, "pull")?;
+        let merge_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
+            message: "pull is blocked because the upstream ref is unavailable".to_owned(),
+        })?;
+        self.run_args(vec![
+            "merge".to_owned(),
+            "--ff-only".to_owned(),
+            merge_target.to_owned(),
+        ])
+    }
+
+    pub fn pull_rebase(&self) -> Result<GitOutput, GitError> {
+        self.run(["pull", "--rebase"])
+    }
+
+    pub fn pull_rebase_from(
+        &self,
+        remote: &str,
+        branch: &str,
+        expected_upstream_oid: Option<&str>,
+        expected_target: &HeadTarget,
+    ) -> Result<GitOutput, GitError> {
+        self.ensure_remote_tracking_unchanged(
+            remote,
+            branch,
+            expected_upstream_oid,
+            "pull rebase",
+        )?;
+        self.ensure_head_target_unchanged(expected_target, "pull rebase")?;
+        let rebase_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
+            message: "pull rebase is blocked because the upstream ref is unavailable".to_owned(),
+        })?;
+        self.run_args(vec!["rebase".to_owned(), rebase_target.to_owned()])
+    }
+
+    pub fn upstream_push_target(&self, branch: &str) -> Result<Option<(String, String)>, GitError> {
+        let remote = self.config_value(["config", "--get", &format!("branch.{branch}.remote")])?;
+        let merge = self.config_value(["config", "--get", &format!("branch.{branch}.merge")])?;
+        let (Some(remote), Some(merge)) = (remote, merge) else {
+            return Ok(None);
+        };
+        let branch = merge
+            .strip_prefix("refs/heads/")
+            .unwrap_or(merge.as_str())
+            .to_owned();
+        Ok(Some((remote, branch)))
+    }
+
+    pub fn remote_tracking_oid(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<Option<String>, GitError> {
+        self.ref_oid(&remote_tracking_ref(remote, branch))
+    }
+
+    pub fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+        self.run_args(vec![
+            "fetch".to_owned(),
+            "--".to_owned(),
+            remote.to_owned(),
+            format!(
+                "+refs/heads/{branch}:{}",
+                remote_tracking_ref(remote, branch)
+            ),
+        ])
+    }
+
+    fn ensure_remote_tracking_unchanged(
+        &self,
+        remote: &str,
+        branch: &str,
+        expected_oid: Option<&str>,
+        operation: &str,
+    ) -> Result<(), GitError> {
+        if self.remote_tracking_oid(remote, branch)?.as_deref() != expected_oid {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{operation} is blocked because the remote changed since the plan was shown"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_head_target_unchanged(
+        &self,
+        expected_target: &HeadTarget,
+        operation: &str,
+    ) -> Result<(), GitError> {
+        if self.head_target()? != *expected_target {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{operation} is blocked because the branch target changed since the plan was shown"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ref_oid(&self, reference: &str) -> Result<Option<String>, GitError> {
+        match self.run_args(vec![
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            reference.to_owned(),
+        ]) {
+            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {
@@ -313,8 +548,20 @@ impl Git {
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .current_dir(&self.cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never");
+        if env::var_os("GIT_SSH_COMMAND").is_none() {
+            command.env(
+                "GIT_SSH_COMMAND",
+                "ssh -oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes",
+            );
+        }
+        let output = command
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {
@@ -430,6 +677,10 @@ impl Git {
             .collect::<Vec<_>>();
         let mut command = Command::new("git");
         command.current_dir(&self.cwd).args(&args);
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env("GIT_ASKPASS", "");
+        command.env("SSH_ASKPASS", "");
+        command.env("SSH_ASKPASS_REQUIRE", "never");
         if literal_pathspecs {
             command.env("GIT_LITERAL_PATHSPECS", "1");
         }
@@ -459,6 +710,10 @@ impl Git {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let output = Command::new("git")
             .current_dir(&self.cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {
@@ -1019,6 +1274,35 @@ fn parse_error(message: &str) -> GitError {
     }
 }
 
+fn remote_tracking_ref(remote: &str, branch: &str) -> String {
+    format!("refs/remotes/{remote}/{branch}")
+}
+
+fn force_with_lease_arg(branch: &str, expected_remote_oid: Option<&str>) -> String {
+    format!(
+        "--force-with-lease=refs/heads/{branch}:{}",
+        expected_remote_oid.unwrap_or("")
+    )
+}
+
+fn combine_outputs(first: GitOutput, second: GitOutput) -> GitOutput {
+    let stdout = [first.stdout.trim(), second.stdout.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stderr = [first.stderr.trim(), second.stderr.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    GitOutput {
+        status: second.status,
+        stdout,
+        stderr,
+    }
+}
+
 #[cfg(unix)]
 fn hook_is_enabled(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1491,6 +1775,35 @@ mod tests {
         Git::new(repo.path()).commit("literal $(touch owned)")?;
 
         assert!(!repo.path().join("owned").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn push_current_branch_set_upstream_sets_tracking_branch() -> Result<(), Box<dyn Error>> {
+        let remote = TempRepo::new()?;
+        remote.run(["init", "--bare"])?;
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        let remote_path = remote.path().to_string_lossy().into_owned();
+        repo.run_args(&["remote", "add", "origin", &remote_path])?;
+
+        let head = repo.git_stdout(["rev-parse", "HEAD"])?;
+        Git::new(repo.path()).push_current_branch_set_upstream(
+            "origin",
+            "main",
+            head.trim(),
+            None,
+        )?;
+
+        assert_eq!(
+            Git::new(repo.path()).upstream()?,
+            Some("origin/main".to_owned())
+        );
         Ok(())
     }
 

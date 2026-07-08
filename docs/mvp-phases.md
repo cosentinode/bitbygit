@@ -113,7 +113,7 @@ Success condition:
 
 Status:
 
-- in progress
+- completed
 
 Must have:
 
@@ -127,6 +127,10 @@ Success condition:
 - users can create commits while preserving guardrails and auditability
 
 ## Phase 7: Fetch, pull, and push workflows
+
+Status:
+
+- in progress
 
 Must have:
 
