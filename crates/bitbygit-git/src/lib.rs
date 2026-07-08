@@ -105,8 +105,20 @@ impl Git {
         self.run(["pull", "--rebase"])
     }
 
-    pub fn pull_rebase_from(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+    pub fn pull_rebase_from(
+        &self,
+        remote: &str,
+        branch: &str,
+        allow_remote_ahead: bool,
+    ) -> Result<GitOutput, GitError> {
         let fetch = self.fetch_remote_branch(remote, branch)?;
+        if !allow_remote_ahead && !self.remote_tracking_is_ancestor_of_head(remote, branch)? {
+            return Err(GitError::Blocked {
+                message:
+                    "pull rebase is blocked because the remote changed since the plan was shown"
+                        .to_owned(),
+            });
+        }
         let rebase = self.run_args(vec![
             "rebase".to_owned(),
             remote_tracking_ref(remote, branch),
@@ -136,6 +148,23 @@ impl Git {
                 remote_tracking_ref(remote, branch)
             ),
         ])
+    }
+
+    fn remote_tracking_is_ancestor_of_head(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<bool, GitError> {
+        match self.run_args(vec![
+            "merge-base".to_owned(),
+            "--is-ancestor".to_owned(),
+            remote_tracking_ref(remote, branch),
+            "HEAD".to_owned(),
+        ]) {
+            Ok(_output) => Ok(true),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {

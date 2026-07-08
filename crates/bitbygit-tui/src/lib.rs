@@ -432,11 +432,18 @@ impl App {
                 upstream,
                 remote,
                 upstream_branch,
+                planned_behind,
             } => match validate_pull_plan(true, &local_branch, &upstream, &target) {
                 Ok(()) => run_audited_git_operation_with_output(
                     "pull rebase",
                     "pull_rebase",
-                    || Git::new(current_dir()).pull_rebase_from(&remote, &upstream_branch),
+                    || {
+                        Git::new(current_dir()).pull_rebase_from(
+                            &remote,
+                            &upstream_branch,
+                            planned_behind > 0,
+                        )
+                    },
                 ),
                 Err(error) => error,
             },
@@ -679,6 +686,7 @@ impl App {
                 upstream: upstream.clone(),
                 remote,
                 upstream_branch,
+                planned_behind: status.branch.behind,
             });
             self.details = format!(
                 "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
@@ -753,6 +761,7 @@ enum PendingAction {
         upstream: String,
         remote: String,
         upstream_branch: String,
+        planned_behind: u32,
     },
     Commit {
         message: String,
