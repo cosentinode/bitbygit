@@ -39,6 +39,13 @@ Medium-risk operations require a visible plan and confirmation:
 - checkout branch with a clean working tree
 - open pull request
 
+Fast-forward pull detection should be implementation-specific, such as fetch
+plus an ancestry check or an explicit `--ff-only` plan. The UI should not assume
+a configured pull strategy is safe without checking the current branch state.
+
+Pull request creation must preview provider, remote, head branch, base branch,
+title, and target URL before execution.
+
 High-risk operations require explicit confirmation and must explain the reason:
 
 - merge

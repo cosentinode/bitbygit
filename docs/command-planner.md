@@ -38,6 +38,10 @@ Initial supported commands should include:
 The parser should also accept `pull rebase` and `open pull request` as aliases
 when the meaning is unambiguous.
 
+`open pr` and `open pull request` must produce a plan that previews provider,
+remote, head branch, base branch, title, and target URL before calling a GitHub
+operation.
+
 ## Quoted Strings
 
 Quoted strings are atomic values. Connectors inside a quoted string are part of
