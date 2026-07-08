@@ -129,11 +129,25 @@ impl LocalStore {
         Ok(self.load_registry_map()?.into_values().collect())
     }
 
+    /// Checks every registered repository synchronously.
+    ///
+    /// TUI callers should prefer `repository_status_by_id` from a background
+    /// task or a lazy viewport-specific refresh path when many repositories are
+    /// registered.
     pub fn list_repository_statuses(&self) -> Result<Vec<RepositoryStatus>, StoreError> {
         self.list_repositories()?
             .into_iter()
             .map(|record| self.repository_status(record))
             .collect()
+    }
+
+    pub fn repository_status_by_id(&self, id: &RepoId) -> Result<RepositoryStatus, StoreError> {
+        let records = self.load_registry_map()?;
+        let record = records
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StoreError::UnknownRepository { id: id.clone() })?;
+        self.repository_status(record)
     }
 
     pub fn repository_status(
@@ -474,6 +488,8 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
             });
         }
 
+        sync_parent_dir(path)?;
+
         return Ok(());
     }
 
@@ -486,6 +502,26 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
             )
         }),
     })
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let directory = fs::File::open(parent).map_err(|source| StoreError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    directory.sync_all().map_err(|source| StoreError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
 }
 
 fn unique_tmp_path(path: &Path, attempt: u8) -> PathBuf {
@@ -514,15 +550,25 @@ fn parse_registry(contents: &str) -> Result<BTreeMap<RepoId, RepositoryRecord>, 
         let path = decode_path(fields[1])?;
         let added_at = parse_u64(fields[2], "added_at")?;
         let last_seen_at = parse_u64(fields[3], "last_seen_at")?;
-        records.insert(
-            id.clone(),
-            RepositoryRecord {
-                id,
-                path,
-                added_at,
-                last_seen_at,
-            },
-        );
+        let expected_id = RepoId::from_path(&path);
+        if id != expected_id {
+            return Err(parse_store_error(format!(
+                "registry line {} id does not match path",
+                index + 1
+            )));
+        }
+        let record = RepositoryRecord {
+            id: id.clone(),
+            path,
+            added_at,
+            last_seen_at,
+        };
+        if records.insert(id, record).is_some() {
+            return Err(parse_store_error(format!(
+                "registry line {} duplicates repository id",
+                index + 1
+            )));
+        }
     }
     Ok(records)
 }
@@ -819,6 +865,20 @@ mod tests {
     }
 
     #[test]
+    fn repository_status_by_id_checks_one_registered_repo() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        let record = store.add_repository(repo.path())?;
+
+        let status = store.repository_status_by_id(&record.id)?;
+
+        assert_eq!(status.record.id, record.id);
+        assert_eq!(status.status, RepositoryHealth::Valid);
+        Ok(())
+    }
+
+    #[test]
     fn audit_entries_are_persisted() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new()?;
         let store = fixture.store()?;
@@ -842,6 +902,37 @@ mod tests {
             result,
             Err(StoreError::Parse { path: Some(_), .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_registry_id_is_rejected() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        fs::write(
+            &store.paths().registry_file,
+            format!("repo-deadbeef\t{}\t1\t1\n", encode_path(repo.path())),
+        )?;
+
+        let result = store.list_repositories();
+
+        assert!(matches!(result, Err(StoreError::Parse { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_registry_id_is_rejected() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        let id = RepoId::from_path(repo.path());
+        let line = format!("{}\t{}\t1\t1\n", id.as_str(), encode_path(repo.path()));
+        fs::write(&store.paths().registry_file, format!("{line}{line}"))?;
+
+        let result = store.list_repositories();
+
+        assert!(matches!(result, Err(StoreError::Parse { .. })));
         Ok(())
     }
 
