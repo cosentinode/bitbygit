@@ -33,7 +33,8 @@ Medium-risk operations require a visible plan and confirmation:
 - commit
 - push current branch
 - push new branch and set upstream
-- pull that resolves as fast-forward or configured merge without rebase
+- pull that Git reports can fast-forward without creating a merge commit or
+  rebasing
 - create branch
 - checkout branch with a clean working tree
 - open pull request
@@ -43,6 +44,7 @@ High-risk operations require explicit confirmation and must explain the reason:
 - merge
 - rebase
 - pull with rebase
+- pull that would create a merge commit
 - pull from a diverged branch where Git cannot fast-forward cleanly
 - amend commit
 - abort merge or rebase
