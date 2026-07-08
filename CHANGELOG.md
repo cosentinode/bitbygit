@@ -16,3 +16,5 @@ semantic versioning once releases begin.
   and audit entries.
 - Added the initial responsive terminal UI shell with keyboard and mouse focus
   handling.
+- Added typed staging/diff operations and wired the TUI status/details panels to
+  changed files in the current repository.

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::string::FromUtf8Error;
 
@@ -57,9 +57,68 @@ impl Git {
         parse_status_bytes(&output.stdout)
     }
 
+    pub fn stage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
+        self.run_path_args(["add"], Some(path), true)
+    }
+
+    pub fn stage_paths(&self, paths: &[PathBuf]) -> Result<GitOutput, GitError> {
+        self.run_paths_args(["add"], paths, true)
+    }
+
+    pub fn unstage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
+        if self.is_unborn()? {
+            return self.run_path_args(
+                ["rm", "--cached", "--ignore-unmatch", "-r"],
+                Some(path),
+                true,
+            );
+        }
+        self.run_path_args(["restore", "--staged"], Some(path), true)
+    }
+
+    pub fn unstage_paths(&self, paths: &[PathBuf]) -> Result<GitOutput, GitError> {
+        if self.is_unborn()? {
+            return self.run_paths_args(["rm", "--cached", "--ignore-unmatch", "-r"], paths, true);
+        }
+        self.run_paths_args(["restore", "--staged"], paths, true)
+    }
+
+    pub fn stage_all(&self) -> Result<GitOutput, GitError> {
+        self.run(["add", "--all"])
+    }
+
+    pub fn unstage_all(&self) -> Result<GitOutput, GitError> {
+        if self.is_unborn()? {
+            return self.run(["rm", "--cached", "--ignore-unmatch", "-r", ":/"]);
+        }
+        self.run(["restore", "--staged", ":/"])
+    }
+
+    pub fn diff_path(&self, path: &Path, staged: bool) -> Result<String, GitError> {
+        self.diff_paths(&[path.to_path_buf()], staged)
+    }
+
+    pub fn diff_paths(&self, paths: &[PathBuf], staged: bool) -> Result<String, GitError> {
+        let args = if staged {
+            vec![
+                OsString::from("diff"),
+                OsString::from("--cached"),
+                OsString::from("--"),
+            ]
+        } else {
+            vec![OsString::from("diff"), OsString::from("--")]
+        };
+        let output = self.run_os_paths(args, paths, true)?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn run<const N: usize>(&self, args: [&str; N]) -> Result<GitOutput, GitError> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         self.run_args(args)
+    }
+
+    fn is_unborn(&self) -> Result<bool, GitError> {
+        Ok(self.branch_state()?.unborn)
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
@@ -96,6 +155,112 @@ impl Git {
             status: output.status,
             stdout,
             stderr,
+        })
+    }
+
+    fn run_path_args<const N: usize>(
+        &self,
+        args: [&str; N],
+        path: Option<&Path>,
+        literal_pathspecs: bool,
+    ) -> Result<GitOutput, GitError> {
+        let mut os_args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        if let Some(path) = path {
+            os_args.push(OsString::from("--"));
+            os_args.push(path.as_os_str().to_owned());
+        }
+        let output = self.run_os_args(os_args, None, literal_pathspecs)?;
+        let stdout = String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stdout,
+            source,
+        })?;
+        let stderr = String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stderr,
+            source,
+        })?;
+        Ok(GitOutput {
+            status: output.status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn run_paths_args<const N: usize>(
+        &self,
+        args: [&str; N],
+        paths: &[PathBuf],
+        literal_pathspecs: bool,
+    ) -> Result<GitOutput, GitError> {
+        let mut os_args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        os_args.push(OsString::from("--"));
+        os_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+        let output = self.run_os_args(os_args, None, literal_pathspecs)?;
+        let stdout = String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stdout,
+            source,
+        })?;
+        let stderr = String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stderr,
+            source,
+        })?;
+        Ok(GitOutput {
+            status: output.status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn run_os_paths(
+        &self,
+        mut args: Vec<OsString>,
+        paths: &[PathBuf],
+        literal_pathspecs: bool,
+    ) -> Result<RawProcessOutput, GitError> {
+        args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+        self.run_os_args(args, None, literal_pathspecs)
+    }
+
+    fn run_os_args(
+        &self,
+        mut args: Vec<OsString>,
+        path: Option<&Path>,
+        literal_pathspecs: bool,
+    ) -> Result<RawProcessOutput, GitError> {
+        if let Some(path) = path {
+            args.push(path.as_os_str().to_owned());
+        }
+        let display_args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let mut command = Command::new("git");
+        command.current_dir(&self.cwd).args(&args);
+        if literal_pathspecs {
+            command.env("GIT_LITERAL_PATHSPECS", "1");
+        }
+        let output = command.output().map_err(|source| GitError::Io {
+            args: display_args.clone(),
+            source,
+        })?;
+
+        if !output.status.success() {
+            return Err(GitError::GitFailed {
+                args: display_args,
+                status: output.status,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(RawProcessOutput {
+            args: display_args,
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
     }
 
@@ -143,6 +308,14 @@ pub struct GitOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawGitOutput {
     stdout: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawProcessOutput {
+    args: Vec<String>,
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -970,6 +1143,157 @@ mod tests {
         let result = Git::new(repo.path()).upstream();
 
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stages_and_unstages_selected_path() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+
+        let git = Git::new(repo.path());
+        git.stage_path(Path::new("README.md"))?;
+        assert_eq!(git.status()?.staged_files().len(), 1);
+
+        git.unstage_path(Path::new("README.md"))?;
+        assert_eq!(git.status()?.staged_files().len(), 0);
+        assert_eq!(git.status()?.unstaged_files().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stages_and_unstages_all_paths() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("one.txt", "one\n")?;
+        repo.write("two.txt", "two\n")?;
+
+        let git = Git::new(repo.path());
+        git.stage_all()?;
+        assert_eq!(git.status()?.staged_files().len(), 2);
+
+        git.unstage_all()?;
+        assert_eq!(git.status()?.staged_files().len(), 0);
+        assert_eq!(git.status()?.untracked_files().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unstages_selected_path_in_unborn_repository() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+
+        let git = Git::new(repo.path());
+        git.unstage_path(Path::new("README.md"))?;
+
+        let status = git.status()?;
+        assert_eq!(status.staged_files().len(), 0);
+        assert_eq!(status.untracked_files().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unstages_all_paths_in_unborn_repository() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.write("one.txt", "one\n")?;
+        repo.write("two.txt", "two\n")?;
+        repo.run(["add", "one.txt", "two.txt"])?;
+
+        let git = Git::new(repo.path());
+        git.unstage_all()?;
+
+        let status = git.status()?;
+        assert_eq!(status.staged_files().len(), 0);
+        assert_eq!(status.untracked_files().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unstages_and_diffs_staged_rename_with_source_and_destination() -> Result<(), Box<dyn Error>>
+    {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("old.txt", "content\n")?;
+        repo.run(["add", "old.txt"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["mv", "old.txt", "new.txt"])?;
+
+        let git = Git::new(repo.path());
+        let paths = vec![PathBuf::from("old.txt"), PathBuf::from("new.txt")];
+        let diff = git.diff_paths(&paths, true)?;
+        assert!(diff.contains("rename from old.txt"));
+        assert!(diff.contains("rename to new.txt"));
+
+        git.unstage_paths(&paths)?;
+
+        assert_eq!(git.status()?.staged_files().len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn returns_diff_for_selected_path() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+
+        let diff = Git::new(repo.path()).diff_path(Path::new("README.md"), false)?;
+
+        assert!(diff.contains("-initial"));
+        assert!(diff.contains("+changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_path_operations_treat_pathspec_magic_as_literal() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.write(":(glob)*", "literal\n")?;
+        repo.run(["add", "README.md", ":(glob)*"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+        repo.write(":(glob)*", "changed\n")?;
+
+        let git = Git::new(repo.path());
+        let diff = git.diff_path(Path::new(":(glob)*"), false)?;
+        assert!(diff.contains("-literal"));
+        assert!(!diff.contains("-initial"));
+
+        git.stage_path(Path::new(":(glob)*"))?;
+        let status = git.status()?;
+
+        assert_eq!(status.staged_files().len(), 1);
+        assert_eq!(status.unstaged_files().len(), 1);
+        assert_eq!(status.staged_files()[0].path, PathBuf::from(":(glob)*"));
+        assert_eq!(status.unstaged_files()[0].path, PathBuf::from("README.md"));
+
+        git.unstage_path(Path::new(":(glob)*"))?;
+        let status = git.status()?;
+        assert_eq!(status.staged_files().len(), 0);
+        assert_eq!(status.unstaged_files().len(), 2);
         Ok(())
     }
 

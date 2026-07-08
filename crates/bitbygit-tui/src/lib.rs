@@ -15,16 +15,21 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+use bitbygit_git::{ChangeKind, Git, GitError, GitOutput, StatusEntry, StatusEntryType};
+use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
+
 const MAX_PROMPT_LEN: usize = 512;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
     let mut app = App::new();
+    app.load_current_dir();
 
     loop {
         terminal.draw(|frame| {
             let areas = Viewport::split(frame.area());
             app.ensure_visible_focus(&areas);
+            app.clamp_file_scroll_for(areas.status);
             render(&app, frame, &areas);
             app.last_viewport = areas;
         })?;
@@ -100,6 +105,11 @@ pub struct App {
     prompt: String,
     repos: Vec<String>,
     selected_repo: usize,
+    files: Vec<FileRow>,
+    selected_file: usize,
+    file_scroll: usize,
+    details: String,
+    pending_confirmation: Option<PendingAction>,
     should_quit: bool,
     last_viewport: Viewport,
 }
@@ -115,6 +125,11 @@ impl App {
                 "recent repositories".to_owned(),
             ],
             selected_repo: 0,
+            files: Vec::new(),
+            selected_file: 0,
+            file_scroll: 0,
+            details: "No repository status loaded yet.".to_owned(),
+            pending_confirmation: None,
             should_quit: false,
             last_viewport: Viewport::default(),
         }
@@ -124,7 +139,20 @@ impl App {
         self.focus
     }
 
+    pub fn load_current_dir(&mut self) {
+        self.refresh_status();
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.pending_confirmation.is_some() {
+            match key.code {
+                KeyCode::Char('y') => self.confirm_pending(),
+                KeyCode::Char('n') | KeyCode::Esc => self.cancel_pending(),
+                _ => self.cancel_pending(),
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -135,6 +163,16 @@ impl App {
             KeyCode::BackTab => self.focus = self.previous_visible_focus(),
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
+            KeyCode::Char('a') if self.focus == Focus::Status => {
+                self.pending_confirmation = Some(PendingAction::StageAll);
+                self.details = "Stage all changes? Press y to confirm or n to cancel.".to_owned();
+            }
+            KeyCode::Char('A') if self.focus == Focus::Status => {
+                self.pending_confirmation = Some(PendingAction::UnstageAll);
+                self.details = "Unstage all changes? Press y to confirm or n to cancel.".to_owned();
+            }
+            KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
+            KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
             KeyCode::Char(value)
                 if self.focus == Focus::Prompt
                     && prompt_accepts_modifiers(key.modifiers)
@@ -155,6 +193,12 @@ impl App {
                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
             {
                 self.handle_key(key);
+            }
+            Event::Mouse(mouse)
+                if self.pending_confirmation.is_some()
+                    && mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+            {
+                self.cancel_pending();
             }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(focus) = self.last_viewport.focus_at(mouse.column, mouse.row) {
@@ -216,14 +260,160 @@ impl App {
     }
 
     fn move_selection_up(&mut self) {
-        if self.focus == Focus::Repos && self.selected_repo > 0 {
-            self.selected_repo -= 1;
+        match self.focus {
+            Focus::Repos if self.selected_repo > 0 => self.selected_repo -= 1,
+            Focus::Status if self.selected_file > 0 => {
+                self.selected_file -= 1;
+                self.clamp_file_scroll();
+                self.refresh_diff();
+            }
+            _ => {}
         }
     }
 
     fn move_selection_down(&mut self) {
-        if self.focus == Focus::Repos && self.selected_repo + 1 < self.repos.len() {
-            self.selected_repo += 1;
+        match self.focus {
+            Focus::Repos if self.selected_repo + 1 < self.repos.len() => self.selected_repo += 1,
+            Focus::Status if self.selected_file + 1 < self.files.len() => {
+                self.selected_file += 1;
+                self.clamp_file_scroll();
+                self.refresh_diff();
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_status(&mut self) {
+        match Git::new(current_dir()).status() {
+            Ok(status) => {
+                self.files = status
+                    .entries
+                    .iter()
+                    .flat_map(FileRow::from_entry)
+                    .collect();
+                self.files.sort_by(|left, right| {
+                    left.section
+                        .cmp(&right.section)
+                        .then(left.path.cmp(&right.path))
+                });
+                if self.selected_file >= self.files.len() {
+                    self.selected_file = self.files.len().saturating_sub(1);
+                }
+                self.clamp_file_scroll();
+                self.refresh_diff();
+            }
+            Err(error) => {
+                self.files.clear();
+                self.selected_file = 0;
+                self.details = format!("Unable to read repository status: {error}");
+            }
+        }
+    }
+
+    fn refresh_diff(&mut self) {
+        let Some(file) = self.files.get(self.selected_file) else {
+            self.details = "No changed file selected.".to_owned();
+            return;
+        };
+        match Git::new(current_dir())
+            .diff_paths(&file.pathspecs, file.section == FileSection::Staged)
+        {
+            Ok(diff) if diff.is_empty() && file.section == FileSection::Untracked => {
+                self.details =
+                    "Untracked file; stage it to include it in the next commit.".to_owned();
+            }
+            Ok(diff) if diff.is_empty() => {
+                self.details = "No textual diff for selected file.".to_owned();
+            }
+            Ok(diff) => self.details = diff,
+            Err(error) => self.details = format!("Unable to render diff: {error}"),
+        }
+    }
+
+    fn stage_selected_file(&mut self) {
+        let Some(file) = self.files.get(self.selected_file).cloned() else {
+            return;
+        };
+        if !file.can_stage() {
+            self.details = "Selected row has no unstaged changes to stage.".to_owned();
+            return;
+        }
+        let message = run_audited_git_operation("stage", "stage_path", || {
+            Git::new(current_dir()).stage_paths(&file.pathspecs)
+        });
+        self.refresh_status();
+        self.details = message;
+    }
+
+    fn unstage_selected_file(&mut self) {
+        let Some(file) = self.files.get(self.selected_file).cloned() else {
+            return;
+        };
+        if !file.can_unstage() {
+            self.details = "Selected row has no staged changes to unstage.".to_owned();
+            return;
+        }
+        let message = run_audited_git_operation("unstage", "unstage_path", || {
+            Git::new(current_dir()).unstage_paths(&file.pathspecs)
+        });
+        self.refresh_status();
+        self.details = message;
+    }
+
+    fn confirm_pending(&mut self) {
+        let Some(action) = self.pending_confirmation.take() else {
+            return;
+        };
+        let message = run_audited_git_operation(action.label(), action.operation(), || {
+            let git = Git::new(current_dir());
+            match action {
+                PendingAction::StageAll => git.stage_all(),
+                PendingAction::UnstageAll => git.unstage_all(),
+            }
+        });
+        self.refresh_status();
+        self.details = message;
+    }
+
+    fn cancel_pending(&mut self) {
+        self.pending_confirmation = None;
+        self.details = "Operation cancelled.".to_owned();
+    }
+
+    fn clamp_file_scroll(&mut self) {
+        self.clamp_file_scroll_for(self.last_viewport.status);
+    }
+
+    fn clamp_file_scroll_for(&mut self, area: Rect) {
+        let visible_len = status_visible_len(area);
+        if self.selected_file < self.file_scroll {
+            self.file_scroll = self.selected_file;
+        }
+        let window_end = self.file_scroll.saturating_add(visible_len);
+        if self.selected_file >= window_end {
+            self.file_scroll = self.selected_file.saturating_sub(visible_len - 1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    StageAll,
+    UnstageAll,
+}
+
+impl PendingAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StageAll => "stage all",
+            Self::UnstageAll => "unstage all",
+        }
+    }
+
+    fn operation(self) -> &'static str {
+        match self {
+            Self::StageAll => "stage_all",
+            Self::UnstageAll => "unstage_all",
         }
     }
 }
@@ -332,12 +522,135 @@ impl Viewport {
 fn render(app: &App, frame: &mut ratatui::Frame<'_>, areas: &Viewport) {
     frame.render_widget(Clear, frame.area());
     frame.render_widget(repo_list(app), areas.repos);
-    frame.render_widget(status_panel(app), areas.status);
+    frame.render_widget(status_panel(app, areas.status), areas.status);
     frame.render_widget(details_panel(app), areas.details);
     if areas.queue.area() > 0 {
         frame.render_widget(queue_panel(app), areas.queue);
     }
     frame.render_widget(prompt_panel(app), areas.prompt);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileRow {
+    path: std::path::PathBuf,
+    pathspecs: Vec<std::path::PathBuf>,
+    label: String,
+    section: FileSection,
+}
+
+impl FileRow {
+    fn from_entry(entry: &StatusEntry) -> Vec<Self> {
+        if entry.entry_type == StatusEntryType::Conflict {
+            return vec![Self::new(entry, FileSection::Conflict)];
+        }
+        if entry.entry_type == StatusEntryType::Untracked {
+            return vec![Self::new(entry, FileSection::Untracked)];
+        }
+        if entry.entry_type == StatusEntryType::Ignored {
+            return vec![Self::new(entry, FileSection::Ignored)];
+        }
+
+        let mut rows = Vec::new();
+        if entry.index != ChangeKind::Unmodified {
+            rows.push(Self::new(entry, FileSection::Staged));
+        }
+        if entry.worktree != ChangeKind::Unmodified {
+            rows.push(Self::new(entry, FileSection::Unstaged));
+        }
+        rows
+    }
+
+    fn new(entry: &StatusEntry, section: FileSection) -> Self {
+        let label = format!(
+            "{} {} {}",
+            section.marker(),
+            change_label(entry, section),
+            path_label(entry)
+        );
+        Self {
+            path: entry.path.clone(),
+            pathspecs: pathspecs_for_entry(entry, section),
+            label,
+            section,
+        }
+    }
+
+    fn can_stage(&self) -> bool {
+        matches!(
+            self.section,
+            FileSection::Unstaged | FileSection::Untracked | FileSection::Conflict
+        )
+    }
+
+    fn can_unstage(&self) -> bool {
+        self.section == FileSection::Staged
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FileSection {
+    Conflict,
+    Staged,
+    Unstaged,
+    Untracked,
+    Ignored,
+}
+
+impl FileSection {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Conflict => "UU",
+            Self::Staged => "S ",
+            Self::Unstaged => "M ",
+            Self::Untracked => "??",
+            Self::Ignored => "!!",
+        }
+    }
+}
+
+fn change_label(entry: &StatusEntry, section: FileSection) -> &'static str {
+    match section {
+        FileSection::Conflict => "U",
+        FileSection::Staged => change_kind_label(entry.index),
+        FileSection::Unstaged => change_kind_label(entry.worktree),
+        FileSection::Untracked => "?",
+        FileSection::Ignored => "!",
+    }
+}
+
+fn change_kind_label(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Unmodified => ".",
+        ChangeKind::Modified => "M",
+        ChangeKind::Added => "A",
+        ChangeKind::Deleted => "D",
+        ChangeKind::Renamed => "R",
+        ChangeKind::Copied => "C",
+        ChangeKind::Unmerged => "U",
+        ChangeKind::Untracked => "?",
+        ChangeKind::Ignored => "!",
+        ChangeKind::Unknown(_code) => "?",
+    }
+}
+
+fn path_label(entry: &StatusEntry) -> String {
+    match &entry.original_path {
+        Some(original_path) => format!(
+            "{} -> {}",
+            original_path.to_string_lossy(),
+            entry.path.to_string_lossy()
+        ),
+        None => entry.path.to_string_lossy().into_owned(),
+    }
+}
+
+fn pathspecs_for_entry(entry: &StatusEntry, section: FileSection) -> Vec<std::path::PathBuf> {
+    match (&entry.entry_type, &entry.original_path, section) {
+        (StatusEntryType::Renamed, Some(original_path), FileSection::Staged) => {
+            vec![original_path.clone(), entry.path.clone()]
+        }
+        _ => vec![entry.path.clone()],
+    }
 }
 
 fn repo_list(app: &App) -> List<'_> {
@@ -358,25 +671,37 @@ fn repo_list(app: &App) -> List<'_> {
     List::new(items).block(panel_block("Repos", app.focus == Focus::Repos))
 }
 
-fn status_panel(app: &App) -> Paragraph<'_> {
-    let lines = [
-        Line::from("branch: develop"),
-        Line::from("working tree: clean"),
-        Line::from("remote: origin"),
-        Line::from("sync: up to date"),
-    ];
-    Paragraph::new(lines.to_vec())
+fn status_panel(app: &App, area: Rect) -> Paragraph<'_> {
+    let visible_len = status_visible_len(area);
+    let lines = if app.files.is_empty() {
+        vec![Line::from("working tree clean or unavailable")]
+    } else {
+        app.files
+            .iter()
+            .enumerate()
+            .skip(app.file_scroll)
+            .take(visible_len)
+            .map(|(index, file)| {
+                let marker = if index == app.selected_file {
+                    "> "
+                } else {
+                    "  "
+                };
+                Line::from(format!("{marker}{}", file.label))
+            })
+            .collect::<Vec<_>>()
+    };
+    Paragraph::new(lines)
         .block(panel_block("Status", app.focus == Focus::Status))
         .wrap(Wrap { trim: true })
 }
 
+fn status_visible_len(area: Rect) -> usize {
+    area.height.saturating_sub(2).max(1) as usize
+}
+
 fn details_panel(app: &App) -> Paragraph<'_> {
-    let text = vec![
-        Line::from("Welcome to bitbygit."),
-        Line::from("This shell is wired for navigation first."),
-        Line::from("Git actions will enter through typed operations."),
-    ];
-    Paragraph::new(text)
+    Paragraph::new(app.details.clone())
         .block(panel_block("Details", app.focus == Focus::Details))
         .wrap(Wrap { trim: true })
 }
@@ -430,6 +755,81 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
+}
+
+fn current_dir() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_error| std::path::PathBuf::from("."))
+}
+
+fn operation_message(action: &str, result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!("{action} succeeded"),
+        Err(error) => format!("{action} failed: {error}"),
+    }
+}
+
+fn run_audited_git_operation(
+    action: &str,
+    operation: &str,
+    run: impl FnOnce() -> Result<GitOutput, GitError>,
+) -> String {
+    let audit = match begin_audit_operation(operation) {
+        Ok(audit) => audit,
+        Err(error) => return operation_message(action, Err(error)),
+    };
+    let result = run();
+    operation_message(action, audit.finish(&result))
+}
+
+fn begin_audit_operation(operation: &str) -> Result<PendingAudit, String> {
+    let paths = StorePaths::from_environment()
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
+    begin_audit_operation_with_paths(operation, paths)
+}
+
+fn begin_audit_operation_with_paths(
+    operation: &str,
+    paths: StorePaths,
+) -> Result<PendingAudit, String> {
+    let store = LocalStore::open(paths)
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
+    let entry = AuditEntry::new(None, operation, "started", "pending")
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
+    store
+        .append_audit(entry)
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
+    Ok(PendingAudit {
+        operation: operation.to_owned(),
+        store,
+    })
+}
+
+struct PendingAudit {
+    operation: String,
+    store: LocalStore,
+}
+
+impl PendingAudit {
+    fn finish(self, result: &Result<GitOutput, GitError>) -> Result<(), String> {
+        let result_label = if result.is_ok() { "ok" } else { "error" };
+        let message = operation_result_message(result);
+        let entry = AuditEntry::new(None, self.operation, result_label, message.clone())
+            .map_err(|error| format!("{message}; audit failed: {error}"))?;
+        self.store
+            .append_audit(entry)
+            .map_err(|error| format!("{message}; audit failed: {error}"))?;
+        result
+            .as_ref()
+            .map(|_output| ())
+            .map_err(ToString::to_string)
+    }
+}
+
+fn operation_result_message(result: &Result<GitOutput, GitError>) -> String {
+    match result {
+        Ok(_output) => "completed".to_owned(),
+        Err(error) => error.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +988,241 @@ mod tests {
     }
 
     #[test]
+    fn partial_file_creates_staged_and_unstaged_rows() {
+        let entry = StatusEntry {
+            path: std::path::PathBuf::from("file.txt"),
+            original_path: None,
+            index: ChangeKind::Modified,
+            worktree: ChangeKind::Modified,
+            entry_type: StatusEntryType::Ordinary,
+        };
+
+        let rows = FileRow::from_entry(&entry);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section, FileSection::Staged);
+        assert_eq!(rows[1].section, FileSection::Unstaged);
+        assert!(!rows[0].can_stage());
+        assert!(rows[0].can_unstage());
+        assert!(rows[1].can_stage());
+        assert!(!rows[1].can_unstage());
+    }
+
+    #[test]
+    fn rename_and_delete_rows_show_change_details() {
+        let renamed = StatusEntry {
+            path: std::path::PathBuf::from("new.txt"),
+            original_path: Some(std::path::PathBuf::from("old.txt")),
+            index: ChangeKind::Renamed,
+            worktree: ChangeKind::Unmodified,
+            entry_type: StatusEntryType::Renamed,
+        };
+        let deleted = StatusEntry {
+            path: std::path::PathBuf::from("deleted.txt"),
+            original_path: None,
+            index: ChangeKind::Unmodified,
+            worktree: ChangeKind::Deleted,
+            entry_type: StatusEntryType::Ordinary,
+        };
+
+        let renamed_rows = FileRow::from_entry(&renamed);
+        let deleted_rows = FileRow::from_entry(&deleted);
+
+        assert!(renamed_rows[0].label.contains("R old.txt -> new.txt"));
+        assert_eq!(renamed_rows[0].pathspecs.len(), 2);
+        assert_eq!(
+            renamed_rows[0].pathspecs[0],
+            std::path::PathBuf::from("old.txt")
+        );
+        assert_eq!(
+            renamed_rows[0].pathspecs[1],
+            std::path::PathBuf::from("new.txt")
+        );
+        assert!(deleted_rows[0].label.contains("D deleted.txt"));
+    }
+
+    #[test]
+    fn partial_rename_uses_section_specific_pathspecs() {
+        let entry = StatusEntry {
+            path: std::path::PathBuf::from("new.txt"),
+            original_path: Some(std::path::PathBuf::from("old.txt")),
+            index: ChangeKind::Renamed,
+            worktree: ChangeKind::Modified,
+            entry_type: StatusEntryType::Renamed,
+        };
+
+        let rows = FileRow::from_entry(&entry);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section, FileSection::Staged);
+        assert_eq!(rows[0].pathspecs.len(), 2);
+        assert_eq!(rows[1].section, FileSection::Unstaged);
+        assert_eq!(rows[1].pathspecs, vec![std::path::PathBuf::from("new.txt")]);
+    }
+
+    #[test]
+    fn status_window_follows_selected_file() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+        app.last_viewport.status = Rect::new(0, 0, 30, 5);
+        let visible_len = status_visible_len(app.last_viewport.status);
+        app.files = (0..visible_len + 5)
+            .map(|index| FileRow {
+                path: std::path::PathBuf::from(format!("file-{index}.txt")),
+                pathspecs: vec![std::path::PathBuf::from(format!("file-{index}.txt"))],
+                label: format!("M file-{index}.txt"),
+                section: FileSection::Unstaged,
+            })
+            .collect();
+
+        for _ in 0..visible_len + 4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+
+        assert_eq!(app.selected_file, visible_len + 4);
+        assert_eq!(app.file_scroll, 5);
+        assert!(app.selected_file < app.file_scroll + visible_len);
+    }
+
+    #[test]
+    fn status_window_reclamps_after_resize() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+        app.last_viewport.status = Rect::new(0, 0, 30, 10);
+        app.files = (0..10)
+            .map(|index| FileRow {
+                path: std::path::PathBuf::from(format!("file-{index}.txt")),
+                pathspecs: vec![std::path::PathBuf::from(format!("file-{index}.txt"))],
+                label: format!("M file-{index}.txt"),
+                section: FileSection::Unstaged,
+            })
+            .collect();
+        app.selected_file = 7;
+        app.clamp_file_scroll();
+
+        app.clamp_file_scroll_for(Rect::new(0, 0, 30, 3));
+
+        assert_eq!(app.file_scroll, 7);
+    }
+
+    #[test]
+    fn stage_all_requires_confirmation() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        assert_eq!(app.pending_confirmation, Some(PendingAction::StageAll));
+        assert!(app.details.contains("Stage all changes?"));
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn unrelated_key_cancels_pending_confirmation() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Down));
+
+        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn mouse_click_cancels_pending_confirmation() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }));
+
+        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("stage-audit")?;
+        let output = std::process::Command::new("git")
+            .arg("--version")
+            .output()?;
+        let result: Result<GitOutput, GitError> = Ok(GitOutput {
+            status: output.status,
+            stdout: String::from_utf8(output.stdout)?,
+            stderr: String::from_utf8(output.stderr)?,
+        });
+
+        for operation in ["stage_path", "unstage_path", "stage_all", "unstage_all"] {
+            let audit = begin_audit_operation_with_paths(operation, paths.clone())?;
+            audit.finish(&result)?;
+        }
+
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries[0].operation, "stage_path");
+        assert_eq!(entries[0].result, "started");
+        assert_eq!(entries[1].operation, "stage_path");
+        assert_eq!(entries[1].result, "ok");
+        assert_eq!(entries[2].operation, "unstage_path");
+        assert_eq!(entries[3].operation, "unstage_path");
+        assert_eq!(entries[4].operation, "stage_all");
+        assert_eq!(entries[5].operation, "stage_all");
+        assert_eq!(entries[6].operation, "unstage_all");
+        assert_eq!(entries[7].operation, "unstage_all");
+        assert!(
+            entries
+                .iter()
+                .step_by(2)
+                .all(|entry| entry.result == "started")
+        );
+        assert!(
+            entries
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .all(|entry| entry.result == "ok")
+        );
+        assert!(
+            entries
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .all(|entry| entry.message == "completed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("failed-stage-audit")?;
+        let result = Git::new("/definitely/not/a/bitbygit/repo").stage_all();
+
+        let audit = begin_audit_operation_with_paths("stage_all", paths.clone())?;
+        let audit_result = audit.finish(&result);
+
+        assert!(result.is_err());
+        assert!(audit_result.is_err());
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].operation, "stage_all");
+        assert_eq!(entries[0].result, "started");
+        assert_eq!(entries[1].operation, "stage_all");
+        assert_eq!(entries[1].result, "error");
+        assert_ne!(entries[1].message, "completed");
+        Ok(())
+    }
+
+    #[test]
     fn renders_desktop_viewport() -> Result<(), Box<dyn Error>> {
         render_with_test_backend(120, 40)
     }
@@ -677,5 +1312,17 @@ mod tests {
         })?;
 
         Ok(())
+    }
+
+    fn isolated_store_paths(name: &str) -> Result<StorePaths, Box<dyn Error>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("bitbygit-tui-{name}-{}-{now}", std::process::id()));
+        Ok(StorePaths::from_roots(
+            root.join("config"),
+            root.join("data"),
+        ))
     }
 }
