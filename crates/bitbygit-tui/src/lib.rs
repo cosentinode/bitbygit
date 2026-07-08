@@ -194,6 +194,12 @@ impl App {
             {
                 self.handle_key(key);
             }
+            Event::Mouse(mouse)
+                if self.pending_confirmation.is_some()
+                    && mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+            {
+                self.cancel_pending();
+            }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(focus) = self.last_viewport.focus_at(mouse.column, mouse.row) {
                     self.focus = focus;
@@ -563,7 +569,7 @@ impl FileRow {
         );
         Self {
             path: entry.path.clone(),
-            pathspecs: pathspecs_for_entry(entry),
+            pathspecs: pathspecs_for_entry(entry, section),
             label,
             section,
         }
@@ -638,9 +644,9 @@ fn path_label(entry: &StatusEntry) -> String {
     }
 }
 
-fn pathspecs_for_entry(entry: &StatusEntry) -> Vec<std::path::PathBuf> {
-    match (&entry.entry_type, &entry.original_path) {
-        (StatusEntryType::Renamed, Some(original_path)) => {
+fn pathspecs_for_entry(entry: &StatusEntry, section: FileSection) -> Vec<std::path::PathBuf> {
+    match (&entry.entry_type, &entry.original_path, section) {
+        (StatusEntryType::Renamed, Some(original_path), FileSection::Staged) => {
             vec![original_path.clone(), entry.path.clone()]
         }
         _ => vec![entry.path.clone()],
@@ -1036,6 +1042,25 @@ mod tests {
     }
 
     #[test]
+    fn partial_rename_uses_section_specific_pathspecs() {
+        let entry = StatusEntry {
+            path: std::path::PathBuf::from("new.txt"),
+            original_path: Some(std::path::PathBuf::from("old.txt")),
+            index: ChangeKind::Renamed,
+            worktree: ChangeKind::Modified,
+            entry_type: StatusEntryType::Renamed,
+        };
+
+        let rows = FileRow::from_entry(&entry);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section, FileSection::Staged);
+        assert_eq!(rows[0].pathspecs.len(), 2);
+        assert_eq!(rows[1].section, FileSection::Unstaged);
+        assert_eq!(rows[1].pathspecs, vec![std::path::PathBuf::from("new.txt")]);
+    }
+
+    #[test]
     fn status_window_follows_selected_file() {
         let mut app = App::new();
         app.focus = Focus::Status;
@@ -1103,6 +1128,23 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Down));
+
+        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn mouse_click_cancels_pending_confirmation() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }));
 
         assert_eq!(app.pending_confirmation, None);
         assert_eq!(app.details, "Operation cancelled.");
