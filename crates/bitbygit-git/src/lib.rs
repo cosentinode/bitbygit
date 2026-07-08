@@ -34,8 +34,8 @@ impl Git {
     }
 
     pub fn repo_root(&self) -> Result<PathBuf, GitError> {
-        let output = self.run(["rev-parse", "--show-toplevel"])?;
-        Ok(PathBuf::from(strip_line_ending(&output.stdout)))
+        let output = self.run_raw(["rev-parse", "--show-toplevel"])?;
+        Ok(path_from_bytes(strip_byte_line_ending(&output.stdout)))
     }
 
     pub fn branch_state(&self) -> Result<BranchState, GitError> {
@@ -49,13 +49,7 @@ impl Git {
     }
 
     pub fn upstream(&self) -> Result<Option<String>, GitError> {
-        match self.run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
-            Ok(output) => Ok(Some(strip_line_ending(&output.stdout).to_owned())),
-            Err(GitError::GitFailed { stderr, .. }) if is_missing_upstream_error(&stderr) => {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+        Ok(self.status()?.branch.upstream)
     }
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {
@@ -588,15 +582,9 @@ fn parse_remotes(input: &str) -> Vec<Remote> {
     remotes.into_values().collect()
 }
 
-fn strip_line_ending(value: &str) -> &str {
-    value.trim_end_matches(['\r', '\n'])
-}
-
-fn is_missing_upstream_error(stderr: &str) -> bool {
-    stderr.contains("no upstream configured")
-        || stderr.contains("no upstream branch")
-        || stderr.contains("ambiguous argument '@{u}'")
-        || stderr.contains("no such branch")
+fn strip_byte_line_ending(value: &[u8]) -> &[u8] {
+    let value = value.strip_suffix(b"\n").unwrap_or(value);
+    value.strip_suffix(b"\r").unwrap_or(value)
 }
 
 fn strip_bytes_prefix<'a>(value: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
@@ -956,6 +944,21 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reads_non_utf8_repository_root() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new_non_utf8()?;
+        repo.run(["init", "-b", "main"])?;
+
+        let root = Git::new(repo.path()).repo_root()?;
+
+        assert_eq!(
+            root.as_os_str().as_bytes(),
+            repo.path().as_os_str().as_bytes()
+        );
+        Ok(())
+    }
+
     struct TempRepo {
         path: PathBuf,
     }
@@ -965,6 +968,19 @@ mod tests {
             let id = NEXT_REPO_ID.fetch_add(1, Ordering::Relaxed);
             let path =
                 std::env::temp_dir().join(format!("bitbygit-test-{}-{id}", std::process::id()));
+            if path.exists() {
+                fs::remove_dir_all(&path)?;
+            }
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        #[cfg(unix)]
+        fn new_non_utf8() -> Result<Self, Box<dyn Error>> {
+            let id = NEXT_REPO_ID.fetch_add(1, Ordering::Relaxed);
+            let mut name = format!("bitbygit-test-{}-{id}-", std::process::id()).into_bytes();
+            name.push(0xff);
+            let path = std::env::temp_dir().join(OsString::from_vec(name));
             if path.exists() {
                 fs::remove_dir_all(&path)?;
             }
