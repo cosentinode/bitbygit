@@ -120,7 +120,7 @@ Must have:
 - commit staged changes
 - validate empty staged state
 - show commit plan before execution
-- commit the confirmed staged tree and surface Git failures clearly
+- commit the confirmed staged tree and surface Git/guardrail failures clearly
 
 Success condition:
 

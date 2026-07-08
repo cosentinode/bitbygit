@@ -2,12 +2,21 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::string::FromUtf8Error;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+const COMMIT_HOOKS: &[&str] = &[
+    "pre-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+];
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -96,15 +105,18 @@ impl Git {
 
     pub fn commit(&self, message: &str) -> Result<GitOutput, GitError> {
         let staged_tree = self.staged_tree()?;
-        self.commit_staged_tree(message, &staged_tree)
+        let head = self.head_commit()?;
+        self.commit_staged_tree(message, &staged_tree, head.as_deref())
     }
 
     pub fn commit_staged_tree(
         &self,
         message: &str,
         staged_tree: &str,
+        expected_head: Option<&str>,
     ) -> Result<GitOutput, GitError> {
-        let parent = self.head_commit()?;
+        self.ensure_guarded_commit_supported()?;
+        let parent = expected_head.map(ToOwned::to_owned);
         let mut commit_args = vec!["commit-tree".to_owned(), staged_tree.to_owned()];
         if let Some(parent) = &parent {
             commit_args.push("-p".to_owned());
@@ -128,9 +140,7 @@ impl Git {
             "HEAD".to_owned(),
             commit_id.clone(),
         ];
-        if let Some(parent) = parent {
-            update_args.push(parent);
-        }
+        update_args.push(parent.unwrap_or_else(|| ZERO_OID.to_owned()));
         let update_output = self.run_args(update_args)?;
         let short_id = commit_id.chars().take(12).collect::<String>();
         let stderr = [commit_output.stderr.trim(), update_output.stderr.trim()]
@@ -177,7 +187,7 @@ impl Git {
         Ok(self.branch_state()?.unborn)
     }
 
-    fn head_commit(&self) -> Result<Option<String>, GitError> {
+    pub fn head_commit(&self) -> Result<Option<String>, GitError> {
         if self.is_unborn()? {
             return Ok(None);
         }
@@ -187,6 +197,74 @@ impl Git {
                 .trim()
                 .to_owned(),
         ))
+    }
+
+    fn ensure_guarded_commit_supported(&self) -> Result<(), GitError> {
+        if self.config_bool("commit.gpgsign")? {
+            return Err(GitError::Blocked {
+                message: "guarded commit is blocked because commit.gpgsign is enabled".to_owned(),
+            });
+        }
+
+        let hooks = COMMIT_HOOKS
+            .iter()
+            .filter_map(|hook| match self.hook_path(hook) {
+                Ok(path) if hook_is_enabled(&path) => Some(Ok((*hook).to_owned())),
+                Ok(_path) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !hooks.is_empty() {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "guarded commit is blocked because commit hook(s) are configured: {}",
+                    hooks.join(", ")
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn config_bool(&self, key: &str) -> Result<bool, GitError> {
+        Ok(matches!(
+            self.config_value(["config", "--bool", "--get", key])?
+                .as_deref(),
+            Some("true") | Some("yes") | Some("on") | Some("1")
+        ))
+    }
+
+    fn config_value<const N: usize>(&self, args: [&str; N]) -> Result<Option<String>, GitError> {
+        match self.run_args(args.iter().map(|arg| (*arg).to_owned()).collect()) {
+            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn hook_path(&self, hook: &str) -> Result<PathBuf, GitError> {
+        if let Some(hooks_path) =
+            self.config_value(["config", "--path", "--get", "core.hooksPath"])?
+        {
+            let path = PathBuf::from(hooks_path);
+            return Ok(if path.is_absolute() {
+                path.join(hook)
+            } else {
+                self.repo_root()?.join(path).join(hook)
+            });
+        }
+
+        let output = self.run_args(vec![
+            "rev-parse".to_owned(),
+            "--git-path".to_owned(),
+            format!("hooks/{hook}"),
+        ])?;
+        let path = PathBuf::from(output.stdout.trim());
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.cwd.join(path)
+        })
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
@@ -403,6 +481,9 @@ pub enum GitError {
         stdout: String,
         stderr: String,
     },
+    Blocked {
+        message: String,
+    },
     Parse {
         message: String,
     },
@@ -443,6 +524,7 @@ impl Display for GitError {
                     args.join(" ")
                 )
             }
+            Self::Blocked { message } => formatter.write_str(message),
             Self::Parse { message } => write!(formatter, "failed to parse git output: {message}"),
         }
     }
@@ -453,7 +535,7 @@ impl Error for GitError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Utf8 { source, .. } => Some(source),
-            Self::GitFailed { .. } | Self::Parse { .. } => None,
+            Self::GitFailed { .. } | Self::Blocked { .. } | Self::Parse { .. } => None,
         }
     }
 }
@@ -884,6 +966,22 @@ fn parse_error(message: &str) -> GitError {
     GitError::Parse {
         message: message.to_owned(),
     }
+}
+
+#[cfg(unix)]
+fn hook_is_enabled(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn hook_is_enabled(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1355,15 +1453,105 @@ mod tests {
         repo.run(["add", "README.md"])?;
         let git = Git::new(repo.path());
         let confirmed_tree = git.staged_tree()?;
+        let confirmed_head = git.head_commit()?;
 
         repo.write("injected.txt", "not confirmed\n")?;
         repo.run(["add", "injected.txt"])?;
-        git.commit_staged_tree("initial commit", &confirmed_tree)?;
+        git.commit_staged_tree("initial commit", &confirmed_tree, confirmed_head.as_deref())?;
 
         let files = repo.git_stdout(["ls-tree", "--name-only", "HEAD"])?;
         assert!(files.contains("README.md"));
         assert!(!files.contains("injected.txt"));
         assert_eq!(git.status()?.staged_files().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn commit_staged_tree_rejects_changed_head() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+        repo.run(["add", "README.md"])?;
+        let git = Git::new(repo.path());
+        let confirmed_tree = git.staged_tree()?;
+        let Some(confirmed_head) = git.head_commit()? else {
+            return Err("expected repository to have HEAD".into());
+        };
+        let base_tree = repo.git_stdout(["rev-parse", "HEAD^{tree}"])?;
+        let external_commit = repo.git_stdout_args(&[
+            "commit-tree",
+            base_tree.trim(),
+            "-p",
+            &confirmed_head,
+            "-m",
+            "external",
+        ])?;
+        repo.run_args(&["update-ref", "HEAD", external_commit.trim()])?;
+
+        let result = git.commit_staged_tree("confirmed", &confirmed_tree, Some(&confirmed_head));
+
+        let Err(error) = result else {
+            return Err("expected stale HEAD rejection".into());
+        };
+        assert!(matches!(error, GitError::GitFailed { .. }));
+        let head = repo.git_stdout(["rev-parse", "HEAD"])?;
+        assert_eq!(head.trim(), external_commit.trim());
+        Ok(())
+    }
+
+    #[test]
+    fn commit_staged_tree_blocks_gpgsign_policy() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.run(["config", "commit.gpgsign", "true"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        let git = Git::new(repo.path());
+        let tree = git.staged_tree()?;
+        let head = git.head_commit()?;
+
+        let result = git.commit_staged_tree("initial", &tree, head.as_deref());
+
+        let Err(error) = result else {
+            return Err("expected gpgsign guardrail".into());
+        };
+        assert!(error.to_string().contains("commit.gpgsign"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_staged_tree_blocks_configured_commit_hooks() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        let hook = repo.path().join(".git").join("hooks").join("commit-msg");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n")?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::new(repo.path());
+        let tree = git.staged_tree()?;
+        let head = git.head_commit()?;
+
+        let result = git.commit_staged_tree("initial", &tree, head.as_deref());
+
+        let Err(error) = result else {
+            return Err("expected hook guardrail".into());
+        };
+        assert!(error.to_string().contains("commit hook"));
         Ok(())
     }
 
@@ -1550,7 +1738,27 @@ mod tests {
             Ok(())
         }
 
+        fn run_args(&self, args: &[&str]) -> Result<(), Box<dyn Error>> {
+            let output = Command::new("git")
+                .current_dir(&self.path)
+                .args(args)
+                .output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "git command failed with status {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
+            Ok(())
+        }
+
         fn git_stdout<const N: usize>(&self, args: [&str; N]) -> Result<String, Box<dyn Error>> {
+            self.git_stdout_args(&args)
+        }
+
+        fn git_stdout_args(&self, args: &[&str]) -> Result<String, Box<dyn Error>> {
             let output = Command::new("git")
                 .current_dir(&self.path)
                 .args(args)

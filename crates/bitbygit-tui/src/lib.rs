@@ -380,17 +380,26 @@ impl App {
                 message,
                 staged_items,
                 staged_tree,
+                head,
             } => match Git::new(current_dir()).status() {
                 Ok(current_status) if staged_plan_items(&current_status.entries) == staged_items =>
                 {
-                    match Git::new(current_dir()).staged_tree() {
-                        Ok(current_tree) if current_tree == staged_tree => {
+                    let git = Git::new(current_dir());
+                    match (git.staged_tree(), git.head_commit()) {
+                        (Ok(current_tree), Ok(current_head))
+                            if current_tree == staged_tree && current_head == head =>
+                        {
                             run_audited_git_operation_with_output("commit", "commit", || {
-                                Git::new(current_dir()).commit_staged_tree(&message, &staged_tree)
+                                Git::new(current_dir()).commit_staged_tree(
+                                    &message,
+                                    &staged_tree,
+                                    head.as_deref(),
+                                )
                             })
                         }
-                        Ok(_current_tree) => "Commit blocked: staged content changed since the plan was shown. Re-run the commit prompt.".to_owned(),
-                        Err(error) => format!("Unable to validate staged content: {error}"),
+                        (Ok(_current_tree), Ok(_current_head)) => "Commit blocked: repository state changed since the plan was shown. Re-run the commit prompt.".to_owned(),
+                        (Err(error), _) => format!("Unable to validate staged content: {error}"),
+                        (_, Err(error)) => format!("Unable to validate commit target: {error}"),
                     }
                 }
                 Ok(_current_status) => "Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned(),
@@ -429,12 +438,20 @@ impl App {
                 return;
             }
         };
+        let head = match git.head_commit() {
+            Ok(head) => head,
+            Err(error) => {
+                self.details = format!("Unable to snapshot commit target: {error}");
+                return;
+            }
+        };
         let staged_count = staged_items.len();
 
         self.pending_confirmation = Some(PendingAction::Commit {
             message: message.clone(),
             staged_items,
             staged_tree,
+            head,
         });
         self.prompt.clear();
         self.details = format!(
@@ -471,6 +488,7 @@ enum PendingAction {
         message: String,
         staged_items: Vec<String>,
         staged_tree: String,
+        head: Option<String>,
     },
 }
 
@@ -949,6 +967,7 @@ fn sanitized_git_error(error: &GitError) -> String {
         GitError::GitFailed { status, .. } => format!("git failed with status {status}"),
         GitError::Io { .. } => "git failed before execution".to_owned(),
         GitError::Utf8 { stream, .. } => format!("git returned non-UTF-8 {stream}"),
+        GitError::Blocked { message } => format!("operation blocked: {message}"),
         GitError::Parse { message } => format!("failed to parse git output: {message}"),
     }
 }
