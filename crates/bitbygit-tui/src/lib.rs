@@ -420,9 +420,14 @@ impl App {
                 upstream,
                 remote,
                 upstream_branch,
+                upstream_oid,
             } => match validate_pull_plan(false, &local_branch, &upstream, &target) {
                 Ok(()) => run_audited_git_operation_with_output("pull", "pull", || {
-                    Git::new(current_dir()).pull_ff_only_from(&remote, &upstream_branch)
+                    Git::new(current_dir()).pull_ff_only_from(
+                        &remote,
+                        &upstream_branch,
+                        upstream_oid.as_deref(),
+                    )
                 }),
                 Err(error) => error,
             },
@@ -432,7 +437,7 @@ impl App {
                 upstream,
                 remote,
                 upstream_branch,
-                planned_behind,
+                upstream_oid,
             } => match validate_pull_plan(true, &local_branch, &upstream, &target) {
                 Ok(()) => run_audited_git_operation_with_output(
                     "pull rebase",
@@ -441,7 +446,7 @@ impl App {
                         Git::new(current_dir()).pull_rebase_from(
                             &remote,
                             &upstream_branch,
-                            planned_behind > 0,
+                            upstream_oid.as_deref(),
                         )
                     },
                 ),
@@ -679,6 +684,14 @@ impl App {
             self.details = format!("Pull blocked: upstream config does not match {upstream}.");
             return;
         }
+        let upstream_oid =
+            match Git::new(current_dir()).remote_tracking_oid(&remote, &upstream_branch) {
+                Ok(upstream_oid) => upstream_oid,
+                Err(error) => {
+                    self.details = format!("Unable to snapshot pull upstream: {error}");
+                    return;
+                }
+            };
         if rebase {
             self.pending_confirmation = Some(PendingAction::PullRebase {
                 local_branch,
@@ -686,7 +699,7 @@ impl App {
                 upstream: upstream.clone(),
                 remote,
                 upstream_branch,
-                planned_behind: status.branch.behind,
+                upstream_oid,
             });
             self.details = format!(
                 "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
@@ -699,6 +712,7 @@ impl App {
                 upstream: upstream.clone(),
                 remote,
                 upstream_branch,
+                upstream_oid,
             });
             self.details = format!(
                 "Pull plan:\n- fetch and fast-forward from {upstream}\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
@@ -754,6 +768,7 @@ enum PendingAction {
         upstream: String,
         remote: String,
         upstream_branch: String,
+        upstream_oid: Option<String>,
     },
     PullRebase {
         local_branch: String,
@@ -761,7 +776,7 @@ enum PendingAction {
         upstream: String,
         remote: String,
         upstream_branch: String,
-        planned_behind: u32,
+        upstream_oid: Option<String>,
     },
     Commit {
         message: String,

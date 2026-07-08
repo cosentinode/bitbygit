@@ -69,6 +69,7 @@ impl Git {
     pub fn push_current_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
         self.run_args(vec![
             "push".to_owned(),
+            "--".to_owned(),
             remote.to_owned(),
             format!("HEAD:refs/heads/{branch}"),
         ])
@@ -82,6 +83,7 @@ impl Git {
         self.run_args(vec![
             "push".to_owned(),
             "-u".to_owned(),
+            "--".to_owned(),
             remote.to_owned(),
             format!("HEAD:refs/heads/{branch}"),
         ])
@@ -91,8 +93,14 @@ impl Git {
         self.run(["pull", "--ff-only"])
     }
 
-    pub fn pull_ff_only_from(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+    pub fn pull_ff_only_from(
+        &self,
+        remote: &str,
+        branch: &str,
+        expected_upstream_oid: Option<&str>,
+    ) -> Result<GitOutput, GitError> {
         let fetch = self.fetch_remote_branch(remote, branch)?;
+        self.ensure_remote_tracking_unchanged(remote, branch, expected_upstream_oid, "pull")?;
         let merge = self.run_args(vec![
             "merge".to_owned(),
             "--ff-only".to_owned(),
@@ -109,16 +117,15 @@ impl Git {
         &self,
         remote: &str,
         branch: &str,
-        allow_remote_ahead: bool,
+        expected_upstream_oid: Option<&str>,
     ) -> Result<GitOutput, GitError> {
         let fetch = self.fetch_remote_branch(remote, branch)?;
-        if !allow_remote_ahead && !self.remote_tracking_is_ancestor_of_head(remote, branch)? {
-            return Err(GitError::Blocked {
-                message:
-                    "pull rebase is blocked because the remote changed since the plan was shown"
-                        .to_owned(),
-            });
-        }
+        self.ensure_remote_tracking_unchanged(
+            remote,
+            branch,
+            expected_upstream_oid,
+            "pull rebase",
+        )?;
         let rebase = self.run_args(vec![
             "rebase".to_owned(),
             remote_tracking_ref(remote, branch),
@@ -139,9 +146,18 @@ impl Git {
         Ok(Some((remote, branch)))
     }
 
+    pub fn remote_tracking_oid(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<Option<String>, GitError> {
+        self.ref_oid(&remote_tracking_ref(remote, branch))
+    }
+
     fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
         self.run_args(vec![
             "fetch".to_owned(),
+            "--".to_owned(),
             remote.to_owned(),
             format!(
                 "refs/heads/{branch}:{}",
@@ -150,19 +166,31 @@ impl Git {
         ])
     }
 
-    fn remote_tracking_is_ancestor_of_head(
+    fn ensure_remote_tracking_unchanged(
         &self,
         remote: &str,
         branch: &str,
-    ) -> Result<bool, GitError> {
+        expected_oid: Option<&str>,
+        operation: &str,
+    ) -> Result<(), GitError> {
+        if self.remote_tracking_oid(remote, branch)?.as_deref() != expected_oid {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{operation} is blocked because the remote changed since the plan was shown"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ref_oid(&self, reference: &str) -> Result<Option<String>, GitError> {
         match self.run_args(vec![
-            "merge-base".to_owned(),
-            "--is-ancestor".to_owned(),
-            remote_tracking_ref(remote, branch),
-            "HEAD".to_owned(),
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            reference.to_owned(),
         ]) {
-            Ok(_output) => Ok(true),
-            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(false),
+            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(None),
             Err(error) => Err(error),
         }
     }
