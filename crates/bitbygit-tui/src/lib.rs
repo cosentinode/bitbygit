@@ -2,7 +2,7 @@ use std::error::Error;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -14,6 +14,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+const MAX_PROMPT_LEN: usize = 512;
+
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
     let mut app = App::new();
@@ -21,6 +23,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     loop {
         terminal.draw(|frame| {
             let areas = Viewport::split(frame.area());
+            app.ensure_visible_focus(&areas);
             render(&app, frame, &areas);
             app.last_viewport = areas;
         })?;
@@ -128,7 +131,11 @@ impl App {
             KeyCode::BackTab => self.focus = self.previous_visible_focus(),
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
-            KeyCode::Char(value) if self.focus == Focus::Prompt => self.prompt.push(value),
+            KeyCode::Char(value)
+                if self.focus == Focus::Prompt && self.prompt.len() < MAX_PROMPT_LEN =>
+            {
+                self.prompt.push(value);
+            }
             KeyCode::Backspace if self.focus == Focus::Prompt => {
                 let _removed = self.prompt.pop();
             }
@@ -138,7 +145,7 @@ impl App {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Key(key) => self.handle_key(key),
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(focus) = self.last_viewport.focus_at(mouse.column, mouse.row) {
                     self.focus = focus;
@@ -148,6 +155,12 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn ensure_visible_focus(&mut self, viewport: &Viewport) {
+        if self.focus == Focus::Queue && viewport.queue.area() == 0 {
+            self.focus = Focus::Prompt;
         }
     }
 
@@ -172,6 +185,14 @@ impl App {
 
     fn select_repo_at(&mut self, row: u16) {
         let first_row = self.last_viewport.repos.y.saturating_add(1);
+        let last_row = self
+            .last_viewport
+            .repos
+            .y
+            .saturating_add(self.last_viewport.repos.height.saturating_sub(1));
+        if row < first_row || row >= last_row {
+            return;
+        }
         let index = row.saturating_sub(first_row) as usize;
         if index < self.repos.len() {
             self.selected_repo = index;
@@ -421,6 +442,17 @@ mod tests {
     }
 
     #[test]
+    fn compact_resize_moves_hidden_queue_focus_to_prompt() {
+        let mut app = App::new();
+        let compact = Viewport::split(Rect::new(0, 0, 40, 12));
+        app.focus = Focus::Queue;
+
+        app.ensure_visible_focus(&compact);
+
+        assert_eq!(app.focus(), Focus::Prompt);
+    }
+
+    #[test]
     fn prompt_accepts_text_only_when_focused() {
         let mut app = App::new();
         app.handle_key(key(KeyCode::Char('x')));
@@ -447,6 +479,30 @@ mod tests {
 
         assert_eq!(app.prompt, "q");
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn key_release_events_do_not_change_prompt() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        app.handle_event(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        )));
+
+        assert!(app.prompt.is_empty());
+    }
+
+    #[test]
+    fn prompt_input_is_bounded() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        for _ in 0..MAX_PROMPT_LEN + 10 {
+            app.handle_key(key(KeyCode::Char('x')));
+        }
+
+        assert_eq!(app.prompt.len(), MAX_PROMPT_LEN);
     }
 
     #[test]
@@ -495,6 +551,21 @@ mod tests {
 
         assert_eq!(app.focus(), Focus::Repos);
         assert_eq!(app.selected_repo, 1);
+    }
+
+    #[test]
+    fn mouse_click_on_repo_border_does_not_select_repo() {
+        let mut app = App::new();
+        app.selected_repo = 2;
+        app.last_viewport = Viewport::split(Rect::new(0, 0, 100, 30));
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.last_viewport.repos.x,
+            row: app.last_viewport.repos.y,
+            modifiers: KeyModifiers::empty(),
+        }));
+
+        assert_eq!(app.selected_repo, 2);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
