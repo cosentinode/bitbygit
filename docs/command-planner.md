@@ -11,12 +11,14 @@ with suggestions.
 ## Planner Pipeline
 
 1. Normalize prompt text by trimming whitespace and matching case-insensitively.
-2. Tokenize supported connectors such as `and`, `then`, and `&&`.
-3. Parse each segment into a supported operation request.
-4. Validate that the sequence is allowed.
-5. Read repository state for preconditions.
-6. Produce a typed operation plan.
-7. Show the preview and required confirmations.
+2. Parse quoted strings before connector tokenization.
+3. Tokenize supported connectors such as `and`, `then`, and `&&` outside quoted
+   strings.
+4. Parse each segment into a supported operation request.
+5. Validate that the sequence is allowed.
+6. Read repository state for preconditions.
+7. Produce a typed operation plan.
+8. Show the preview and required confirmations.
 
 ## Supported MVP Prompts
 
@@ -34,6 +36,19 @@ Initial supported commands should include:
 
 The parser should also accept `pull rebase` and `open pull request` as aliases
 when the meaning is unambiguous.
+
+## Quoted Strings
+
+Quoted strings are atomic values. Connectors inside a quoted string are part of
+that value, not plan separators.
+
+For example, `commit -m "fix auth and routing" and push` should produce two
+steps:
+
+1. commit with message `fix auth and routing`
+2. push the current branch
+
+Unclosed quotes should fail closed with a parse error and no execution.
 
 ## Rejected Prompts
 

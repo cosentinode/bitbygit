@@ -47,13 +47,14 @@ High-risk operations require explicit confirmation and must explain the reason:
 - amend commit
 - abort merge or rebase
 - delete branch
-- reset any ref or working tree state
+- soft or mixed reset that moves a ref without discarding file content
 - stash pop or apply
 
 Blocked-by-default operations require a later dedicated design before support:
 
 - force push
 - hard reset
+- reset operations that discard file content
 - deleting untracked files
 - deleting a repository from disk
 - running custom user shell commands
