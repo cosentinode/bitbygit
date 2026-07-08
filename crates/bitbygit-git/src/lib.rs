@@ -95,11 +95,55 @@ impl Git {
     }
 
     pub fn commit(&self, message: &str) -> Result<GitOutput, GitError> {
-        self.run_args(vec![
-            "commit".to_owned(),
+        let staged_tree = self.staged_tree()?;
+        self.commit_staged_tree(message, &staged_tree)
+    }
+
+    pub fn commit_staged_tree(
+        &self,
+        message: &str,
+        staged_tree: &str,
+    ) -> Result<GitOutput, GitError> {
+        let parent = self.head_commit()?;
+        let mut commit_args = vec!["commit-tree".to_owned(), staged_tree.to_owned()];
+        if let Some(parent) = &parent {
+            commit_args.push("-p".to_owned());
+            commit_args.push(parent.clone());
+        }
+        commit_args.push("-m".to_owned());
+        commit_args.push(message.to_owned());
+
+        let commit_output = self.run_args(commit_args)?;
+        let commit_id = commit_output.stdout.trim().to_owned();
+        if commit_id.is_empty() {
+            return Err(GitError::Parse {
+                message: "git commit-tree did not return a commit id".to_owned(),
+            });
+        }
+
+        let mut update_args = vec![
+            "update-ref".to_owned(),
             "-m".to_owned(),
-            message.to_owned(),
-        ])
+            "bitbygit commit".to_owned(),
+            "HEAD".to_owned(),
+            commit_id.clone(),
+        ];
+        if let Some(parent) = parent {
+            update_args.push(parent);
+        }
+        let update_output = self.run_args(update_args)?;
+        let short_id = commit_id.chars().take(12).collect::<String>();
+        let stderr = [commit_output.stderr.trim(), update_output.stderr.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(GitOutput {
+            status: update_output.status,
+            stdout: format!("[{short_id}] {message}\n"),
+            stderr,
+        })
     }
 
     pub fn staged_tree(&self) -> Result<String, GitError> {
@@ -131,6 +175,18 @@ impl Git {
 
     fn is_unborn(&self) -> Result<bool, GitError> {
         Ok(self.branch_state()?.unborn)
+    }
+
+    fn head_commit(&self) -> Result<Option<String>, GitError> {
+        if self.is_unborn()? {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.run(["rev-parse", "--verify", "HEAD"])?
+                .stdout
+                .trim()
+                .to_owned(),
+        ))
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
@@ -1289,33 +1345,25 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
-    fn commit_surfaces_failing_hook_output() -> Result<(), Box<dyn Error>> {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn commit_staged_tree_uses_confirmed_tree() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         repo.run(["init", "-b", "main"])?;
         repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
         repo.run(["config", "user.name", "bitbygit test"])?;
         repo.write("README.md", "initial\n")?;
         repo.run(["add", "README.md"])?;
-        let hook = repo.path().join(".git").join("hooks").join("pre-commit");
-        fs::write(
-            &hook,
-            "#!/bin/sh\nprintf 'hook blocked commit\\n' >&2\nexit 1\n",
-        )?;
-        let mut permissions = fs::metadata(&hook)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions)?;
+        let git = Git::new(repo.path());
+        let confirmed_tree = git.staged_tree()?;
 
-        let result = Git::new(repo.path()).commit("blocked by hook");
+        repo.write("injected.txt", "not confirmed\n")?;
+        repo.run(["add", "injected.txt"])?;
+        git.commit_staged_tree("initial commit", &confirmed_tree)?;
 
-        let Err(error) = result else {
-            return Err("expected hook failure".into());
-        };
-        assert!(matches!(error, GitError::GitFailed { .. }));
-        assert!(error.to_string().contains("hook blocked commit"));
+        let files = repo.git_stdout(["ls-tree", "--name-only", "HEAD"])?;
+        assert!(files.contains("README.md"));
+        assert!(!files.contains("injected.txt"));
+        assert_eq!(git.status()?.staged_files().len(), 1);
         Ok(())
     }
 
@@ -1500,6 +1548,22 @@ mod tests {
                 .args(args)
                 .output()?;
             Ok(())
+        }
+
+        fn git_stdout<const N: usize>(&self, args: [&str; N]) -> Result<String, Box<dyn Error>> {
+            let output = Command::new("git")
+                .current_dir(&self.path)
+                .args(args)
+                .output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "git command failed with status {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
+            Ok(String::from_utf8(output.stdout)?)
         }
     }
 

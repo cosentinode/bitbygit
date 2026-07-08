@@ -386,7 +386,7 @@ impl App {
                     match Git::new(current_dir()).staged_tree() {
                         Ok(current_tree) if current_tree == staged_tree => {
                             run_audited_git_operation_with_output("commit", "commit", || {
-                                Git::new(current_dir()).commit(&message)
+                                Git::new(current_dir()).commit_staged_tree(&message, &staged_tree)
                             })
                         }
                         Ok(_current_tree) => "Commit blocked: staged content changed since the plan was shown. Re-run the commit prompt.".to_owned(),
@@ -924,7 +924,7 @@ struct PendingAudit {
 impl PendingAudit {
     fn finish(self, result: &Result<GitOutput, GitError>) -> Result<(), String> {
         let result_label = if result.is_ok() { "ok" } else { "error" };
-        let message = operation_result_message(result);
+        let message = audit_result_message(result);
         let entry = AuditEntry::new(None, self.operation, result_label, message.clone())
             .map_err(|error| format!("{message}; audit failed: {error}"))?;
         self.store
@@ -937,10 +937,19 @@ impl PendingAudit {
     }
 }
 
-fn operation_result_message(result: &Result<GitOutput, GitError>) -> String {
+fn audit_result_message(result: &Result<GitOutput, GitError>) -> String {
     match result {
         Ok(_output) => "completed".to_owned(),
-        Err(error) => error.to_string(),
+        Err(error) => sanitized_git_error(error),
+    }
+}
+
+fn sanitized_git_error(error: &GitError) -> String {
+    match error {
+        GitError::GitFailed { status, .. } => format!("git failed with status {status}"),
+        GitError::Io { .. } => "git failed before execution".to_owned(),
+        GitError::Utf8 { stream, .. } => format!("git returned non-UTF-8 {stream}"),
+        GitError::Parse { message } => format!("failed to parse git output: {message}"),
     }
 }
 
@@ -1438,6 +1447,33 @@ mod tests {
         assert_eq!(entries[1].operation, "stage_all");
         assert_eq!(entries[1].result, "error");
         assert_ne!(entries[1].message, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn audit_errors_do_not_persist_raw_git_output() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("sanitized-audit")?;
+        let status = std::process::Command::new("git")
+            .arg("not-a-real-bitbygit-command")
+            .output()?
+            .status;
+        let result: Result<GitOutput, GitError> = Err(GitError::GitFailed {
+            args: vec!["commit-tree".to_owned(), "<tree>".to_owned()],
+            status,
+            stdout: "raw stdout token".to_owned(),
+            stderr: "raw stderr secret".to_owned(),
+        });
+
+        let audit = begin_audit_operation_with_paths("commit", paths.clone())?;
+        let audit_result = audit.finish(&result);
+
+        assert!(audit_result.is_err());
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].result, "error");
+        assert!(entries[1].message.contains("git failed with status"));
+        assert!(!entries[1].message.contains("raw stdout token"));
+        assert!(!entries[1].message.contains("raw stderr secret"));
         Ok(())
     }
 
