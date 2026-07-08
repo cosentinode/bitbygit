@@ -29,6 +29,12 @@ Initial supported commands should include:
 - `push`
 - `pull`
 - `pull --rebase`
+- `branches`
+- `checkout <branch>`
+- `branch <name>`
+- `branch <name> from <base>`
+- `merge <branch>`
+- `rebase <base>`
 - `commit`
 - `commit -m "message"`
 - `commit and push`

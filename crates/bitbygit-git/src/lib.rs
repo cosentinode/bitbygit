@@ -67,6 +67,120 @@ impl Git {
         self.run(["fetch"])
     }
 
+    pub fn branches(&self) -> Result<Vec<BranchInfo>, GitError> {
+        let output = self.run_args(vec![
+            "for-each-ref".to_owned(),
+            "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(upstream:short)%00%(HEAD)"
+                .to_owned(),
+            "refs/heads".to_owned(),
+            "refs/remotes".to_owned(),
+        ])?;
+        parse_branches(&output.stdout)
+    }
+
+    pub fn branch_target(&self, name: &str) -> Result<Option<BranchTarget>, GitError> {
+        Ok(self
+            .branches()?
+            .into_iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| BranchTarget {
+                name: branch.name,
+                reference: branch.reference,
+                oid: branch.oid,
+                kind: branch.kind,
+            }))
+    }
+
+    pub fn checkout_branch(
+        &self,
+        branch: &BranchTarget,
+        expected_target: &HeadTarget,
+    ) -> Result<GitOutput, GitError> {
+        self.ensure_clean_worktree("checkout")?;
+        self.ensure_head_target_unchanged(expected_target, "checkout")?;
+        self.ensure_branch_target_unchanged(branch, "checkout")?;
+        match branch.kind {
+            BranchKind::Local => self.run_args(vec![
+                "switch".to_owned(),
+                "--".to_owned(),
+                branch.name.clone(),
+            ]),
+            BranchKind::Remote => self.run_args(vec![
+                "switch".to_owned(),
+                "--track".to_owned(),
+                "--".to_owned(),
+                branch.name.clone(),
+            ]),
+        }
+    }
+
+    pub fn create_branch(
+        &self,
+        branch: &str,
+        base: Option<&BranchTarget>,
+        expected_target: &HeadTarget,
+    ) -> Result<GitOutput, GitError> {
+        self.ensure_valid_new_branch_name(branch)?;
+        self.ensure_clean_worktree("create branch")?;
+        self.ensure_head_target_unchanged(expected_target, "create branch")?;
+        if base.is_none() && expected_target.oid.is_none() {
+            return Err(GitError::Blocked {
+                message: "create branch is blocked because the current branch has no commit"
+                    .to_owned(),
+            });
+        }
+        if self.branch_target(branch)?.is_some() {
+            return Err(GitError::Blocked {
+                message: format!("create branch is blocked because {branch} already exists"),
+            });
+        }
+        if let Some(base) = base {
+            self.ensure_branch_target_unchanged(base, "create branch")?;
+        }
+        let start = base
+            .map(|base| base.reference.clone())
+            .unwrap_or_else(|| "HEAD".to_owned());
+        self.run_args(vec![
+            "switch".to_owned(),
+            "-c".to_owned(),
+            branch.to_owned(),
+            "--".to_owned(),
+            start,
+        ])
+    }
+
+    pub fn merge_ff_only(
+        &self,
+        branch: &BranchTarget,
+        expected_target: &HeadTarget,
+    ) -> Result<GitOutput, GitError> {
+        self.ensure_clean_worktree("merge")?;
+        self.ensure_head_target_unchanged(expected_target, "merge")?;
+        self.ensure_branch_target_unchanged(branch, "merge")?;
+        let Some(current_oid) = &expected_target.oid else {
+            return Err(GitError::Blocked {
+                message: "merge is blocked because the current branch has no commit".to_owned(),
+            });
+        };
+        self.ensure_ancestor(current_oid, &branch.oid, "merge")?;
+        self.run_args(vec![
+            "merge".to_owned(),
+            "--ff-only".to_owned(),
+            branch.oid.clone(),
+        ])
+    }
+
+    pub fn rebase_onto(
+        &self,
+        base: &BranchTarget,
+        expected_target: &HeadTarget,
+    ) -> Result<GitOutput, GitError> {
+        self.ensure_clean_worktree("rebase")?;
+        self.ensure_head_target_unchanged(expected_target, "rebase")?;
+        self.ensure_branch_target_unchanged(base, "rebase")?;
+        self.run_args(vec!["rebase".to_owned(), base.oid.clone()])
+    }
+
     pub fn push_current_branch(
         &self,
         remote: &str,
@@ -283,6 +397,89 @@ impl Git {
             });
         }
         Ok(())
+    }
+
+    fn ensure_clean_worktree(&self, operation: &str) -> Result<(), GitError> {
+        let status = self.status()?;
+        if !status.conflicted_files().is_empty() {
+            return Err(GitError::Blocked {
+                message: format!("{operation} is blocked while conflicts are present"),
+            });
+        }
+        if !status.is_clean() {
+            return Err(GitError::Blocked {
+                message: format!("{operation} is blocked because the working tree is not clean"),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_branch_target_unchanged(
+        &self,
+        expected_branch: &BranchTarget,
+        operation: &str,
+    ) -> Result<(), GitError> {
+        match self.branch_target(&expected_branch.name)? {
+            Some(branch) if branch == *expected_branch => Ok(()),
+            Some(_branch) => Err(GitError::Blocked {
+                message: format!(
+                    "{operation} is blocked because {} changed since the plan was shown",
+                    expected_branch.name
+                ),
+            }),
+            None => Err(GitError::Blocked {
+                message: format!(
+                    "{operation} is blocked because {} no longer exists",
+                    expected_branch.name
+                ),
+            }),
+        }
+    }
+
+    fn ensure_valid_new_branch_name(&self, branch: &str) -> Result<(), GitError> {
+        if branch.starts_with('-') || branch.trim() != branch || branch.is_empty() {
+            return Err(GitError::Blocked {
+                message: "create branch is blocked because the branch name is invalid".to_owned(),
+            });
+        }
+        match self.run_args(vec![
+            "check-ref-format".to_owned(),
+            "--branch".to_owned(),
+            branch.to_owned(),
+        ]) {
+            Ok(_output) => Ok(()),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => {
+                Err(GitError::Blocked {
+                    message: "create branch is blocked because the branch name is invalid"
+                        .to_owned(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn ensure_ancestor(
+        &self,
+        ancestor: &str,
+        descendant: &str,
+        operation: &str,
+    ) -> Result<(), GitError> {
+        match self.run_args(vec![
+            "merge-base".to_owned(),
+            "--is-ancestor".to_owned(),
+            ancestor.to_owned(),
+            descendant.to_owned(),
+        ]) {
+            Ok(_output) => Ok(()),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => {
+                Err(GitError::Blocked {
+                    message: format!(
+                        "{operation} is blocked because it cannot fast-forward cleanly"
+                    ),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn ref_oid(&self, reference: &str) -> Result<Option<String>, GitError> {
@@ -755,6 +952,30 @@ pub struct GitOutput {
 pub struct HeadTarget {
     pub oid: Option<String>,
     pub reference: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub reference: String,
+    pub oid: String,
+    pub upstream: Option<String>,
+    pub current: bool,
+    pub kind: BranchKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchTarget {
+    pub name: String,
+    pub reference: String,
+    pub oid: String,
+    pub kind: BranchKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchKind {
+    Local,
+    Remote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1237,6 +1458,44 @@ fn parse_remotes(input: &str) -> Vec<Remote> {
     remotes.into_values().collect()
 }
 
+fn parse_branches(input: &str) -> Result<Vec<BranchInfo>, GitError> {
+    let mut branches = Vec::new();
+    for line in input.lines().filter(|line| !line.trim().is_empty()) {
+        let branch = parse_branch_line(line)?;
+        if branch.kind == BranchKind::Remote && branch.name.ends_with("/HEAD") {
+            continue;
+        }
+        branches.push(branch);
+    }
+    Ok(branches)
+}
+
+fn parse_branch_line(line: &str) -> Result<BranchInfo, GitError> {
+    let fields = line.split('\0').collect::<Vec<_>>();
+    let [reference, name, oid, upstream, head] = fields.as_slice() else {
+        return Err(GitError::Parse {
+            message: "git branch list output has unexpected fields".to_owned(),
+        });
+    };
+    let kind = if reference.starts_with("refs/heads/") {
+        BranchKind::Local
+    } else if reference.starts_with("refs/remotes/") {
+        BranchKind::Remote
+    } else {
+        return Err(GitError::Parse {
+            message: format!("unsupported branch reference: {reference}"),
+        });
+    };
+    Ok(BranchInfo {
+        name: (*name).to_owned(),
+        reference: (*reference).to_owned(),
+        oid: (*oid).to_owned(),
+        upstream: (!upstream.is_empty()).then(|| (*upstream).to_owned()),
+        current: *head == "*",
+        kind,
+    })
+}
+
 fn strip_byte_line_ending(value: &[u8]) -> &[u8] {
     value.strip_suffix(b"\n").unwrap_or(value)
 }
@@ -1481,6 +1740,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_branches_and_skips_remote_head() -> Result<(), Box<dyn Error>> {
+        let branches = parse_branches(
+            "refs/heads/main\x00main\x001111111111111111111111111111111111111111\x00origin/main\x00*\nrefs/remotes/origin/main\x00origin/main\x002222222222222222222222222222222222222222\x00\x00\nrefs/remotes/origin/HEAD\x00origin/HEAD\x002222222222222222222222222222222222222222\x00\x00\n",
+        )?;
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert_eq!(branches[0].kind, BranchKind::Local);
+        assert!(branches[0].current);
+        assert_eq!(branches[0].upstream.as_deref(), Some("origin/main"));
+        assert_eq!(branches[1].name, "origin/main");
+        assert_eq!(branches[1].kind, BranchKind::Remote);
+        Ok(())
+    }
+
+    #[test]
     fn reads_repository_state_from_temp_repo() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         repo.run(["init", "-b", "main"])?;
@@ -1502,6 +1777,66 @@ mod tests {
         assert_eq!(state.status.staged_files().len(), 1);
         assert_eq!(state.status.unstaged_files().len(), 1);
         assert_eq!(state.status.untracked_files().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn branch_workflows_create_checkout_merge_and_rebase() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        let git = Git::new(repo.path());
+
+        git.create_branch("feature", None, &git.head_target()?)?;
+        repo.write("feature.txt", "feature\n")?;
+        repo.run(["add", "feature.txt"])?;
+        repo.run(["commit", "-m", "feature"])?;
+        let feature = git.branch_target("feature")?.ok_or("missing feature")?;
+        let main = git.branch_target("main")?.ok_or("missing main")?;
+        git.checkout_branch(&main, &git.head_target()?)?;
+        git.merge_ff_only(&feature, &git.head_target()?)?;
+        assert!(repo.path().join("feature.txt").exists());
+
+        git.create_branch("topic", None, &git.head_target()?)?;
+        repo.write("topic.txt", "topic\n")?;
+        repo.run(["add", "topic.txt"])?;
+        repo.run(["commit", "-m", "topic"])?;
+        let main = git.branch_target("main")?.ok_or("missing main")?;
+        git.checkout_branch(&main, &git.head_target()?)?;
+        repo.write("base.txt", "base\n")?;
+        repo.run(["add", "base.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        let topic = git.branch_target("topic")?.ok_or("missing topic")?;
+        git.checkout_branch(&topic, &git.head_target()?)?;
+        let main = git.branch_target("main")?.ok_or("missing main")?;
+        git.rebase_onto(&main, &git.head_target()?)?;
+
+        repo.run(["merge-base", "--is-ancestor", "main", "HEAD"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn branch_workflows_block_dirty_tree() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "dirty\n")?;
+        let git = Git::new(repo.path());
+
+        let result = git.create_branch("feature", None, &git.head_target()?);
+
+        let Err(error) = result else {
+            return Err("expected dirty tree guardrail".into());
+        };
+        assert!(error.to_string().contains("working tree is not clean"));
         Ok(())
     }
 

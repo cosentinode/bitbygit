@@ -22,3 +22,5 @@ semantic versioning once releases begin.
   commit execution and audit entries.
 - Added typed fetch, pull, pull-rebase, push, and push-with-upstream workflows
   with confirmations for mutating sync operations and ahead/behind visibility.
+- Added typed branch listing, checkout, branch creation, fast-forward merge, and
+  rebase workflows with dirty-tree guardrails and confirmation plans.
