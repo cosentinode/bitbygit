@@ -1,0 +1,5 @@
+/target/
+/.beads/
+/.DS_Store
+*.swp
+*.swo
