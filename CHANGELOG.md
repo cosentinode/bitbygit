@@ -10,3 +10,5 @@ semantic versioning once releases begin.
 - Established the initial repository foundation.
 - Documented the product architecture, guardrail policy, command planner, and
   system Git ADR.
+- Added the initial typed system Git command layer with porcelain v2 status
+  parsing and temporary-repository tests.

@@ -1,0 +1,699 @@
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::path::PathBuf;
+use std::process::{Command, ExitStatus};
+use std::string::FromUtf8Error;
+
+#[derive(Debug, Clone)]
+pub struct Git {
+    cwd: PathBuf,
+}
+
+impl Git {
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: cwd.into() }
+    }
+
+    pub fn repository(&self) -> Result<Repository, GitError> {
+        let root = self.repo_root()?;
+        let branch = self.branch_state()?;
+        let remotes = self.remotes()?;
+        let status = self.status()?;
+
+        Ok(Repository {
+            root,
+            branch,
+            remotes,
+            status,
+        })
+    }
+
+    pub fn repo_root(&self) -> Result<PathBuf, GitError> {
+        let output = self.run(["rev-parse", "--show-toplevel"])?;
+        Ok(PathBuf::from(output.stdout.trim()))
+    }
+
+    pub fn branch_state(&self) -> Result<BranchState, GitError> {
+        let status = self.status()?;
+        Ok(status.branch)
+    }
+
+    pub fn remotes(&self) -> Result<Vec<Remote>, GitError> {
+        let output = self.run(["remote", "-v"])?;
+        Ok(parse_remotes(&output.stdout))
+    }
+
+    pub fn upstream(&self) -> Result<Option<String>, GitError> {
+        match self.run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
+            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
+            Err(GitError::GitFailed { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn status(&self) -> Result<WorktreeStatus, GitError> {
+        let output = self.run(["status", "--porcelain=v2", "--branch"])?;
+        parse_status(&output.stdout)
+    }
+
+    pub fn run<const N: usize>(&self, args: [&str; N]) -> Result<GitOutput, GitError> {
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        self.run_args(args)
+    }
+
+    fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
+        let output = Command::new("git")
+            .current_dir(&self.cwd)
+            .args(&args)
+            .output()
+            .map_err(|source| GitError::Io {
+                args: args.clone(),
+                source,
+            })?;
+
+        let stdout = String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
+            args: args.clone(),
+            stream: OutputStream::Stdout,
+            source,
+        })?;
+        let stderr = String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
+            args: args.clone(),
+            stream: OutputStream::Stderr,
+            source,
+        })?;
+
+        if !output.status.success() {
+            return Err(GitError::GitFailed {
+                args,
+                status: output.status,
+                stdout,
+                stderr,
+            });
+        }
+
+        Ok(GitOutput {
+            status: output.status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repository {
+    pub root: PathBuf,
+    pub branch: BranchState,
+    pub remotes: Vec<Remote>,
+    pub status: WorktreeStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOutput {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug)]
+pub enum GitError {
+    Io {
+        args: Vec<String>,
+        source: std::io::Error,
+    },
+    Utf8 {
+        args: Vec<String>,
+        stream: OutputStream,
+        source: FromUtf8Error,
+    },
+    GitFailed {
+        args: Vec<String>,
+        status: ExitStatus,
+        stdout: String,
+        stderr: String,
+    },
+    Parse {
+        message: String,
+    },
+}
+
+impl Display for GitError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { args, source } => {
+                write!(formatter, "failed to run git {}: {source}", args.join(" "))
+            }
+            Self::Utf8 {
+                args,
+                stream,
+                source,
+            } => write!(
+                formatter,
+                "git {} returned non-UTF-8 {stream}: {source}",
+                args.join(" ")
+            ),
+            Self::GitFailed {
+                args,
+                status,
+                stderr,
+                ..
+            } => write!(
+                formatter,
+                "git {} failed with status {status}: {}",
+                args.join(" "),
+                stderr.trim()
+            ),
+            Self::Parse { message } => write!(formatter, "failed to parse git output: {message}"),
+        }
+    }
+}
+
+impl Error for GitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Utf8 { source, .. } => Some(source),
+            Self::GitFailed { .. } | Self::Parse { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl Display for OutputStream {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdout => formatter.write_str("stdout"),
+            Self::Stderr => formatter.write_str("stderr"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchState {
+    pub head: Head,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+impl Default for BranchState {
+    fn default() -> Self {
+        Self {
+            head: Head::Unborn,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Head {
+    Branch(String),
+    Detached(String),
+    Unborn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    pub name: String,
+    pub fetch_url: Option<String>,
+    pub push_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub branch: BranchState,
+    pub entries: Vec<StatusEntry>,
+}
+
+impl WorktreeStatus {
+    pub fn is_clean(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn staged_files(&self) -> Vec<&StatusEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.index != ChangeKind::Unmodified)
+            .collect()
+    }
+
+    pub fn unstaged_files(&self) -> Vec<&StatusEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.entry_type,
+                    StatusEntryType::Ordinary | StatusEntryType::Renamed
+                ) && entry.worktree != ChangeKind::Unmodified
+            })
+            .collect()
+    }
+
+    pub fn untracked_files(&self) -> Vec<&StatusEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.entry_type == StatusEntryType::Untracked)
+            .collect()
+    }
+
+    pub fn conflicted_files(&self) -> Vec<&StatusEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.entry_type == StatusEntryType::Conflict)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub path: String,
+    pub original_path: Option<String>,
+    pub index: ChangeKind,
+    pub worktree: ChangeKind,
+    pub entry_type: StatusEntryType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusEntryType {
+    Ordinary,
+    Renamed,
+    Untracked,
+    Ignored,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Unmodified,
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    Unmerged,
+    Untracked,
+    Ignored,
+    Unknown(char),
+}
+
+pub fn parse_status(input: &str) -> Result<WorktreeStatus, GitError> {
+    let mut branch = BranchState::default();
+    let mut oid = None;
+    let mut entries = Vec::new();
+
+    for line in input.lines() {
+        if let Some(value) = line.strip_prefix("# branch.oid ") {
+            oid = Some(value.to_owned());
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("# branch.head ") {
+            branch.head = if value == "(detached)" {
+                Head::Detached(oid.clone().unwrap_or_default())
+            } else {
+                Head::Branch(value.to_owned())
+            };
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("# branch.upstream ") {
+            branch.upstream = Some(value.to_owned());
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("# branch.ab ") {
+            let (ahead, behind) = parse_ahead_behind(value)?;
+            branch.ahead = ahead;
+            branch.behind = behind;
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("? ") {
+            entries.push(StatusEntry {
+                path: path.to_owned(),
+                original_path: None,
+                index: ChangeKind::Unmodified,
+                worktree: ChangeKind::Untracked,
+                entry_type: StatusEntryType::Untracked,
+            });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("! ") {
+            entries.push(StatusEntry {
+                path: path.to_owned(),
+                original_path: None,
+                index: ChangeKind::Unmodified,
+                worktree: ChangeKind::Ignored,
+                entry_type: StatusEntryType::Ignored,
+            });
+            continue;
+        }
+
+        if line.starts_with("1 ") {
+            entries.push(parse_ordinary_entry(line)?);
+            continue;
+        }
+
+        if line.starts_with("2 ") {
+            entries.push(parse_renamed_entry(line)?);
+            continue;
+        }
+
+        if line.starts_with("u ") {
+            entries.push(parse_conflict_entry(line)?);
+        }
+    }
+
+    Ok(WorktreeStatus { branch, entries })
+}
+
+fn parse_ahead_behind(value: &str) -> Result<(u32, u32), GitError> {
+    let mut parts = value.split_whitespace();
+    let ahead = parts
+        .next()
+        .ok_or_else(|| parse_error("missing ahead count"))?
+        .strip_prefix('+')
+        .ok_or_else(|| parse_error("ahead count must start with +"))?
+        .parse::<u32>()
+        .map_err(|_| parse_error("ahead count is not a number"))?;
+    let behind = parts
+        .next()
+        .ok_or_else(|| parse_error("missing behind count"))?
+        .strip_prefix('-')
+        .ok_or_else(|| parse_error("behind count must start with -"))?
+        .parse::<u32>()
+        .map_err(|_| parse_error("behind count is not a number"))?;
+    Ok((ahead, behind))
+}
+
+fn parse_ordinary_entry(line: &str) -> Result<StatusEntry, GitError> {
+    let parts = line.splitn(9, ' ').collect::<Vec<_>>();
+    let xy = parts
+        .get(1)
+        .copied()
+        .ok_or_else(|| parse_error("ordinary entry missing status"))?;
+    let path = parts
+        .get(8)
+        .copied()
+        .ok_or_else(|| parse_error("ordinary entry missing path"))?;
+    let (index, worktree) = parse_xy(xy)?;
+
+    Ok(StatusEntry {
+        path: path.to_owned(),
+        original_path: None,
+        index,
+        worktree,
+        entry_type: StatusEntryType::Ordinary,
+    })
+}
+
+fn parse_renamed_entry(line: &str) -> Result<StatusEntry, GitError> {
+    let parts = line.splitn(10, ' ').collect::<Vec<_>>();
+    let xy = parts
+        .get(1)
+        .copied()
+        .ok_or_else(|| parse_error("renamed entry missing status"))?;
+    let path_pair = parts
+        .get(9)
+        .copied()
+        .ok_or_else(|| parse_error("renamed entry missing path"))?;
+    let (path, original_path) = path_pair
+        .split_once('\t')
+        .ok_or_else(|| parse_error("renamed entry missing original path"))?;
+    let (index, worktree) = parse_xy(xy)?;
+
+    Ok(StatusEntry {
+        path: path.to_owned(),
+        original_path: Some(original_path.to_owned()),
+        index,
+        worktree,
+        entry_type: StatusEntryType::Renamed,
+    })
+}
+
+fn parse_conflict_entry(line: &str) -> Result<StatusEntry, GitError> {
+    let parts = line.splitn(11, ' ').collect::<Vec<_>>();
+    let path = parts
+        .get(10)
+        .copied()
+        .ok_or_else(|| parse_error("conflict entry missing path"))?;
+
+    Ok(StatusEntry {
+        path: path.to_owned(),
+        original_path: None,
+        index: ChangeKind::Unmerged,
+        worktree: ChangeKind::Unmerged,
+        entry_type: StatusEntryType::Conflict,
+    })
+}
+
+fn parse_xy(value: &str) -> Result<(ChangeKind, ChangeKind), GitError> {
+    let mut chars = value.chars();
+    let index = chars
+        .next()
+        .ok_or_else(|| parse_error("missing index status"))?;
+    let worktree = chars
+        .next()
+        .ok_or_else(|| parse_error("missing worktree status"))?;
+    Ok((change_kind(index), change_kind(worktree)))
+}
+
+fn change_kind(value: char) -> ChangeKind {
+    match value {
+        '.' => ChangeKind::Unmodified,
+        'M' => ChangeKind::Modified,
+        'A' => ChangeKind::Added,
+        'D' => ChangeKind::Deleted,
+        'R' => ChangeKind::Renamed,
+        'C' => ChangeKind::Copied,
+        'U' => ChangeKind::Unmerged,
+        '?' => ChangeKind::Untracked,
+        '!' => ChangeKind::Ignored,
+        other => ChangeKind::Unknown(other),
+    }
+}
+
+fn parse_remotes(input: &str) -> Vec<Remote> {
+    let mut remotes = BTreeMap::<String, Remote>::new();
+
+    for line in input.lines() {
+        let Some((name, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some((url, kind)) = rest.rsplit_once(' ') else {
+            continue;
+        };
+
+        let remote = remotes.entry(name.to_owned()).or_insert_with(|| Remote {
+            name: name.to_owned(),
+            fetch_url: None,
+            push_url: None,
+        });
+
+        match kind {
+            "(fetch)" => remote.fetch_url = Some(url.to_owned()),
+            "(push)" => remote.push_url = Some(url.to_owned()),
+            _ => {}
+        }
+    }
+
+    remotes.into_values().collect()
+}
+
+fn parse_error(message: &str) -> GitError {
+    GitError::Parse {
+        message: message.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_REPO_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn parses_clean_status() -> Result<(), Box<dyn Error>> {
+        let status = parse_status(
+            "# branch.oid 1234567\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
+        )?;
+
+        assert!(status.is_clean());
+        assert_eq!(status.branch.head, Head::Branch("main".to_owned()));
+        assert_eq!(status.branch.upstream, Some("origin/main".to_owned()));
+        assert_eq!(status.branch.ahead, 0);
+        assert_eq!(status.branch.behind, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_dirty_unstaged_file() -> Result<(), Box<dyn Error>> {
+        let status = parse_status(
+            "# branch.oid 1234567\n# branch.head main\n1 .M N... 100644 100644 100644 abc abc README.md\n",
+        )?;
+
+        assert_eq!(status.unstaged_files().len(), 1);
+        assert_eq!(status.entries[0].path, "README.md");
+        assert_eq!(status.entries[0].worktree, ChangeKind::Modified);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_staged_file() -> Result<(), Box<dyn Error>> {
+        let status = parse_status(
+            "# branch.oid 1234567\n# branch.head main\n1 A. N... 000000 100644 100644 zero abc src/main.rs\n",
+        )?;
+
+        assert_eq!(status.staged_files().len(), 1);
+        assert_eq!(status.entries[0].index, ChangeKind::Added);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_untracked_file() -> Result<(), Box<dyn Error>> {
+        let status = parse_status("# branch.head main\n? notes.txt\n")?;
+
+        assert_eq!(status.untracked_files().len(), 1);
+        assert_eq!(status.entries[0].entry_type, StatusEntryType::Untracked);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_renamed_file() -> Result<(), Box<dyn Error>> {
+        let status = parse_status(
+            "# branch.head main\n2 R. N... 100644 100644 100644 abc def R100 new.txt\told.txt\n",
+        )?;
+
+        assert_eq!(status.entries[0].entry_type, StatusEntryType::Renamed);
+        assert_eq!(status.entries[0].path, "new.txt");
+        assert_eq!(status.entries[0].original_path, Some("old.txt".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_conflicted_file() -> Result<(), Box<dyn Error>> {
+        let status = parse_status(
+            "# branch.head main\nu UU N... 100644 100644 100644 100644 one two three conflict.txt\n",
+        )?;
+
+        assert_eq!(status.conflicted_files().len(), 1);
+        assert_eq!(status.entries[0].entry_type, StatusEntryType::Conflict);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_repository_state_from_temp_repo() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.write("README.md", "changed\n")?;
+        repo.write("staged.txt", "staged\n")?;
+        repo.run(["add", "staged.txt"])?;
+        repo.write("untracked.txt", "untracked\n")?;
+
+        let git = Git::new(repo.path());
+        let state = git.repository()?;
+
+        assert_eq!(state.root, repo.path());
+        assert_eq!(state.branch.head, Head::Branch("main".to_owned()));
+        assert_eq!(state.status.staged_files().len(), 1);
+        assert_eq!(state.status.unstaged_files().len(), 1);
+        assert_eq!(state.status.untracked_files().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_conflicts_in_temp_repo() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["checkout", "-b", "other"])?;
+        repo.write("conflict.txt", "other\n")?;
+        repo.run(["commit", "-am", "other"])?;
+        repo.run(["checkout", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.run(["commit", "-am", "main"])?;
+        repo.run_allow_failure(["merge", "other"])?;
+
+        let status = Git::new(repo.path()).status()?;
+
+        assert_eq!(status.conflicted_files().len(), 1);
+        assert_eq!(status.conflicted_files()[0].path, "conflict.txt");
+        Ok(())
+    }
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new() -> Result<Self, Box<dyn Error>> {
+            let id = NEXT_REPO_ID.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("bitbygit-test-{}-{id}", std::process::id()));
+            if path.exists() {
+                fs::remove_dir_all(&path)?;
+            }
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> PathBuf {
+            self.path.clone()
+        }
+
+        fn write(&self, relative_path: &str, contents: &str) -> Result<(), Box<dyn Error>> {
+            fs::write(self.path.join(relative_path), contents)?;
+            Ok(())
+        }
+
+        fn run<const N: usize>(&self, args: [&str; N]) -> Result<(), Box<dyn Error>> {
+            let output = Command::new("git")
+                .current_dir(&self.path)
+                .args(args)
+                .output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "git command failed with status {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
+            Ok(())
+        }
+
+        fn run_allow_failure<const N: usize>(&self, args: [&str; N]) -> Result<(), Box<dyn Error>> {
+            let _output = Command::new("git")
+                .current_dir(&self.path)
+                .args(args)
+                .output()?;
+            Ok(())
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _result = fs::remove_dir_all(&self.path);
+        }
+    }
+}
