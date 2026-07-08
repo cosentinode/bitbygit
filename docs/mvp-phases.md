@@ -26,7 +26,7 @@ Success condition:
 
 Status:
 
-- in review
+- merged
 
 Must have:
 
@@ -42,6 +42,10 @@ Success condition:
 - risky Git workflows have a documented design before implementation
 
 ## Phase 2: Typed system Git command layer
+
+Status:
+
+- in progress
 
 Must have:
 

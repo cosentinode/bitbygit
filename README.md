@@ -29,7 +29,7 @@ keeping risky operations visible, typed, previewed, and confirmed.
 
 ## Current Status
 
-The repository is in Phase 1 architecture and guardrails work. See
+The repository is in Phase 2 typed Git command layer work. See
 [`docs/mvp-phases.md`](docs/mvp-phases.md) for the implementation roadmap.
 
 ## Development
