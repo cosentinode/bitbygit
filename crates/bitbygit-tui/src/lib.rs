@@ -376,11 +376,18 @@ impl App {
                     }
                 })
             }
-            PendingAction::Commit { message, .. } => {
-                run_audited_git_operation_with_output("commit", "commit", || {
-                    Git::new(current_dir()).commit(&message)
-                })
-            }
+            PendingAction::Commit {
+                message,
+                staged_items,
+            } => match Git::new(current_dir()).status() {
+                Ok(current_status) if staged_plan_items(&current_status.entries) == staged_items => {
+                    run_audited_git_operation_with_output("commit", "commit", || {
+                        Git::new(current_dir()).commit(&message)
+                    })
+                }
+                Ok(_current_status) => "Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned(),
+                Err(error) => format!("Unable to validate commit plan: {error}"),
+            },
         };
         self.refresh_status();
         self.details = message;
@@ -401,14 +408,16 @@ impl App {
                 return;
             }
         };
-        let staged_count = status.staged_files().len();
-        if staged_count == 0 {
+        let staged_items = staged_plan_items(&status.entries);
+        if staged_items.is_empty() {
             self.details = "Commit blocked: there are no staged changes.".to_owned();
             return;
         }
+        let staged_count = staged_items.len();
 
         self.pending_confirmation = Some(PendingAction::Commit {
             message: message.clone(),
+            staged_items,
         });
         self.prompt.clear();
         self.details = format!(
@@ -441,7 +450,10 @@ impl App {
 enum PendingAction {
     StageAll,
     UnstageAll,
-    Commit { message: String },
+    Commit {
+        message: String,
+        staged_items: Vec<String>,
+    },
 }
 
 impl PendingAction {
@@ -695,6 +707,17 @@ fn pathspecs_for_entry(entry: &StatusEntry, section: FileSection) -> Vec<std::pa
         }
         _ => vec![entry.path.clone()],
     }
+}
+
+fn staged_plan_items(entries: &[StatusEntry]) -> Vec<String> {
+    let mut items = entries
+        .iter()
+        .flat_map(FileRow::from_entry)
+        .filter(|row| row.section == FileSection::Staged)
+        .map(|row| row.label)
+        .collect::<Vec<_>>();
+    items.sort();
+    items
 }
 
 fn repo_list(app: &App) -> List<'_> {
@@ -1198,6 +1221,31 @@ mod tests {
     }
 
     #[test]
+    fn staged_plan_items_include_only_staged_rows() {
+        let entries = vec![
+            StatusEntry {
+                path: std::path::PathBuf::from("staged.txt"),
+                original_path: None,
+                index: ChangeKind::Added,
+                worktree: ChangeKind::Unmodified,
+                entry_type: StatusEntryType::Ordinary,
+            },
+            StatusEntry {
+                path: std::path::PathBuf::from("unstaged.txt"),
+                original_path: None,
+                index: ChangeKind::Unmodified,
+                worktree: ChangeKind::Modified,
+                entry_type: StatusEntryType::Ordinary,
+            },
+        ];
+
+        let items = staged_plan_items(&entries);
+
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("staged.txt"));
+    }
+
+    #[test]
     fn status_window_follows_selected_file() {
         let mut app = App::new();
         app.focus = Focus::Status;
@@ -1299,13 +1347,19 @@ mod tests {
             stderr: String::from_utf8(output.stderr)?,
         });
 
-        for operation in ["stage_path", "unstage_path", "stage_all", "unstage_all"] {
+        for operation in [
+            "stage_path",
+            "unstage_path",
+            "stage_all",
+            "unstage_all",
+            "commit",
+        ] {
             let audit = begin_audit_operation_with_paths(operation, paths.clone())?;
             audit.finish(&result)?;
         }
 
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
-        assert_eq!(entries.len(), 8);
+        assert_eq!(entries.len(), 10);
         assert_eq!(entries[0].operation, "stage_path");
         assert_eq!(entries[0].result, "started");
         assert_eq!(entries[1].operation, "stage_path");
@@ -1316,6 +1370,8 @@ mod tests {
         assert_eq!(entries[5].operation, "stage_all");
         assert_eq!(entries[6].operation, "unstage_all");
         assert_eq!(entries[7].operation, "unstage_all");
+        assert_eq!(entries[8].operation, "commit");
+        assert_eq!(entries[9].operation, "commit");
         assert!(
             entries
                 .iter()

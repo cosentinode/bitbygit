@@ -1285,6 +1285,36 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn commit_surfaces_failing_hook_output() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        let hook = repo.path().join(".git").join("hooks").join("pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'hook blocked commit\\n' >&2\nexit 1\n",
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+
+        let result = Git::new(repo.path()).commit("blocked by hook");
+
+        let Err(error) = result else {
+            return Err("expected hook failure".into());
+        };
+        assert!(matches!(error, GitError::GitFailed { .. }));
+        assert!(error.to_string().contains("hook blocked commit"));
+        Ok(())
+    }
+
     #[test]
     fn returns_diff_for_selected_path() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
