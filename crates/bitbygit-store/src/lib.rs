@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -153,7 +153,7 @@ impl LocalStore {
     }
 
     pub fn load_state(&self) -> Result<AppState, StoreError> {
-        let contents = read_optional(&self.paths.state_file)?;
+        let contents = read_snapshot_optional(&self.paths.state_file)?;
         let Some(contents) = contents else {
             return Ok(AppState::default());
         };
@@ -211,7 +211,7 @@ impl LocalStore {
     }
 
     fn save_state(&self, state: &AppState) -> Result<(), StoreError> {
-        write_atomic(&self.paths.state_file, &format_state(state))
+        write_snapshot(&self.paths.state_file, &format_state(state))
     }
 
     fn require_registered(&self, id: &RepoId) -> Result<(), StoreError> {
@@ -223,7 +223,7 @@ impl LocalStore {
     }
 
     fn load_registry_map(&self) -> Result<BTreeMap<RepoId, RepositoryRecord>, StoreError> {
-        let contents = read_optional(&self.paths.registry_file)?;
+        let contents = read_snapshot_optional(&self.paths.registry_file)?;
         let Some(contents) = contents else {
             return Ok(BTreeMap::new());
         };
@@ -235,7 +235,7 @@ impl LocalStore {
         &self,
         records: impl IntoIterator<Item = RepositoryRecord>,
     ) -> Result<(), StoreError> {
-        write_atomic(&self.paths.registry_file, &format_registry(records))
+        write_snapshot(&self.paths.registry_file, &format_registry(records))
     }
 }
 
@@ -451,7 +451,36 @@ fn read_optional(path: &Path) -> Result<Option<String>, StoreError> {
     }
 }
 
-fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
+fn read_snapshot_optional(path: &Path) -> Result<Option<String>, StoreError> {
+    let Some(contents) = read_optional(path)? else {
+        return Ok(None);
+    };
+
+    let mut saw_snapshot = false;
+    for line in contents.lines().rev() {
+        let Some(encoded) = line.strip_prefix("snapshot\t") else {
+            continue;
+        };
+        saw_snapshot = true;
+        let Ok(bytes) = decode_bytes(encoded) else {
+            continue;
+        };
+        let Ok(snapshot) = String::from_utf8(bytes) else {
+            continue;
+        };
+        return Ok(Some(snapshot));
+    }
+
+    if saw_snapshot {
+        return Err(parse_store_error(
+            "no valid store snapshot found".to_owned(),
+        ));
+    }
+
+    Ok(Some(contents))
+}
+
+fn write_snapshot(path: &Path, contents: &str) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| StoreError::Io {
             path: parent.to_path_buf(),
@@ -459,108 +488,24 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), StoreError> {
         })?;
     }
 
-    let mut last_error = None;
-    for attempt in 0..100_u8 {
-        let tmp_path = unique_tmp_path(path, attempt);
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                last_error = Some(error);
-                continue;
-            }
-            Err(source) => {
-                return Err(StoreError::Io {
-                    path: tmp_path,
-                    source,
-                });
-            }
-        };
-
-        if let Err(source) = file.write_all(contents.as_bytes()) {
-            let _cleanup = fs::remove_file(&tmp_path);
-            return Err(StoreError::Io {
-                path: tmp_path,
-                source,
-            });
-        }
-
-        if let Err(source) = file.sync_all() {
-            let _cleanup = fs::remove_file(&tmp_path);
-            return Err(StoreError::Io {
-                path: tmp_path,
-                source,
-            });
-        }
-
-        if let Err(source) = replace_file(&tmp_path, path) {
-            let _cleanup = fs::remove_file(&tmp_path);
-            return Err(StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-
-        sync_parent_dir(path)?;
-
-        return Ok(());
-    }
-
-    Err(StoreError::Io {
+    let line = format!("snapshot\t{}\n", encode_string(contents));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(line.as_bytes())
+        .map_err(|source| StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.sync_all().map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
-        source: last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::AlreadyExists,
-                "temporary store file already exists",
-            )
-        }),
-    })
-}
-
-#[cfg(windows)]
-fn replace_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        let _bytes = fs::copy(tmp_path, path)?;
-        fs::remove_file(tmp_path)
-    } else {
-        fs::rename(tmp_path, path)
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    fs::rename(tmp_path, path)
-}
-
-#[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let directory = fs::File::open(parent).map_err(|source| StoreError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    directory.sync_all().map_err(|source| StoreError::Io {
-        path: parent.to_path_buf(),
         source,
     })
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
-}
-
-fn unique_tmp_path(path: &Path, attempt: u8) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "store".into());
-    path.with_file_name(format!(".{file_name}.tmp-{}-{attempt}", std::process::id()))
 }
 
 fn parse_registry(contents: &str) -> Result<BTreeMap<RepoId, RepositoryRecord>, StoreError> {
@@ -969,6 +914,21 @@ mod tests {
         store.set_active_repository(None)?;
 
         assert_eq!(store.load_state()?.active_repo, None);
+        Ok(())
+    }
+
+    #[test]
+    fn state_reader_uses_latest_valid_snapshot_before_torn_tail() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        let record = store.add_repository(repo.path())?;
+        store.set_active_repository(Some(record.id.clone()))?;
+        let mut contents = fs::read_to_string(&store.paths().state_file)?;
+        contents.push_str("snapshot\tnot-valid-hex\n");
+        fs::write(&store.paths().state_file, contents)?;
+
+        assert_eq!(store.load_state()?.active_repo, Some(record.id));
         Ok(())
     }
 
