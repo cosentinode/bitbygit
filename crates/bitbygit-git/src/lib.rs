@@ -70,8 +70,7 @@ impl Git {
     pub fn branches(&self) -> Result<Vec<BranchInfo>, GitError> {
         let output = self.run_args(vec![
             "for-each-ref".to_owned(),
-            "--format=%(refname)%00%(refname:short)%00%(objectname)%00%(upstream:short)%00%(HEAD)"
-                .to_owned(),
+            "--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(HEAD)".to_owned(),
             "refs/heads".to_owned(),
             "refs/remotes".to_owned(),
         ])?;
@@ -79,16 +78,22 @@ impl Git {
     }
 
     pub fn branch_target(&self, name: &str) -> Result<Option<BranchTarget>, GitError> {
-        Ok(self
+        let matches = self
             .branches()?
             .into_iter()
-            .find(|branch| branch.name == name)
-            .map(|branch| BranchTarget {
-                name: branch.name,
-                reference: branch.reference,
-                oid: branch.oid,
-                kind: branch.kind,
-            }))
+            .filter(|branch| branch.name == name)
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(GitError::Blocked {
+                message: format!("branch name {name} is ambiguous between local and remote refs"),
+            });
+        }
+        Ok(matches.into_iter().next().map(|branch| BranchTarget {
+            name: branch.name,
+            reference: branch.reference,
+            oid: branch.oid,
+            kind: branch.kind,
+        }))
     }
 
     pub fn checkout_branch(
@@ -1541,22 +1546,22 @@ fn parse_branches(input: &str) -> Result<Vec<BranchInfo>, GitError> {
 
 fn parse_branch_line(line: &str) -> Result<BranchInfo, GitError> {
     let fields = line.split('\0').collect::<Vec<_>>();
-    let [reference, name, oid, upstream, head] = fields.as_slice() else {
+    let [reference, oid, upstream, head] = fields.as_slice() else {
         return Err(GitError::Parse {
             message: "git branch list output has unexpected fields".to_owned(),
         });
     };
-    let kind = if reference.starts_with("refs/heads/") {
-        BranchKind::Local
-    } else if reference.starts_with("refs/remotes/") {
-        BranchKind::Remote
+    let (kind, name) = if let Some(name) = reference.strip_prefix("refs/heads/") {
+        (BranchKind::Local, name)
+    } else if let Some(name) = reference.strip_prefix("refs/remotes/") {
+        (BranchKind::Remote, name)
     } else {
         return Err(GitError::Parse {
             message: format!("unsupported branch reference: {reference}"),
         });
     };
     Ok(BranchInfo {
-        name: (*name).to_owned(),
+        name: name.to_owned(),
         reference: (*reference).to_owned(),
         oid: (*oid).to_owned(),
         upstream: (!upstream.is_empty()).then(|| (*upstream).to_owned()),
@@ -1817,7 +1822,7 @@ mod tests {
     #[test]
     fn parses_branches_and_skips_remote_head() -> Result<(), Box<dyn Error>> {
         let branches = parse_branches(
-            "refs/heads/main\x00main\x001111111111111111111111111111111111111111\x00origin/main\x00*\nrefs/remotes/origin/main\x00origin/main\x002222222222222222222222222222222222222222\x00\x00\nrefs/remotes/origin/HEAD\x00origin/HEAD\x002222222222222222222222222222222222222222\x00\x00\n",
+            "refs/heads/main\x001111111111111111111111111111111111111111\x00origin/main\x00*\nrefs/remotes/origin/main\x002222222222222222222222222222222222222222\x00\x00\nrefs/remotes/origin/HEAD\x002222222222222222222222222222222222222222\x00\x00\n",
         )?;
 
         assert_eq!(branches.len(), 2);
@@ -1827,6 +1832,28 @@ mod tests {
         assert_eq!(branches[0].upstream.as_deref(), Some("origin/main"));
         assert_eq!(branches[1].name, "origin/main");
         assert_eq!(branches[1].kind, BranchKind::Remote);
+        Ok(())
+    }
+
+    #[test]
+    fn branch_target_blocks_ambiguous_local_and_remote_names() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["branch", "origin/main"])?;
+        repo.run(["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+        let git = Git::new(repo.path());
+
+        let result = git.branch_target("origin/main");
+
+        let Err(error) = result else {
+            return Err("expected ambiguous branch guardrail".into());
+        };
+        assert!(error.to_string().contains("ambiguous"));
         Ok(())
     }
 
