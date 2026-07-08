@@ -141,8 +141,12 @@ impl Git {
             self.ensure_branch_target_unchanged(base, "create branch")?;
         }
         let start = base
-            .map(|base| base.reference.clone())
-            .unwrap_or_else(|| "HEAD".to_owned());
+            .map(|base| base.oid.clone())
+            .or_else(|| expected_target.oid.clone())
+            .ok_or_else(|| GitError::Blocked {
+                message: "create branch is blocked because the current branch has no commit"
+                    .to_owned(),
+            })?;
         self.run_args(vec![
             "switch".to_owned(),
             "-c".to_owned(),
@@ -402,7 +406,14 @@ impl Git {
         Ok(())
     }
 
-    fn ensure_clean_worktree(&self, operation: &str) -> Result<(), GitError> {
+    pub fn ensure_clean_worktree(&self, operation: &str) -> Result<(), GitError> {
+        if let Some(in_progress) = self.in_progress_operation()? {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{operation} is blocked because a {in_progress} operation is in progress"
+                ),
+            });
+        }
         let status = self.status()?;
         if !status.conflicted_files().is_empty() {
             return Err(GitError::Blocked {
@@ -415,6 +426,35 @@ impl Git {
             });
         }
         Ok(())
+    }
+
+    fn in_progress_operation(&self) -> Result<Option<&'static str>, GitError> {
+        for (operation, marker) in [
+            ("merge", "MERGE_HEAD"),
+            ("rebase", "rebase-merge"),
+            ("rebase", "rebase-apply"),
+            ("cherry-pick", "CHERRY_PICK_HEAD"),
+            ("revert", "REVERT_HEAD"),
+        ] {
+            if self.git_path(marker)?.exists() {
+                return Ok(Some(operation));
+            }
+        }
+        Ok(None)
+    }
+
+    fn git_path(&self, path: &str) -> Result<PathBuf, GitError> {
+        let output = self.run_args(vec![
+            "rev-parse".to_owned(),
+            "--git-path".to_owned(),
+            path.to_owned(),
+        ])?;
+        let path = PathBuf::from(output.stdout.trim());
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.cwd.join(path)
+        })
     }
 
     fn ensure_branch_target_unchanged(
@@ -1897,6 +1937,40 @@ mod tests {
             error
                 .to_string()
                 .contains("local branch main already exists")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_workflows_block_in_progress_rebase() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("topic.txt", "topic\n")?;
+        repo.run(["add", "topic.txt"])?;
+        repo.run(["commit", "-m", "topic"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("base.txt", "base\n")?;
+        repo.run(["add", "base.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "--exec", "false", "main"])?;
+        let git = Git::new(repo.path());
+
+        let result = git.create_branch("new-topic", None, &git.head_target()?);
+
+        let Err(error) = result else {
+            return Err("expected in-progress rebase guardrail".into());
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("rebase operation is in progress")
         );
         Ok(())
     }

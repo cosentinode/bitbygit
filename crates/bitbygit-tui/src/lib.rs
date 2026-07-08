@@ -1522,20 +1522,9 @@ fn branch_name(branch: &BranchState) -> Result<String, String> {
 }
 
 fn ensure_clean_branch_worktree(action: &str) -> Result<(), String> {
-    let status = Git::new(current_dir())
-        .status()
-        .map_err(|error| format!("{action} blocked: unable to read repository status: {error}"))?;
-    if !status.conflicted_files().is_empty() {
-        return Err(format!(
-            "{action} blocked: resolve conflicts before changing branches."
-        ));
-    }
-    if !status.is_clean() {
-        return Err(format!(
-            "{action} blocked: working tree must be clean before changing branches."
-        ));
-    }
-    Ok(())
+    Git::new(current_dir())
+        .ensure_clean_worktree(&action.to_ascii_lowercase())
+        .map_err(|error| format!("{action} blocked: {error}"))
 }
 
 fn current_branch_for_branch_operation(action: &str) -> Result<String, String> {
@@ -1643,7 +1632,7 @@ fn parse_prompt(input: &str) -> Result<PromptCommand, String> {
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "branches" | "branch list" => Ok(PromptCommand::Branches),
+        "branches" => Ok(PromptCommand::Branches),
         "fetch" => Ok(PromptCommand::Fetch),
         "push" => Ok(PromptCommand::Push),
         "pull" => Ok(PromptCommand::Pull),
@@ -2119,6 +2108,13 @@ mod tests {
             parse_prompt("branch feature/auth"),
             Ok(PromptCommand::CreateBranch {
                 branch: "feature/auth".to_owned(),
+                base: None,
+            })
+        );
+        assert_eq!(
+            parse_prompt("branch list"),
+            Ok(PromptCommand::CreateBranch {
+                branch: "list".to_owned(),
                 base: None,
             })
         );
