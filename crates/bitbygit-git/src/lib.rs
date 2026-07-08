@@ -62,6 +62,35 @@ impl Git {
         Ok(self.status()?.branch.upstream)
     }
 
+    pub fn fetch_default_remote(&self) -> Result<GitOutput, GitError> {
+        self.run(["fetch"])
+    }
+
+    pub fn push_current_branch(&self) -> Result<GitOutput, GitError> {
+        self.run(["push"])
+    }
+
+    pub fn push_current_branch_set_upstream(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<GitOutput, GitError> {
+        self.run_args(vec![
+            "push".to_owned(),
+            "-u".to_owned(),
+            remote.to_owned(),
+            branch.to_owned(),
+        ])
+    }
+
+    pub fn pull(&self) -> Result<GitOutput, GitError> {
+        self.run(["pull"])
+    }
+
+    pub fn pull_rebase(&self) -> Result<GitOutput, GitError> {
+        self.run(["pull", "--rebase"])
+    }
+
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {
         let output = self.run_raw(["status", "--porcelain=v2", "--branch", "-z"])?;
         parse_status_bytes(&output.stdout)
@@ -1491,6 +1520,29 @@ mod tests {
         Git::new(repo.path()).commit("literal $(touch owned)")?;
 
         assert!(!repo.path().join("owned").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn push_current_branch_set_upstream_sets_tracking_branch() -> Result<(), Box<dyn Error>> {
+        let remote = TempRepo::new()?;
+        remote.run(["init", "--bare"])?;
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        let remote_path = remote.path().to_string_lossy().into_owned();
+        repo.run_args(&["remote", "add", "origin", &remote_path])?;
+
+        Git::new(repo.path()).push_current_branch_set_upstream("origin", "main")?;
+
+        assert_eq!(
+            Git::new(repo.path()).upstream()?,
+            Some("origin/main".to_owned())
+        );
         Ok(())
     }
 

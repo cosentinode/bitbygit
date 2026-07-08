@@ -29,7 +29,7 @@ keeping risky operations visible, typed, previewed, and confirmed.
 
 ## Current Status
 
-The repository is in Phase 6 guarded commit workflow work. See
+The repository is in Phase 7 fetch, pull, and push workflow work. See
 [`docs/mvp-phases.md`](docs/mvp-phases.md) for the implementation roadmap.
 
 ## Development

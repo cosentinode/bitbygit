@@ -128,6 +128,10 @@ Success condition:
 
 ## Phase 7: Fetch, pull, and push workflows
 
+Status:
+
+- in progress
+
 Must have:
 
 - fetch default remote

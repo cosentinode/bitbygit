@@ -16,7 +16,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use bitbygit_git::{
-    ChangeKind, Git, GitError, GitOutput, HeadTarget, StatusEntry, StatusEntryType,
+    BranchState, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget, StatusEntry,
+    StatusEntryType,
 };
 use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
@@ -108,6 +109,7 @@ pub struct App {
     repos: Vec<String>,
     selected_repo: usize,
     files: Vec<FileRow>,
+    branch: Option<BranchState>,
     selected_file: usize,
     file_scroll: usize,
     details: String,
@@ -128,6 +130,7 @@ impl App {
             ],
             selected_repo: 0,
             files: Vec::new(),
+            branch: None,
             selected_file: 0,
             file_scroll: 0,
             details: "No repository status loaded yet.".to_owned(),
@@ -294,6 +297,7 @@ impl App {
                     .iter()
                     .flat_map(FileRow::from_entry)
                     .collect();
+                self.branch = Some(status.branch);
                 self.files.sort_by(|left, right| {
                     left.section
                         .cmp(&right.section)
@@ -307,6 +311,7 @@ impl App {
             }
             Err(error) => {
                 self.files.clear();
+                self.branch = None;
                 self.selected_file = 0;
                 self.details = format!("Unable to read repository status: {error}");
             }
@@ -374,8 +379,28 @@ impl App {
                     match action {
                         PendingAction::StageAll => git.stage_all(),
                         PendingAction::UnstageAll => git.unstage_all(),
-                        PendingAction::Commit { .. } => unreachable!(),
+                        PendingAction::Commit { .. }
+                        | PendingAction::Push
+                        | PendingAction::PushSetUpstream { .. }
+                        | PendingAction::Pull
+                        | PendingAction::PullRebase => unreachable!(),
                     }
+                })
+            }
+            PendingAction::Push => run_audited_git_operation_with_output("push", "push", || {
+                Git::new(current_dir()).push_current_branch()
+            }),
+            PendingAction::PushSetUpstream { remote, branch } => {
+                run_audited_git_operation_with_output("push", "push_set_upstream", || {
+                    Git::new(current_dir()).push_current_branch_set_upstream(&remote, &branch)
+                })
+            }
+            PendingAction::Pull => run_audited_git_operation_with_output("pull", "pull", || {
+                Git::new(current_dir()).pull()
+            }),
+            PendingAction::PullRebase => {
+                run_audited_git_operation_with_output("pull rebase", "pull_rebase", || {
+                    Git::new(current_dir()).pull_rebase()
                 })
             }
             PendingAction::Commit {
@@ -413,13 +438,23 @@ impl App {
     }
 
     fn submit_prompt(&mut self) {
-        let message = match parse_commit_prompt(&self.prompt) {
-            Ok(message) => message,
+        let command = match parse_prompt(&self.prompt) {
+            Ok(command) => command,
             Err(error) => {
                 self.details = error;
                 return;
             }
         };
+        match command {
+            PromptCommand::Commit(message) => self.prepare_commit(message),
+            PromptCommand::Fetch => self.run_fetch(),
+            PromptCommand::Push => self.prepare_push(),
+            PromptCommand::Pull => self.prepare_pull(false),
+            PromptCommand::PullRebase => self.prepare_pull(true),
+        }
+    }
+
+    fn prepare_commit(&mut self, message: String) {
         let git = Git::new(current_dir());
         let status = match git.status() {
             Ok(status) => status,
@@ -461,6 +496,101 @@ impl App {
         );
     }
 
+    fn run_fetch(&mut self) {
+        self.prompt.clear();
+        let message = run_audited_git_operation_with_output("fetch", "fetch", || {
+            Git::new(current_dir()).fetch_default_remote()
+        });
+        self.refresh_status();
+        self.details = message;
+    }
+
+    fn prepare_push(&mut self) {
+        let status = match Git::new(current_dir()).status() {
+            Ok(status) => status,
+            Err(error) => {
+                self.details = format!("Unable to prepare push plan: {error}");
+                return;
+            }
+        };
+        let branch = match branch_name(&status.branch) {
+            Ok(branch) => branch,
+            Err(error) => {
+                self.details = error;
+                return;
+            }
+        };
+        if status.branch.behind > 0 {
+            self.details = "Push blocked: branch is behind its upstream. Pull or resolve divergence before pushing.".to_owned();
+            return;
+        }
+        self.prompt.clear();
+        match &status.branch.upstream {
+            Some(upstream) => {
+                self.pending_confirmation = Some(PendingAction::Push);
+                self.details = format!(
+                    "Push plan:\n- push {branch} to {upstream}\n- ahead: {} commit(s)\nPress y to push or n to cancel.",
+                    status.branch.ahead
+                );
+            }
+            None => {
+                let Some(remote) = default_remote_name() else {
+                    self.details = "Push blocked: no remotes are configured.".to_owned();
+                    return;
+                };
+                self.pending_confirmation = Some(PendingAction::PushSetUpstream {
+                    remote: remote.clone(),
+                    branch: branch.clone(),
+                });
+                self.details = format!(
+                    "Push plan:\n- push {branch} to {remote}\n- set upstream to {remote}/{branch}\nPress y to push or n to cancel."
+                );
+            }
+        }
+    }
+
+    fn prepare_pull(&mut self, rebase: bool) {
+        let status = match Git::new(current_dir()).status() {
+            Ok(status) => status,
+            Err(error) => {
+                self.details = format!("Unable to prepare pull plan: {error}");
+                return;
+            }
+        };
+        if status.branch.upstream.is_none() {
+            self.details = "Pull blocked: current branch has no upstream.".to_owned();
+            return;
+        }
+        if status.branch.behind == 0 {
+            self.details = "Pull skipped: branch is not behind its upstream.".to_owned();
+            self.prompt.clear();
+            return;
+        }
+        if status.branch.ahead > 0 && !rebase {
+            self.details = "Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned();
+            return;
+        }
+        if rebase && !status.is_clean() {
+            self.details = "Pull rebase blocked: working tree must be clean.".to_owned();
+            return;
+        }
+        self.prompt.clear();
+        let upstream = status.branch.upstream.clone().unwrap_or_default();
+        if rebase {
+            self.pending_confirmation = Some(PendingAction::PullRebase);
+            self.details = format!(
+                "Pull rebase plan:\n- rebase current branch onto {upstream}\n- behind: {} commit(s)\nPress y to rebase or n to cancel.",
+                status.branch.behind
+            );
+        } else {
+            self.pending_confirmation = Some(PendingAction::Pull);
+            self.details = format!(
+                "Pull plan:\n- pull from {upstream} using configured strategy\n- behind: {} commit(s)\nPress y to pull or n to cancel.",
+                status.branch.behind
+            );
+        }
+    }
+
     fn cancel_pending(&mut self) {
         self.pending_confirmation = None;
         self.details = "Operation cancelled.".to_owned();
@@ -486,6 +616,13 @@ impl App {
 enum PendingAction {
     StageAll,
     UnstageAll,
+    Push,
+    PushSetUpstream {
+        remote: String,
+        branch: String,
+    },
+    Pull,
+    PullRebase,
     Commit {
         message: String,
         staged_items: Vec<String>,
@@ -499,6 +636,10 @@ impl PendingAction {
         match self {
             Self::StageAll => "stage all",
             Self::UnstageAll => "unstage all",
+            Self::Push => "push",
+            Self::PushSetUpstream { .. } => "push",
+            Self::Pull => "pull",
+            Self::PullRebase => "pull rebase",
             Self::Commit { .. } => "commit",
         }
     }
@@ -507,9 +648,22 @@ impl PendingAction {
         match self {
             Self::StageAll => "stage_all",
             Self::UnstageAll => "unstage_all",
+            Self::Push => "push",
+            Self::PushSetUpstream { .. } => "push_set_upstream",
+            Self::Pull => "pull",
+            Self::PullRebase => "pull_rebase",
             Self::Commit { .. } => "commit",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptCommand {
+    Commit(String),
+    Fetch,
+    Push,
+    Pull,
+    PullRebase,
 }
 
 fn prompt_accepts_modifiers(modifiers: KeyModifiers) -> bool {
@@ -778,27 +932,83 @@ fn repo_list(app: &App) -> List<'_> {
 
 fn status_panel(app: &App, area: Rect) -> Paragraph<'_> {
     let visible_len = status_visible_len(area);
-    let lines = if app.files.is_empty() {
-        vec![Line::from("working tree clean or unavailable")]
+    let mut lines = vec![Line::from(branch_summary(app.branch.as_ref()))];
+    if app.files.is_empty() {
+        lines.push(Line::from("working tree clean or unavailable"));
     } else {
-        app.files
-            .iter()
-            .enumerate()
-            .skip(app.file_scroll)
-            .take(visible_len)
-            .map(|(index, file)| {
-                let marker = if index == app.selected_file {
-                    "> "
-                } else {
-                    "  "
-                };
-                Line::from(format!("{marker}{}", file.label))
-            })
-            .collect::<Vec<_>>()
-    };
+        lines.extend(
+            app.files
+                .iter()
+                .enumerate()
+                .skip(app.file_scroll)
+                .take(visible_len.saturating_sub(1).max(1))
+                .map(|(index, file)| {
+                    let marker = if index == app.selected_file {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    Line::from(format!("{marker}{}", file.label))
+                }),
+        );
+    }
+
     Paragraph::new(lines)
         .block(panel_block("Status", app.focus == Focus::Status))
         .wrap(Wrap { trim: true })
+}
+
+fn branch_summary(branch: Option<&BranchState>) -> String {
+    let Some(branch) = branch else {
+        return "branch unavailable".to_owned();
+    };
+    let head = match &branch.head {
+        Head::Branch(name) => name.as_str(),
+        Head::Detached(oid) => oid.as_str(),
+        Head::Unborn => "unborn",
+    };
+    let upstream = branch.upstream.as_deref().unwrap_or("no upstream");
+    format!(
+        "{head} -> {upstream} | ahead {} behind {}",
+        branch.ahead, branch.behind
+    )
+}
+
+fn branch_name(branch: &BranchState) -> Result<String, String> {
+    match &branch.head {
+        Head::Branch(name) if !branch.unborn => Ok(name.clone()),
+        Head::Branch(_) | Head::Unborn => {
+            Err("Operation blocked: unborn branch needs an initial commit first.".to_owned())
+        }
+        Head::Detached(_oid) => Err("Operation blocked: HEAD is detached.".to_owned()),
+    }
+}
+
+fn default_remote_name() -> Option<String> {
+    let remotes = Git::new(current_dir()).remotes().ok()?;
+    remotes
+        .iter()
+        .find(|remote| remote.name == "origin")
+        .or_else(|| remotes.first())
+        .map(|remote| remote.name.clone())
+}
+
+fn parse_prompt(input: &str) -> Result<PromptCommand, String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "fetch" => Ok(PromptCommand::Fetch),
+        "push" => Ok(PromptCommand::Push),
+        "pull" => Ok(PromptCommand::Pull),
+        "pull --rebase" | "pull rebase" => Ok(PromptCommand::PullRebase),
+        _ if lower == "commit" || lower.starts_with("commit ") => {
+            parse_commit_prompt(trimmed).map(PromptCommand::Commit)
+        }
+        _ => Err(
+            "Unsupported prompt. Try: commit -m \"message\", fetch, push, pull, or pull --rebase"
+                .to_owned(),
+        ),
+    }
 }
 
 fn status_visible_len(area: Rect) -> usize {
@@ -1182,6 +1392,42 @@ mod tests {
         assert!(parse_commit_prompt("commit -m \"message\" trailing").is_err());
         assert!(parse_commit_prompt("commitment -m \"message\"").is_err());
         assert!(parse_commit_prompt("git commit -m \"message\"").is_err());
+    }
+
+    #[test]
+    fn parses_sync_prompts() {
+        assert_eq!(parse_prompt("fetch"), Ok(PromptCommand::Fetch));
+        assert_eq!(parse_prompt("push"), Ok(PromptCommand::Push));
+        assert_eq!(parse_prompt("pull"), Ok(PromptCommand::Pull));
+        assert_eq!(parse_prompt("pull --rebase"), Ok(PromptCommand::PullRebase));
+        assert_eq!(parse_prompt("pull rebase"), Ok(PromptCommand::PullRebase));
+        assert_eq!(
+            parse_prompt("commit -m \"sync docs\""),
+            Ok(PromptCommand::Commit("sync docs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_raw_git_sync_prompts() {
+        assert!(parse_prompt("git push").is_err());
+        assert!(parse_prompt("push --force").is_err());
+        assert!(parse_prompt("pull --ff-only").is_err());
+    }
+
+    #[test]
+    fn branch_summary_shows_ahead_behind() {
+        let branch = BranchState {
+            head: Head::Branch("main".to_owned()),
+            upstream: Some("origin/main".to_owned()),
+            ahead: 2,
+            behind: 1,
+            unborn: false,
+        };
+
+        assert_eq!(
+            branch_summary(Some(&branch)),
+            "main -> origin/main | ahead 2 behind 1"
+        );
     }
 
     #[test]

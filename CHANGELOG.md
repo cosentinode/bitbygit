@@ -20,3 +20,5 @@ semantic versioning once releases begin.
   changed files in the current repository.
 - Added a guarded prompt-driven commit plan for staged changes using typed Git
   commit execution and audit entries.
+- Added typed fetch, pull, pull-rebase, push, and push-with-upstream workflows
+  with confirmation plans and ahead/behind status visibility.
