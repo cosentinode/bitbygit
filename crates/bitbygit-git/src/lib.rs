@@ -66,12 +66,17 @@ impl Git {
         self.run(["fetch"])
     }
 
-    pub fn push_current_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+    pub fn push_current_branch(
+        &self,
+        remote: &str,
+        branch: &str,
+        source_oid: &str,
+    ) -> Result<GitOutput, GitError> {
         self.run_args(vec![
             "push".to_owned(),
             "--".to_owned(),
             remote.to_owned(),
-            format!("HEAD:refs/heads/{branch}"),
+            format!("{source_oid}:refs/heads/{branch}"),
         ])
     }
 
@@ -79,14 +84,19 @@ impl Git {
         &self,
         remote: &str,
         branch: &str,
+        source_oid: &str,
     ) -> Result<GitOutput, GitError> {
-        self.run_args(vec![
+        let push = self.run_args(vec![
             "push".to_owned(),
-            "-u".to_owned(),
             "--".to_owned(),
             remote.to_owned(),
-            format!("HEAD:refs/heads/{branch}"),
-        ])
+            format!("{source_oid}:refs/heads/{branch}"),
+        ])?;
+        let upstream = self.run_args(vec![
+            "branch".to_owned(),
+            format!("--set-upstream-to={}", remote_tracking_ref(remote, branch)),
+        ])?;
+        Ok(combine_outputs(push, upstream))
     }
 
     pub fn pull(&self) -> Result<GitOutput, GitError> {
@@ -101,10 +111,13 @@ impl Git {
     ) -> Result<GitOutput, GitError> {
         let fetch = self.fetch_remote_branch(remote, branch)?;
         self.ensure_remote_tracking_unchanged(remote, branch, expected_upstream_oid, "pull")?;
+        let merge_target = expected_upstream_oid
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| remote_tracking_ref(remote, branch));
         let merge = self.run_args(vec![
             "merge".to_owned(),
             "--ff-only".to_owned(),
-            remote_tracking_ref(remote, branch),
+            merge_target,
         ])?;
         Ok(combine_outputs(fetch, merge))
     }
@@ -126,10 +139,10 @@ impl Git {
             expected_upstream_oid,
             "pull rebase",
         )?;
-        let rebase = self.run_args(vec![
-            "rebase".to_owned(),
-            remote_tracking_ref(remote, branch),
-        ])?;
+        let rebase_target = expected_upstream_oid
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| remote_tracking_ref(remote, branch));
+        let rebase = self.run_args(vec!["rebase".to_owned(), rebase_target])?;
         Ok(combine_outputs(fetch, rebase))
     }
 
@@ -1678,7 +1691,8 @@ mod tests {
         let remote_path = remote.path().to_string_lossy().into_owned();
         repo.run_args(&["remote", "add", "origin", &remote_path])?;
 
-        Git::new(repo.path()).push_current_branch_set_upstream("origin", "main")?;
+        let head = repo.git_stdout(["rev-parse", "HEAD"])?;
+        Git::new(repo.path()).push_current_branch_set_upstream("origin", "main", head.trim())?;
 
         assert_eq!(
             Git::new(repo.path()).upstream()?,

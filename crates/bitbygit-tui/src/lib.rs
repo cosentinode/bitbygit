@@ -395,7 +395,15 @@ impl App {
                 upstream,
             } => match validate_push_plan(&local_branch, Some(&upstream), &target) {
                 Ok(()) => run_audited_git_operation_with_output("push", "push", || {
-                    Git::new(current_dir()).push_current_branch(&remote, &upstream_branch)
+                    let source_oid = target.oid.as_deref().ok_or_else(|| GitError::Blocked {
+                        message: "push is blocked because the planned branch has no commit"
+                            .to_owned(),
+                    })?;
+                    Git::new(current_dir()).push_current_branch(
+                        &remote,
+                        &upstream_branch,
+                        source_oid,
+                    )
                 }),
                 Err(error) => error,
             },
@@ -407,8 +415,16 @@ impl App {
                 match validate_push_plan(&branch, None, &target) {
                     Ok(()) => {
                         run_audited_git_operation_with_output("push", "push_set_upstream", || {
-                            Git::new(current_dir())
-                                .push_current_branch_set_upstream(&remote, &branch)
+                            let source_oid = target.oid.as_deref().ok_or_else(|| {
+                                GitError::Blocked {
+                                    message:
+                                        "push is blocked because the planned branch has no commit"
+                                            .to_owned(),
+                                }
+                            })?;
+                            Git::new(current_dir()).push_current_branch_set_upstream(
+                                &remote, &branch, source_oid,
+                            )
                         })
                     }
                     Err(error) => error,
@@ -702,7 +718,7 @@ impl App {
                 upstream_oid,
             });
             self.details = format!(
-                "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
+                "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- block if the remote changed since this plan\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
                 status.branch.behind
             );
         } else {
@@ -715,7 +731,7 @@ impl App {
                 upstream_oid,
             });
             self.details = format!(
-                "Pull plan:\n- fetch and fast-forward from {upstream}\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
+                "Pull plan:\n- fetch and fast-forward from {upstream}\n- block if the remote changed since this plan\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
                 status.branch.behind
             );
         }
