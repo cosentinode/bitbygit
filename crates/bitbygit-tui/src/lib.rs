@@ -144,6 +144,15 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.pending_confirmation.is_some() {
+            match key.code {
+                KeyCode::Char('y') => self.confirm_pending(),
+                KeyCode::Char('n') | KeyCode::Esc => self.cancel_pending(),
+                _ => self.cancel_pending(),
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -161,11 +170,6 @@ impl App {
             KeyCode::Char('A') if self.focus == Focus::Status => {
                 self.pending_confirmation = Some(PendingAction::UnstageAll);
                 self.details = "Unstage all changes? Press y to confirm or n to cancel.".to_owned();
-            }
-            KeyCode::Char('y') if self.pending_confirmation.is_some() => self.confirm_pending(),
-            KeyCode::Char('n') if self.pending_confirmation.is_some() => {
-                self.pending_confirmation = None;
-                self.details = "Operation cancelled.".to_owned();
             }
             KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
             KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
@@ -305,7 +309,9 @@ impl App {
             self.details = "No changed file selected.".to_owned();
             return;
         };
-        match Git::new(current_dir()).diff_path(&file.path, file.section == FileSection::Staged) {
+        match Git::new(current_dir())
+            .diff_paths(&file.pathspecs, file.section == FileSection::Staged)
+        {
             Ok(diff) if diff.is_empty() && file.section == FileSection::Untracked => {
                 self.details =
                     "Untracked file; stage it to include it in the next commit.".to_owned();
@@ -326,8 +332,9 @@ impl App {
             self.details = "Selected row has no unstaged changes to stage.".to_owned();
             return;
         }
-        let result = Git::new(current_dir()).stage_path(&file.path);
-        let message = operation_message("stage", audit_operation("stage_path", &result));
+        let message = run_audited_git_operation("stage", "stage_path", || {
+            Git::new(current_dir()).stage_paths(&file.pathspecs)
+        });
         self.refresh_status();
         self.details = message;
     }
@@ -340,8 +347,9 @@ impl App {
             self.details = "Selected row has no staged changes to unstage.".to_owned();
             return;
         }
-        let result = Git::new(current_dir()).unstage_path(&file.path);
-        let message = operation_message("unstage", audit_operation("unstage_path", &result));
+        let message = run_audited_git_operation("unstage", "unstage_path", || {
+            Git::new(current_dir()).unstage_paths(&file.pathspecs)
+        });
         self.refresh_status();
         self.details = message;
     }
@@ -350,15 +358,20 @@ impl App {
         let Some(action) = self.pending_confirmation.take() else {
             return;
         };
-        let git = Git::new(current_dir());
-        let result = match action {
-            PendingAction::StageAll => git.stage_all(),
-            PendingAction::UnstageAll => git.unstage_all(),
-        };
-        let message =
-            operation_message(action.label(), audit_operation(action.operation(), &result));
+        let message = run_audited_git_operation(action.label(), action.operation(), || {
+            let git = Git::new(current_dir());
+            match action {
+                PendingAction::StageAll => git.stage_all(),
+                PendingAction::UnstageAll => git.unstage_all(),
+            }
+        });
         self.refresh_status();
         self.details = message;
+    }
+
+    fn cancel_pending(&mut self) {
+        self.pending_confirmation = None;
+        self.details = "Operation cancelled.".to_owned();
     }
 
     fn clamp_file_scroll(&mut self) {
@@ -514,6 +527,7 @@ fn render(app: &App, frame: &mut ratatui::Frame<'_>, areas: &Viewport) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileRow {
     path: std::path::PathBuf,
+    pathspecs: Vec<std::path::PathBuf>,
     label: String,
     section: FileSection,
 }
@@ -549,6 +563,7 @@ impl FileRow {
         );
         Self {
             path: entry.path.clone(),
+            pathspecs: pathspecs_for_entry(entry),
             label,
             section,
         }
@@ -620,6 +635,15 @@ fn path_label(entry: &StatusEntry) -> String {
             entry.path.to_string_lossy()
         ),
         None => entry.path.to_string_lossy().into_owned(),
+    }
+}
+
+fn pathspecs_for_entry(entry: &StatusEntry) -> Vec<std::path::PathBuf> {
+    match (&entry.entry_type, &entry.original_path) {
+        (StatusEntryType::Renamed, Some(original_path)) => {
+            vec![original_path.clone(), entry.path.clone()]
+        }
+        _ => vec![entry.path.clone()],
     }
 }
 
@@ -738,32 +762,61 @@ fn operation_message(action: &str, result: Result<(), String>) -> String {
     }
 }
 
-fn audit_operation(operation: &str, result: &Result<GitOutput, GitError>) -> Result<(), String> {
-    let paths = StorePaths::from_environment().map_err(|error| {
-        let message = operation_result_message(result);
-        format!("{message}; audit failed: {error}")
-    })?;
-    audit_operation_with_paths(operation, result, paths)
+fn run_audited_git_operation(
+    action: &str,
+    operation: &str,
+    run: impl FnOnce() -> Result<GitOutput, GitError>,
+) -> String {
+    let audit = match begin_audit_operation(operation) {
+        Ok(audit) => audit,
+        Err(error) => return operation_message(action, Err(error)),
+    };
+    let result = run();
+    operation_message(action, audit.finish(&result))
 }
 
-fn audit_operation_with_paths(
+fn begin_audit_operation(operation: &str) -> Result<PendingAudit, String> {
+    let paths = StorePaths::from_environment()
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
+    begin_audit_operation_with_paths(operation, paths)
+}
+
+fn begin_audit_operation_with_paths(
     operation: &str,
-    result: &Result<GitOutput, GitError>,
     paths: StorePaths,
-) -> Result<(), String> {
-    let result_label = if result.is_ok() { "ok" } else { "error" };
-    let message = operation_result_message(result);
-    let entry = AuditEntry::new(None, operation, result_label, message.clone())
-        .map_err(|error| format!("{message}; audit failed: {error}"))?;
-    let store =
-        LocalStore::open(paths).map_err(|error| format!("{message}; audit failed: {error}"))?;
+) -> Result<PendingAudit, String> {
+    let store = LocalStore::open(paths)
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
+    let entry = AuditEntry::new(None, operation, "started", "pending")
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
     store
         .append_audit(entry)
-        .map_err(|error| format!("{message}; audit failed: {error}"))?;
-    result
-        .as_ref()
-        .map(|_output| ())
-        .map_err(ToString::to_string)
+        .map_err(|error| format!("audit failed before operation: {error}"))?;
+    Ok(PendingAudit {
+        operation: operation.to_owned(),
+        store,
+    })
+}
+
+struct PendingAudit {
+    operation: String,
+    store: LocalStore,
+}
+
+impl PendingAudit {
+    fn finish(self, result: &Result<GitOutput, GitError>) -> Result<(), String> {
+        let result_label = if result.is_ok() { "ok" } else { "error" };
+        let message = operation_result_message(result);
+        let entry = AuditEntry::new(None, self.operation, result_label, message.clone())
+            .map_err(|error| format!("{message}; audit failed: {error}"))?;
+        self.store
+            .append_audit(entry)
+            .map_err(|error| format!("{message}; audit failed: {error}"))?;
+        result
+            .as_ref()
+            .map(|_output| ())
+            .map_err(ToString::to_string)
+    }
 }
 
 fn operation_result_message(result: &Result<GitOutput, GitError>) -> String {
@@ -970,6 +1023,15 @@ mod tests {
         let deleted_rows = FileRow::from_entry(&deleted);
 
         assert!(renamed_rows[0].label.contains("R old.txt -> new.txt"));
+        assert_eq!(renamed_rows[0].pathspecs.len(), 2);
+        assert_eq!(
+            renamed_rows[0].pathspecs[0],
+            std::path::PathBuf::from("old.txt")
+        );
+        assert_eq!(
+            renamed_rows[0].pathspecs[1],
+            std::path::PathBuf::from("new.txt")
+        );
         assert!(deleted_rows[0].label.contains("D deleted.txt"));
     }
 
@@ -982,6 +1044,7 @@ mod tests {
         app.files = (0..visible_len + 5)
             .map(|index| FileRow {
                 path: std::path::PathBuf::from(format!("file-{index}.txt")),
+                pathspecs: vec![std::path::PathBuf::from(format!("file-{index}.txt"))],
                 label: format!("M file-{index}.txt"),
                 section: FileSection::Unstaged,
             })
@@ -1004,6 +1067,7 @@ mod tests {
         app.files = (0..10)
             .map(|index| FileRow {
                 path: std::path::PathBuf::from(format!("file-{index}.txt")),
+                pathspecs: vec![std::path::PathBuf::from(format!("file-{index}.txt"))],
                 label: format!("M file-{index}.txt"),
                 section: FileSection::Unstaged,
             })
@@ -1033,6 +1097,18 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_key_cancels_pending_confirmation() {
+        let mut app = App::new();
+        app.focus = Focus::Status;
+
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Down));
+
+        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
     fn stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
         let paths = isolated_store_paths("stage-audit")?;
         let output = std::process::Command::new("git")
@@ -1045,17 +1121,42 @@ mod tests {
         });
 
         for operation in ["stage_path", "unstage_path", "stage_all", "unstage_all"] {
-            audit_operation_with_paths(operation, &result, paths.clone())?;
+            let audit = begin_audit_operation_with_paths(operation, paths.clone())?;
+            audit.finish(&result)?;
         }
 
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 8);
         assert_eq!(entries[0].operation, "stage_path");
-        assert_eq!(entries[1].operation, "unstage_path");
-        assert_eq!(entries[2].operation, "stage_all");
-        assert_eq!(entries[3].operation, "unstage_all");
-        assert!(entries.iter().all(|entry| entry.result == "ok"));
-        assert!(entries.iter().all(|entry| entry.message == "completed"));
+        assert_eq!(entries[0].result, "started");
+        assert_eq!(entries[1].operation, "stage_path");
+        assert_eq!(entries[1].result, "ok");
+        assert_eq!(entries[2].operation, "unstage_path");
+        assert_eq!(entries[3].operation, "unstage_path");
+        assert_eq!(entries[4].operation, "stage_all");
+        assert_eq!(entries[5].operation, "stage_all");
+        assert_eq!(entries[6].operation, "unstage_all");
+        assert_eq!(entries[7].operation, "unstage_all");
+        assert!(
+            entries
+                .iter()
+                .step_by(2)
+                .all(|entry| entry.result == "started")
+        );
+        assert!(
+            entries
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .all(|entry| entry.result == "ok")
+        );
+        assert!(
+            entries
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .all(|entry| entry.message == "completed")
+        );
         Ok(())
     }
 
@@ -1064,15 +1165,18 @@ mod tests {
         let paths = isolated_store_paths("failed-stage-audit")?;
         let result = Git::new("/definitely/not/a/bitbygit/repo").stage_all();
 
-        let audit_result = audit_operation_with_paths("stage_all", &result, paths.clone());
+        let audit = begin_audit_operation_with_paths("stage_all", paths.clone())?;
+        let audit_result = audit.finish(&result);
 
         assert!(result.is_err());
         assert!(audit_result.is_err());
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].operation, "stage_all");
-        assert_eq!(entries[0].result, "error");
-        assert_ne!(entries[0].message, "completed");
+        assert_eq!(entries[0].result, "started");
+        assert_eq!(entries[1].operation, "stage_all");
+        assert_eq!(entries[1].result, "error");
+        assert_ne!(entries[1].message, "completed");
         Ok(())
     }
 

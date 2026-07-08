@@ -61,6 +61,10 @@ impl Git {
         self.run_path_args(["add"], Some(path), true)
     }
 
+    pub fn stage_paths(&self, paths: &[PathBuf]) -> Result<GitOutput, GitError> {
+        self.run_paths_args(["add"], paths, true)
+    }
+
     pub fn unstage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
         if self.is_unborn()? {
             return self.run_path_args(
@@ -70,6 +74,13 @@ impl Git {
             );
         }
         self.run_path_args(["restore", "--staged"], Some(path), true)
+    }
+
+    pub fn unstage_paths(&self, paths: &[PathBuf]) -> Result<GitOutput, GitError> {
+        if self.is_unborn()? {
+            return self.run_paths_args(["rm", "--cached", "--ignore-unmatch", "-r"], paths, true);
+        }
+        self.run_paths_args(["restore", "--staged"], paths, true)
     }
 
     pub fn stage_all(&self) -> Result<GitOutput, GitError> {
@@ -84,6 +95,10 @@ impl Git {
     }
 
     pub fn diff_path(&self, path: &Path, staged: bool) -> Result<String, GitError> {
+        self.diff_paths(&[path.to_path_buf()], staged)
+    }
+
+    pub fn diff_paths(&self, paths: &[PathBuf], staged: bool) -> Result<String, GitError> {
         let args = if staged {
             vec![
                 OsString::from("diff"),
@@ -93,7 +108,7 @@ impl Git {
         } else {
             vec![OsString::from("diff"), OsString::from("--")]
         };
-        let output = self.run_os_args(args, Some(path), true)?;
+        let output = self.run_os_paths(args, paths, true)?;
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
@@ -170,6 +185,43 @@ impl Git {
             stdout,
             stderr,
         })
+    }
+
+    fn run_paths_args<const N: usize>(
+        &self,
+        args: [&str; N],
+        paths: &[PathBuf],
+        literal_pathspecs: bool,
+    ) -> Result<GitOutput, GitError> {
+        let mut os_args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        os_args.push(OsString::from("--"));
+        os_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+        let output = self.run_os_args(os_args, None, literal_pathspecs)?;
+        let stdout = String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stdout,
+            source,
+        })?;
+        let stderr = String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
+            args: output.args.clone(),
+            stream: OutputStream::Stderr,
+            source,
+        })?;
+        Ok(GitOutput {
+            status: output.status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn run_os_paths(
+        &self,
+        mut args: Vec<OsString>,
+        paths: &[PathBuf],
+        literal_pathspecs: bool,
+    ) -> Result<RawProcessOutput, GitError> {
+        args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+        self.run_os_args(args, None, literal_pathspecs)
     }
 
     fn run_os_args(
@@ -1167,6 +1219,30 @@ mod tests {
         let status = git.status()?;
         assert_eq!(status.staged_files().len(), 0);
         assert_eq!(status.untracked_files().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unstages_and_diffs_staged_rename_with_source_and_destination() -> Result<(), Box<dyn Error>>
+    {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("old.txt", "content\n")?;
+        repo.run(["add", "old.txt"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["mv", "old.txt", "new.txt"])?;
+
+        let git = Git::new(repo.path());
+        let paths = vec![PathBuf::from("old.txt"), PathBuf::from("new.txt")];
+        let diff = git.diff_paths(&paths, true)?;
+        assert!(diff.contains("rename from old.txt"));
+        assert!(diff.contains("rename to new.txt"));
+
+        git.unstage_paths(&paths)?;
+
+        assert_eq!(git.status()?.staged_files().len(), 0);
         Ok(())
     }
 
