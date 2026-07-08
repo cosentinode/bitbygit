@@ -97,7 +97,7 @@ Success condition:
 
 Status:
 
-- in progress
+- merged
 
 Must have:
 
@@ -111,12 +111,16 @@ Success condition:
 
 ## Phase 6: Guarded commit workflow
 
+Status:
+
+- in progress
+
 Must have:
 
 - commit staged changes
 - validate empty staged state
 - show commit plan before execution
-- surface hooks, signing, and Git failures clearly
+- commit the confirmed staged tree and surface Git/guardrail failures clearly
 
 Success condition:
 

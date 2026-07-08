@@ -24,7 +24,8 @@ available, such as `git status --porcelain=v2`.
 Benefits:
 
 - respects existing user Git configuration and credentials
-- preserves hooks, signing, SSH, and credential helper behavior
+- preserves hooks, signing, SSH, and credential helper behavior where compatible
+  with operation guardrails
 - avoids premature dependency on a lower-level Git library
 - keeps early behavior close to what users expect from the command line
 
@@ -33,6 +34,8 @@ Costs:
 - command output parsing must be tested carefully
 - process execution errors need good diagnostics
 - some operations may vary across Git versions
+- guarded operations may intentionally use plumbing commands when porcelain
+  behavior can mutate state after confirmation
 
 ## Security Notes
 

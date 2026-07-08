@@ -100,6 +100,10 @@ Branch-changing operations must inspect the working tree first.
   operation is safe.
 - Pull with rebase requires a clean working tree.
 - Commit requires staged changes.
+- Guarded commit execution must commit the confirmed staged tree rather than any
+  later index mutation.
+- Guarded commit execution is blocked when configured commit hooks or mandatory
+  commit signing would be bypassed by exact-tree plumbing.
 - Push warns when the branch has no upstream or is diverged.
 
 ## Conflict Recovery

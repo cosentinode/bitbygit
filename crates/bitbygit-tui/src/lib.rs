@@ -15,7 +15,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use bitbygit_git::{ChangeKind, Git, GitError, GitOutput, StatusEntry, StatusEntryType};
+use bitbygit_git::{
+    ChangeKind, Git, GitError, GitOutput, HeadTarget, StatusEntry, StatusEntryType,
+};
 use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
@@ -173,6 +175,7 @@ impl App {
             }
             KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
             KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
+            KeyCode::Enter if self.focus == Focus::Prompt => self.submit_prompt(),
             KeyCode::Char(value)
                 if self.focus == Focus::Prompt
                     && prompt_accepts_modifiers(key.modifiers)
@@ -364,15 +367,98 @@ impl App {
         let Some(action) = self.pending_confirmation.take() else {
             return;
         };
-        let message = run_audited_git_operation(action.label(), action.operation(), || {
-            let git = Git::new(current_dir());
-            match action {
-                PendingAction::StageAll => git.stage_all(),
-                PendingAction::UnstageAll => git.unstage_all(),
+        let message = match action {
+            action @ (PendingAction::StageAll | PendingAction::UnstageAll) => {
+                run_audited_git_operation(action.label(), action.operation(), || {
+                    let git = Git::new(current_dir());
+                    match action {
+                        PendingAction::StageAll => git.stage_all(),
+                        PendingAction::UnstageAll => git.unstage_all(),
+                        PendingAction::Commit { .. } => unreachable!(),
+                    }
+                })
             }
-        });
+            PendingAction::Commit {
+                message,
+                staged_items,
+                staged_tree,
+                target,
+            } => match Git::new(current_dir()).status() {
+                Ok(current_status) if staged_plan_items(&current_status.entries) == staged_items =>
+                {
+                    let git = Git::new(current_dir());
+                    match (git.staged_tree(), git.head_target()) {
+                        (Ok(current_tree), Ok(current_target))
+                            if current_tree == staged_tree && current_target == target =>
+                        {
+                            run_audited_git_operation_with_output("commit", "commit", || {
+                                Git::new(current_dir()).commit_staged_tree(
+                                    &message,
+                                    &staged_tree,
+                                    &target,
+                                )
+                            })
+                        }
+                        (Ok(_current_tree), Ok(_current_target)) => "Commit blocked: repository state changed since the plan was shown. Re-run the commit prompt.".to_owned(),
+                        (Err(error), _) => format!("Unable to validate staged content: {error}"),
+                        (_, Err(error)) => format!("Unable to validate commit target: {error}"),
+                    }
+                }
+                Ok(_current_status) => "Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned(),
+                Err(error) => format!("Unable to validate commit plan: {error}"),
+            },
+        };
         self.refresh_status();
         self.details = message;
+    }
+
+    fn submit_prompt(&mut self) {
+        let message = match parse_commit_prompt(&self.prompt) {
+            Ok(message) => message,
+            Err(error) => {
+                self.details = error;
+                return;
+            }
+        };
+        let git = Git::new(current_dir());
+        let status = match git.status() {
+            Ok(status) => status,
+            Err(error) => {
+                self.details = format!("Unable to prepare commit plan: {error}");
+                return;
+            }
+        };
+        let staged_items = staged_plan_items(&status.entries);
+        if staged_items.is_empty() {
+            self.details = "Commit blocked: there are no staged changes.".to_owned();
+            return;
+        }
+        let staged_tree = match git.staged_tree() {
+            Ok(staged_tree) => staged_tree,
+            Err(error) => {
+                self.details = format!("Unable to snapshot staged content: {error}");
+                return;
+            }
+        };
+        let target = match git.head_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.details = format!("Unable to snapshot commit target: {error}");
+                return;
+            }
+        };
+        let staged_count = staged_items.len();
+
+        self.pending_confirmation = Some(PendingAction::Commit {
+            message: message.clone(),
+            staged_items,
+            staged_tree,
+            target,
+        });
+        self.prompt.clear();
+        self.details = format!(
+            "Commit plan:\n- commit {staged_count} staged file(s)\n- message: {message}\nPress y to commit or n to cancel."
+        );
     }
 
     fn cancel_pending(&mut self) {
@@ -396,24 +482,32 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAction {
     StageAll,
     UnstageAll,
+    Commit {
+        message: String,
+        staged_items: Vec<String>,
+        staged_tree: String,
+        target: HeadTarget,
+    },
 }
 
 impl PendingAction {
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Self::StageAll => "stage all",
             Self::UnstageAll => "unstage all",
+            Self::Commit { .. } => "commit",
         }
     }
 
-    fn operation(self) -> &'static str {
+    fn operation(&self) -> &'static str {
         match self {
             Self::StageAll => "stage_all",
             Self::UnstageAll => "unstage_all",
+            Self::Commit { .. } => "commit",
         }
     }
 }
@@ -653,6 +747,17 @@ fn pathspecs_for_entry(entry: &StatusEntry, section: FileSection) -> Vec<std::pa
     }
 }
 
+fn staged_plan_items(entries: &[StatusEntry]) -> Vec<String> {
+    let mut items = entries
+        .iter()
+        .flat_map(FileRow::from_entry)
+        .filter(|row| row.section == FileSection::Staged)
+        .map(|row| row.label)
+        .collect::<Vec<_>>();
+    items.sort();
+    items
+}
+
 fn repo_list(app: &App) -> List<'_> {
     let items = app
         .repos
@@ -781,6 +886,33 @@ fn run_audited_git_operation(
     operation_message(action, audit.finish(&result))
 }
 
+fn run_audited_git_operation_with_output(
+    action: &str,
+    operation: &str,
+    run: impl FnOnce() -> Result<GitOutput, GitError>,
+) -> String {
+    let audit = match begin_audit_operation(operation) {
+        Ok(audit) => audit,
+        Err(error) => return operation_message(action, Err(error)),
+    };
+    let result = run();
+    let output = git_result_output(&result);
+    let audit_result = audit.finish(&result);
+    match (result.is_ok(), audit_result) {
+        (true, Ok(())) if output.is_empty() => format!("{action} succeeded"),
+        (true, Ok(())) => format!("{action} succeeded:\n{output}"),
+        (true, Err(error)) if output.is_empty() => {
+            format!("{action} succeeded, but audit finalization failed: {error}")
+        }
+        (true, Err(error)) => {
+            format!("{action} succeeded, but audit finalization failed: {error}\n{output}")
+        }
+        (false, Err(error)) if output.is_empty() => format!("{action} failed: {error}"),
+        (false, Err(error)) => format!("{action} failed: {error}\n{output}"),
+        (false, Ok(())) => format!("{action} failed"),
+    }
+}
+
 fn begin_audit_operation(operation: &str) -> Result<PendingAudit, String> {
     let paths = StorePaths::from_environment()
         .map_err(|error| format!("audit failed before operation: {error}"))?;
@@ -812,7 +944,7 @@ struct PendingAudit {
 impl PendingAudit {
     fn finish(self, result: &Result<GitOutput, GitError>) -> Result<(), String> {
         let result_label = if result.is_ok() { "ok" } else { "error" };
-        let message = operation_result_message(result);
+        let message = audit_result_message(result);
         let entry = AuditEntry::new(None, self.operation, result_label, message.clone())
             .map_err(|error| format!("{message}; audit failed: {error}"))?;
         self.store
@@ -825,11 +957,74 @@ impl PendingAudit {
     }
 }
 
-fn operation_result_message(result: &Result<GitOutput, GitError>) -> String {
+fn audit_result_message(result: &Result<GitOutput, GitError>) -> String {
     match result {
         Ok(_output) => "completed".to_owned(),
+        Err(error) => sanitized_git_error(error),
+    }
+}
+
+fn sanitized_git_error(error: &GitError) -> String {
+    match error {
+        GitError::GitFailed { status, .. } => format!("git failed with status {status}"),
+        GitError::Io { .. } => "git failed before execution".to_owned(),
+        GitError::Utf8 { stream, .. } => format!("git returned non-UTF-8 {stream}"),
+        GitError::Blocked { message } => format!("operation blocked: {message}"),
+        GitError::Parse { message } => format!("failed to parse git output: {message}"),
+    }
+}
+
+fn git_result_output(result: &Result<GitOutput, GitError>) -> String {
+    match result {
+        Ok(output) => [output.stdout.trim(), output.stderr.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
         Err(error) => error.to_string(),
     }
+}
+
+fn parse_commit_prompt(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower != "commit" && !lower.starts_with("commit ") {
+        return Err("Unsupported prompt. Try: commit -m \"message\"".to_owned());
+    }
+    let Some(rest) = trimmed.get("commit".len()..) else {
+        return Err("Unsupported prompt. Try: commit -m \"message\"".to_owned());
+    };
+    let mut message = rest.trim_start();
+    if message.is_empty() {
+        return Err("Commit message required. Try: commit -m \"message\"".to_owned());
+    }
+    if message == "-m" {
+        message = "";
+    } else if let Some(after_flag) = message.strip_prefix("-m ") {
+        message = after_flag.trim_start();
+    }
+    parse_commit_message(message)
+}
+
+fn parse_commit_message(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Commit message required. Try: commit -m \"message\"".to_owned());
+    }
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let Some(end) = rest.find('"') else {
+            return Err("Unclosed commit message quote.".to_owned());
+        };
+        if !rest[end + 1..].trim().is_empty() {
+            return Err("Unexpected text after commit message.".to_owned());
+        }
+        let message = &rest[..end];
+        if message.trim().is_empty() {
+            return Err("Commit message cannot be empty.".to_owned());
+        }
+        return Ok(message.to_owned());
+    }
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -969,6 +1164,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_commit_prompt_with_message() {
+        assert_eq!(
+            parse_commit_prompt("commit -m \"fix auth and routing\""),
+            Ok("fix auth and routing".to_owned())
+        );
+        assert_eq!(
+            parse_commit_prompt("commit ship staged work"),
+            Ok("ship staged work".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_commit_prompts() {
+        assert!(parse_commit_prompt("commit").is_err());
+        assert!(parse_commit_prompt("commit -m \"").is_err());
+        assert!(parse_commit_prompt("commit -m \"message\" trailing").is_err());
+        assert!(parse_commit_prompt("commitment -m \"message\"").is_err());
+        assert!(parse_commit_prompt("git commit -m \"message\"").is_err());
+    }
+
+    #[test]
     fn viewport_uses_desktop_panels_when_roomy() {
         let viewport = Viewport::split(Rect::new(0, 0, 120, 40));
 
@@ -1058,6 +1274,31 @@ mod tests {
         assert_eq!(rows[0].pathspecs.len(), 2);
         assert_eq!(rows[1].section, FileSection::Unstaged);
         assert_eq!(rows[1].pathspecs, vec![std::path::PathBuf::from("new.txt")]);
+    }
+
+    #[test]
+    fn staged_plan_items_include_only_staged_rows() {
+        let entries = vec![
+            StatusEntry {
+                path: std::path::PathBuf::from("staged.txt"),
+                original_path: None,
+                index: ChangeKind::Added,
+                worktree: ChangeKind::Unmodified,
+                entry_type: StatusEntryType::Ordinary,
+            },
+            StatusEntry {
+                path: std::path::PathBuf::from("unstaged.txt"),
+                original_path: None,
+                index: ChangeKind::Unmodified,
+                worktree: ChangeKind::Modified,
+                entry_type: StatusEntryType::Ordinary,
+            },
+        ];
+
+        let items = staged_plan_items(&entries);
+
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("staged.txt"));
     }
 
     #[test]
@@ -1162,13 +1403,19 @@ mod tests {
             stderr: String::from_utf8(output.stderr)?,
         });
 
-        for operation in ["stage_path", "unstage_path", "stage_all", "unstage_all"] {
+        for operation in [
+            "stage_path",
+            "unstage_path",
+            "stage_all",
+            "unstage_all",
+            "commit",
+        ] {
             let audit = begin_audit_operation_with_paths(operation, paths.clone())?;
             audit.finish(&result)?;
         }
 
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
-        assert_eq!(entries.len(), 8);
+        assert_eq!(entries.len(), 10);
         assert_eq!(entries[0].operation, "stage_path");
         assert_eq!(entries[0].result, "started");
         assert_eq!(entries[1].operation, "stage_path");
@@ -1179,6 +1426,8 @@ mod tests {
         assert_eq!(entries[5].operation, "stage_all");
         assert_eq!(entries[6].operation, "unstage_all");
         assert_eq!(entries[7].operation, "unstage_all");
+        assert_eq!(entries[8].operation, "commit");
+        assert_eq!(entries[9].operation, "commit");
         assert!(
             entries
                 .iter()
@@ -1219,6 +1468,33 @@ mod tests {
         assert_eq!(entries[1].operation, "stage_all");
         assert_eq!(entries[1].result, "error");
         assert_ne!(entries[1].message, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn audit_errors_do_not_persist_raw_git_output() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("sanitized-audit")?;
+        let status = std::process::Command::new("git")
+            .arg("not-a-real-bitbygit-command")
+            .output()?
+            .status;
+        let result: Result<GitOutput, GitError> = Err(GitError::GitFailed {
+            args: vec!["commit-tree".to_owned(), "<tree>".to_owned()],
+            status,
+            stdout: "raw stdout token".to_owned(),
+            stderr: "raw stderr secret".to_owned(),
+        });
+
+        let audit = begin_audit_operation_with_paths("commit", paths.clone())?;
+        let audit_result = audit.finish(&result);
+
+        assert!(audit_result.is_err());
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].result, "error");
+        assert!(entries[1].message.contains("git failed with status"));
+        assert!(!entries[1].message.contains("raw stdout token"));
+        assert!(!entries[1].message.contains("raw stderr secret"));
         Ok(())
     }
 

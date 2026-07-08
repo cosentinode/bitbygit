@@ -18,3 +18,5 @@ semantic versioning once releases begin.
   handling.
 - Added typed staging/diff operations and wired the TUI status/details panels to
   changed files in the current repository.
+- Added a guarded prompt-driven commit plan for staged changes using typed Git
+  commit execution and audit entries.
