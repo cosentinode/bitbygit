@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 use std::string::FromUtf8Error;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -55,8 +59,8 @@ impl Git {
     }
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {
-        let output = self.run(["status", "--porcelain=v2", "--branch", "-z"])?;
-        parse_status(&output.stdout)
+        let output = self.run_raw(["status", "--porcelain=v2", "--branch", "-z"])?;
+        parse_status_bytes(&output.stdout)
     }
 
     fn run<const N: usize>(&self, args: [&str; N]) -> Result<GitOutput, GitError> {
@@ -100,6 +104,31 @@ impl Git {
             stderr,
         })
     }
+
+    fn run_raw<const N: usize>(&self, args: [&str; N]) -> Result<RawGitOutput, GitError> {
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let output = Command::new("git")
+            .current_dir(&self.cwd)
+            .args(&args)
+            .output()
+            .map_err(|source| GitError::Io {
+                args: args.clone(),
+                source,
+            })?;
+
+        if !output.status.success() {
+            return Err(GitError::GitFailed {
+                args,
+                status: output.status,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(RawGitOutput {
+            stdout: output.stdout,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +144,11 @@ pub struct GitOutput {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawGitOutput {
+    stdout: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -282,8 +316,8 @@ impl WorktreeStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
-    pub path: String,
-    pub original_path: Option<String>,
+    pub path: PathBuf,
+    pub original_path: Option<PathBuf>,
     pub index: ChangeKind,
     pub worktree: ChangeKind,
     pub entry_type: StatusEntryType,
@@ -313,24 +347,31 @@ pub enum ChangeKind {
 }
 
 pub fn parse_status(input: &str) -> Result<WorktreeStatus, GitError> {
-    if input.contains('\0') {
-        return parse_status_records(input.split('\0').filter(|record| !record.is_empty()), true);
-    }
-
-    parse_status_records(input.lines(), false)
+    parse_status_bytes(input.as_bytes())
 }
 
-fn parse_status_records<'a>(
-    records: impl IntoIterator<Item = &'a str>,
-    nul_delimited: bool,
-) -> Result<WorktreeStatus, GitError> {
+fn parse_status_bytes(input: &[u8]) -> Result<WorktreeStatus, GitError> {
     let mut branch = BranchState::default();
     let mut oid = None;
     let mut entries = Vec::new();
-    let mut records = records.into_iter();
+    let nul_delimited = input.contains(&0);
+    let mut records = if nul_delimited {
+        input
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .collect::<Vec<_>>()
+            .into_iter()
+    } else {
+        input
+            .split(|byte| *byte == b'\n')
+            .filter(|record| !record.is_empty())
+            .collect::<Vec<_>>()
+            .into_iter()
+    };
 
     while let Some(line) = records.next() {
-        if let Some(value) = line.strip_prefix("# branch.oid ") {
+        if let Some(value) = strip_bytes_prefix(line, b"# branch.oid ") {
+            let value = parse_utf8(value, "branch oid")?;
             oid = Some(value.to_owned());
             if value == "(initial)" {
                 branch.unborn = true;
@@ -338,7 +379,8 @@ fn parse_status_records<'a>(
             continue;
         }
 
-        if let Some(value) = line.strip_prefix("# branch.head ") {
+        if let Some(value) = strip_bytes_prefix(line, b"# branch.head ") {
+            let value = parse_utf8(value, "branch head")?;
             branch.head = if value == "(detached)" {
                 Head::Detached(oid.clone().unwrap_or_default())
             } else {
@@ -347,21 +389,23 @@ fn parse_status_records<'a>(
             continue;
         }
 
-        if let Some(value) = line.strip_prefix("# branch.upstream ") {
+        if let Some(value) = strip_bytes_prefix(line, b"# branch.upstream ") {
+            let value = parse_utf8(value, "branch upstream")?;
             branch.upstream = Some(value.to_owned());
             continue;
         }
 
-        if let Some(value) = line.strip_prefix("# branch.ab ") {
+        if let Some(value) = strip_bytes_prefix(line, b"# branch.ab ") {
+            let value = parse_utf8(value, "branch ahead/behind")?;
             let (ahead, behind) = parse_ahead_behind(value)?;
             branch.ahead = ahead;
             branch.behind = behind;
             continue;
         }
 
-        if let Some(path) = line.strip_prefix("? ") {
+        if let Some(path) = strip_bytes_prefix(line, b"? ") {
             entries.push(StatusEntry {
-                path: path.to_owned(),
+                path: path_from_bytes(path),
                 original_path: None,
                 index: ChangeKind::Unmodified,
                 worktree: ChangeKind::Untracked,
@@ -370,9 +414,9 @@ fn parse_status_records<'a>(
             continue;
         }
 
-        if let Some(path) = line.strip_prefix("! ") {
+        if let Some(path) = strip_bytes_prefix(line, b"! ") {
             entries.push(StatusEntry {
-                path: path.to_owned(),
+                path: path_from_bytes(path),
                 original_path: None,
                 index: ChangeKind::Unmodified,
                 worktree: ChangeKind::Ignored,
@@ -381,12 +425,12 @@ fn parse_status_records<'a>(
             continue;
         }
 
-        if line.starts_with("1 ") {
+        if line.starts_with(b"1 ") {
             entries.push(parse_ordinary_entry(line)?);
             continue;
         }
 
-        if line.starts_with("2 ") {
+        if line.starts_with(b"2 ") {
             let original_path = if nul_delimited {
                 Some(
                     records
@@ -400,7 +444,7 @@ fn parse_status_records<'a>(
             continue;
         }
 
-        if line.starts_with("u ") {
+        if line.starts_with(b"u ") {
             entries.push(parse_conflict_entry(line)?);
         }
     }
@@ -427,8 +471,8 @@ fn parse_ahead_behind(value: &str) -> Result<(u32, u32), GitError> {
     Ok((ahead, behind))
 }
 
-fn parse_ordinary_entry(line: &str) -> Result<StatusEntry, GitError> {
-    let parts = line.splitn(9, ' ').collect::<Vec<_>>();
+fn parse_ordinary_entry(line: &[u8]) -> Result<StatusEntry, GitError> {
+    let parts = splitn_bytes(line, b' ', 9);
     let xy = parts
         .get(1)
         .copied()
@@ -440,7 +484,7 @@ fn parse_ordinary_entry(line: &str) -> Result<StatusEntry, GitError> {
     let (index, worktree) = parse_xy(xy)?;
 
     Ok(StatusEntry {
-        path: path.to_owned(),
+        path: path_from_bytes(path),
         original_path: None,
         index,
         worktree,
@@ -448,8 +492,8 @@ fn parse_ordinary_entry(line: &str) -> Result<StatusEntry, GitError> {
     })
 }
 
-fn parse_renamed_entry(line: &str, original_path: Option<&str>) -> Result<StatusEntry, GitError> {
-    let parts = line.splitn(10, ' ').collect::<Vec<_>>();
+fn parse_renamed_entry(line: &[u8], original_path: Option<&[u8]>) -> Result<StatusEntry, GitError> {
+    let parts = splitn_bytes(line, b' ', 10);
     let xy = parts
         .get(1)
         .copied()
@@ -460,30 +504,29 @@ fn parse_renamed_entry(line: &str, original_path: Option<&str>) -> Result<Status
         .ok_or_else(|| parse_error("renamed entry missing path"))?;
     let (path, original_path) = match original_path {
         Some(original_path) => (path, original_path),
-        None => path
-            .split_once('\t')
+        None => split_once_byte(path, b'\t')
             .ok_or_else(|| parse_error("renamed entry missing original path"))?,
     };
     let (index, worktree) = parse_xy(xy)?;
 
     Ok(StatusEntry {
-        path: path.to_owned(),
-        original_path: Some(original_path.to_owned()),
+        path: path_from_bytes(path),
+        original_path: Some(path_from_bytes(original_path)),
         index,
         worktree,
         entry_type: StatusEntryType::Renamed,
     })
 }
 
-fn parse_conflict_entry(line: &str) -> Result<StatusEntry, GitError> {
-    let parts = line.splitn(11, ' ').collect::<Vec<_>>();
+fn parse_conflict_entry(line: &[u8]) -> Result<StatusEntry, GitError> {
+    let parts = splitn_bytes(line, b' ', 11);
     let path = parts
         .get(10)
         .copied()
         .ok_or_else(|| parse_error("conflict entry missing path"))?;
 
     Ok(StatusEntry {
-        path: path.to_owned(),
+        path: path_from_bytes(path),
         original_path: None,
         index: ChangeKind::Unmerged,
         worktree: ChangeKind::Unmerged,
@@ -491,29 +534,30 @@ fn parse_conflict_entry(line: &str) -> Result<StatusEntry, GitError> {
     })
 }
 
-fn parse_xy(value: &str) -> Result<(ChangeKind, ChangeKind), GitError> {
-    let mut chars = value.chars();
-    let index = chars
-        .next()
+fn parse_xy(value: &[u8]) -> Result<(ChangeKind, ChangeKind), GitError> {
+    let index = value
+        .first()
+        .copied()
         .ok_or_else(|| parse_error("missing index status"))?;
-    let worktree = chars
-        .next()
+    let worktree = value
+        .get(1)
+        .copied()
         .ok_or_else(|| parse_error("missing worktree status"))?;
     Ok((change_kind(index), change_kind(worktree)))
 }
 
-fn change_kind(value: char) -> ChangeKind {
+fn change_kind(value: u8) -> ChangeKind {
     match value {
-        '.' => ChangeKind::Unmodified,
-        'M' => ChangeKind::Modified,
-        'A' => ChangeKind::Added,
-        'D' => ChangeKind::Deleted,
-        'R' => ChangeKind::Renamed,
-        'C' => ChangeKind::Copied,
-        'U' => ChangeKind::Unmerged,
-        '?' => ChangeKind::Untracked,
-        '!' => ChangeKind::Ignored,
-        other => ChangeKind::Unknown(other),
+        b'.' => ChangeKind::Unmodified,
+        b'M' => ChangeKind::Modified,
+        b'A' => ChangeKind::Added,
+        b'D' => ChangeKind::Deleted,
+        b'R' => ChangeKind::Renamed,
+        b'C' => ChangeKind::Copied,
+        b'U' => ChangeKind::Unmerged,
+        b'?' => ChangeKind::Untracked,
+        b'!' => ChangeKind::Ignored,
+        other => ChangeKind::Unknown(char::from(other)),
     }
 }
 
@@ -552,6 +596,34 @@ fn is_missing_upstream_error(stderr: &str) -> bool {
     stderr.contains("no upstream configured")
         || stderr.contains("no upstream branch")
         || stderr.contains("ambiguous argument '@{u}'")
+        || stderr.contains("no such branch")
+}
+
+fn strip_bytes_prefix<'a>(value: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    value.strip_prefix(prefix)
+}
+
+fn parse_utf8<'a>(value: &'a [u8], description: &str) -> Result<&'a str, GitError> {
+    std::str::from_utf8(value).map_err(|_| parse_error(&format!("{description} is not UTF-8")))
+}
+
+fn splitn_bytes(value: &[u8], delimiter: u8, count: usize) -> Vec<&[u8]> {
+    value.splitn(count, |byte| *byte == delimiter).collect()
+}
+
+fn split_once_byte(value: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
+    let index = value.iter().position(|byte| *byte == delimiter)?;
+    Some((&value[..index], &value[index + 1..]))
+}
+
+#[cfg(unix)]
+fn path_from_bytes(value: &[u8]) -> PathBuf {
+    PathBuf::from(OsString::from_vec(value.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(value: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(value).into_owned())
 }
 
 fn parse_error(message: &str) -> GitError {
@@ -564,8 +636,12 @@ fn parse_error(message: &str) -> GitError {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     static NEXT_REPO_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -590,7 +666,7 @@ mod tests {
         )?;
 
         assert_eq!(status.unstaged_files().len(), 1);
-        assert_eq!(status.entries[0].path, "README.md");
+        assert_eq!(status.entries[0].path, PathBuf::from("README.md"));
         assert_eq!(status.entries[0].worktree, ChangeKind::Modified);
         Ok(())
     }
@@ -622,8 +698,11 @@ mod tests {
         )?;
 
         assert_eq!(status.entries[0].entry_type, StatusEntryType::Renamed);
-        assert_eq!(status.entries[0].path, "new.txt");
-        assert_eq!(status.entries[0].original_path, Some("old.txt".to_owned()));
+        assert_eq!(status.entries[0].path, PathBuf::from("new.txt"));
+        assert_eq!(
+            status.entries[0].original_path,
+            Some(PathBuf::from("old.txt"))
+        );
         Ok(())
     }
 
@@ -661,8 +740,8 @@ mod tests {
         let status = parse_status("# branch.head main\0? café.txt\0? tab\tname.txt\0")?;
 
         assert_eq!(status.untracked_files().len(), 2);
-        assert_eq!(status.entries[0].path, "café.txt");
-        assert_eq!(status.entries[1].path, "tab\tname.txt");
+        assert_eq!(status.entries[0].path, PathBuf::from("café.txt"));
+        assert_eq!(status.entries[1].path, PathBuf::from("tab\tname.txt"));
         Ok(())
     }
 
@@ -675,10 +754,10 @@ mod tests {
         ))?;
 
         assert_eq!(status.entries[0].entry_type, StatusEntryType::Renamed);
-        assert_eq!(status.entries[0].path, "new\tname.txt");
+        assert_eq!(status.entries[0].path, PathBuf::from("new\tname.txt"));
         assert_eq!(
             status.entries[0].original_path,
-            Some("old name.txt".to_owned())
+            Some(PathBuf::from("old name.txt"))
         );
         Ok(())
     }
@@ -746,7 +825,32 @@ mod tests {
         let status = Git::new(repo.path()).status()?;
 
         assert_eq!(status.conflicted_files().len(), 1);
-        assert_eq!(status.conflicted_files()[0].path, "conflict.txt");
+        assert_eq!(
+            status.conflicted_files()[0].path,
+            PathBuf::from("conflict.txt")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_renames_from_temp_repo() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("old name.txt", "old\n")?;
+        repo.run(["add", "old name.txt"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["mv", "old name.txt", "new\tname.txt"])?;
+
+        let status = Git::new(repo.path()).status()?;
+
+        assert_eq!(status.entries[0].entry_type, StatusEntryType::Renamed);
+        assert_eq!(status.entries[0].path, PathBuf::from("new\tname.txt"));
+        assert_eq!(
+            status.entries[0].original_path,
+            Some(PathBuf::from("old name.txt"))
+        );
         Ok(())
     }
 
@@ -760,12 +864,36 @@ mod tests {
         let status = Git::new(repo.path()).status()?;
 
         assert_eq!(status.untracked_files().len(), 2);
-        assert!(status.entries.iter().any(|entry| entry.path == "café.txt"));
         assert!(
             status
                 .entries
                 .iter()
-                .any(|entry| entry.path == "tab\tname.txt")
+                .any(|entry| entry.path.as_path() == Path::new("café.txt"))
+        );
+        assert!(
+            status
+                .entries
+                .iter()
+                .any(|entry| entry.path.as_path() == Path::new("tab\tname.txt"))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_non_utf8_paths_from_temp_repo() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        let path = PathBuf::from(OsString::from_vec(b"bad-\xff.txt".to_vec()));
+        repo.write_path(&path, "non-utf8\n")?;
+
+        let status = Git::new(repo.path()).status()?;
+
+        assert!(
+            status
+                .entries
+                .iter()
+                .any(|entry| entry.path.as_os_str().as_bytes() == b"bad-\xff.txt")
         );
         Ok(())
     }
@@ -819,6 +947,15 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn upstream_unborn_repo_is_none() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+
+        assert_eq!(Git::new(repo.path()).upstream()?, None);
+        Ok(())
+    }
+
     struct TempRepo {
         path: PathBuf,
     }
@@ -840,6 +977,15 @@ mod tests {
         }
 
         fn write(&self, relative_path: &str, contents: &str) -> Result<(), Box<dyn Error>> {
+            fs::write(self.path.join(relative_path), contents)?;
+            Ok(())
+        }
+
+        fn write_path(
+            &self,
+            relative_path: &PathBuf,
+            contents: &str,
+        ) -> Result<(), Box<dyn Error>> {
             fs::write(self.path.join(relative_path), contents)?;
             Ok(())
         }
