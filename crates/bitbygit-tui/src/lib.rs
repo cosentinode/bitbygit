@@ -379,11 +379,19 @@ impl App {
             PendingAction::Commit {
                 message,
                 staged_items,
+                staged_tree,
             } => match Git::new(current_dir()).status() {
-                Ok(current_status) if staged_plan_items(&current_status.entries) == staged_items => {
-                    run_audited_git_operation_with_output("commit", "commit", || {
-                        Git::new(current_dir()).commit(&message)
-                    })
+                Ok(current_status) if staged_plan_items(&current_status.entries) == staged_items =>
+                {
+                    match Git::new(current_dir()).staged_tree() {
+                        Ok(current_tree) if current_tree == staged_tree => {
+                            run_audited_git_operation_with_output("commit", "commit", || {
+                                Git::new(current_dir()).commit(&message)
+                            })
+                        }
+                        Ok(_current_tree) => "Commit blocked: staged content changed since the plan was shown. Re-run the commit prompt.".to_owned(),
+                        Err(error) => format!("Unable to validate staged content: {error}"),
+                    }
                 }
                 Ok(_current_status) => "Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned(),
                 Err(error) => format!("Unable to validate commit plan: {error}"),
@@ -401,7 +409,8 @@ impl App {
                 return;
             }
         };
-        let status = match Git::new(current_dir()).status() {
+        let git = Git::new(current_dir());
+        let status = match git.status() {
             Ok(status) => status,
             Err(error) => {
                 self.details = format!("Unable to prepare commit plan: {error}");
@@ -413,11 +422,19 @@ impl App {
             self.details = "Commit blocked: there are no staged changes.".to_owned();
             return;
         }
+        let staged_tree = match git.staged_tree() {
+            Ok(staged_tree) => staged_tree,
+            Err(error) => {
+                self.details = format!("Unable to snapshot staged content: {error}");
+                return;
+            }
+        };
         let staged_count = staged_items.len();
 
         self.pending_confirmation = Some(PendingAction::Commit {
             message: message.clone(),
             staged_items,
+            staged_tree,
         });
         self.prompt.clear();
         self.details = format!(
@@ -453,6 +470,7 @@ enum PendingAction {
     Commit {
         message: String,
         staged_items: Vec<String>,
+        staged_tree: String,
     },
 }
 
@@ -859,11 +877,19 @@ fn run_audited_git_operation_with_output(
     };
     let result = run();
     let output = git_result_output(&result);
-    match audit.finish(&result) {
-        Ok(()) if output.is_empty() => format!("{action} succeeded"),
-        Ok(()) => format!("{action} succeeded:\n{output}"),
-        Err(error) if output.is_empty() => format!("{action} failed: {error}"),
-        Err(error) => format!("{action} failed: {error}\n{output}"),
+    let audit_result = audit.finish(&result);
+    match (result.is_ok(), audit_result) {
+        (true, Ok(())) if output.is_empty() => format!("{action} succeeded"),
+        (true, Ok(())) => format!("{action} succeeded:\n{output}"),
+        (true, Err(error)) if output.is_empty() => {
+            format!("{action} succeeded, but audit finalization failed: {error}")
+        }
+        (true, Err(error)) => {
+            format!("{action} succeeded, but audit finalization failed: {error}\n{output}")
+        }
+        (false, Err(error)) if output.is_empty() => format!("{action} failed: {error}"),
+        (false, Err(error)) => format!("{action} failed: {error}\n{output}"),
+        (false, Ok(())) => format!("{action} failed"),
     }
 }
 

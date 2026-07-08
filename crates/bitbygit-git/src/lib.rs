@@ -102,6 +102,10 @@ impl Git {
         ])
     }
 
+    pub fn staged_tree(&self) -> Result<String, GitError> {
+        Ok(self.run(["write-tree"])?.stdout.trim().to_owned())
+    }
+
     pub fn diff_path(&self, path: &Path, staged: bool) -> Result<String, GitError> {
         self.diff_paths(&[path.to_path_buf()], staged)
     }
@@ -1312,6 +1316,23 @@ mod tests {
         };
         assert!(matches!(error, GitError::GitFailed { .. }));
         assert!(error.to_string().contains("hook blocked commit"));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_tree_changes_when_staged_content_changes() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.write("README.md", "one\n")?;
+        repo.run(["add", "README.md"])?;
+        let git = Git::new(repo.path());
+        let first_tree = git.staged_tree()?;
+
+        repo.write("README.md", "two\n")?;
+        repo.run(["add", "README.md"])?;
+        let second_tree = git.staged_tree()?;
+
+        assert_ne!(first_tree, second_tree);
         Ok(())
     }
 
