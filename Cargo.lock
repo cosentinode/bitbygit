@@ -16,3 +16,10 @@ version = "0.1.0"
 [[package]]
 name = "bitbygit-git"
 version = "0.1.0"
+
+[[package]]
+name = "bitbygit-store"
+version = "0.1.0"
+dependencies = [
+ "bitbygit-git",
+]

@@ -1,0 +1,13 @@
+[package]
+name = "bitbygit-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitbygit-git = { path = "../bitbygit-git" }
+
+[lints]
+workspace = true
