@@ -14,3 +14,5 @@ semantic versioning once releases begin.
   parsing and temporary-repository tests.
 - Added the initial local store for registered repositories, active/recent state,
   and audit entries.
+- Added the initial responsive terminal UI shell with keyboard and mouse focus
+  handling.

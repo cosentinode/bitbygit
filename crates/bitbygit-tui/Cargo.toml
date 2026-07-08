@@ -1,5 +1,5 @@
 [package]
-name = "bitbygit"
+name = "bitbygit-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,8 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bitbygit-core = { path = "../bitbygit-core" }
-bitbygit-tui = { path = "../bitbygit-tui" }
+crossterm = "0.28"
+ratatui = "0.29"
 
 [lints]
 workspace = true

@@ -21,6 +21,9 @@ bitbygit/
     bitbygit-store/
       src/lib.rs
 
+    bitbygit-tui/
+      src/lib.rs
+
   docs/
     adr/
       0001-system-git-first.md
@@ -29,6 +32,7 @@ bitbygit/
     guardrails.md
     mvp-phases.md
     repo-layout.md
+    tui-smoke-test.md
 
   scripts/
     setup-dev.sh
