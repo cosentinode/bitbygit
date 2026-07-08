@@ -394,8 +394,8 @@ impl App {
                 upstream_branch,
                 upstream,
                 expected_remote_oid,
-                remote_url,
-            } => match validate_push_plan(&local_branch, Some(&upstream), &target, &remote, remote_url.as_deref()) {
+                remote_urls,
+            } => match validate_push_plan(&local_branch, Some(&upstream), &target, &remote, &remote_urls) {
                 Ok(()) => run_audited_git_operation_with_output("push", "push", || {
                     let source_oid = target.oid.as_deref().ok_or_else(|| GitError::Blocked {
                         message: "push is blocked because the planned branch has no commit"
@@ -415,9 +415,9 @@ impl App {
                 branch,
                 target,
                 expected_remote_oid,
-                remote_url,
+                remote_urls,
             } => {
-                match validate_push_plan(&branch, None, &target, &remote, remote_url.as_deref()) {
+                match validate_push_plan(&branch, None, &target, &remote, &remote_urls) {
                     Ok(()) => {
                         run_audited_git_operation_with_output("push", "push_set_upstream", || {
                             let source_oid = target.oid.as_deref().ok_or_else(|| {
@@ -451,7 +451,7 @@ impl App {
                         &remote,
                         &upstream_branch,
                         upstream_oid.as_deref(),
-                        target.oid.as_deref(),
+                        &target,
                     )
                 }),
                 Err(error) => error,
@@ -472,7 +472,7 @@ impl App {
                             &remote,
                             &upstream_branch,
                             upstream_oid.as_deref(),
-                            target.oid.as_deref(),
+                            &target,
                         )
                     },
                 ),
@@ -636,10 +636,10 @@ impl App {
                             return;
                         }
                     };
-                let remote_url = match Git::new(current_dir()).remote_push_url(&remote) {
-                    Ok(url) => url,
+                let remote_urls = match Git::new(current_dir()).remote_push_urls(&remote) {
+                    Ok(urls) => urls,
                     Err(error) => {
-                        self.details = format!("Unable to snapshot push remote URL: {error}");
+                        self.details = format!("Unable to snapshot push remote URLs: {error}");
                         return;
                     }
                 };
@@ -650,7 +650,7 @@ impl App {
                     upstream_branch,
                     upstream: upstream.clone(),
                     expected_remote_oid,
-                    remote_url,
+                    remote_urls,
                 });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {upstream}\n- ahead: {} commit(s)\nPress y to push or n to cancel.",
@@ -670,10 +670,10 @@ impl App {
                             return;
                         }
                     };
-                let remote_url = match Git::new(current_dir()).remote_push_url(&remote) {
-                    Ok(url) => url,
+                let remote_urls = match Git::new(current_dir()).remote_push_urls(&remote) {
+                    Ok(urls) => urls,
                     Err(error) => {
-                        self.details = format!("Unable to snapshot push remote URL: {error}");
+                        self.details = format!("Unable to snapshot push remote URLs: {error}");
                         return;
                     }
                 };
@@ -682,7 +682,7 @@ impl App {
                     branch: branch.clone(),
                     target: head_target,
                     expected_remote_oid,
-                    remote_url,
+                    remote_urls,
                 });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {remote}\n- set upstream to {remote}/{branch}\nPress y to push or n to cancel."
@@ -837,14 +837,14 @@ enum PendingAction {
         upstream_branch: String,
         upstream: String,
         expected_remote_oid: Option<String>,
-        remote_url: Option<String>,
+        remote_urls: Vec<String>,
     },
     PushSetUpstream {
         remote: String,
         branch: String,
         target: HeadTarget,
         expected_remote_oid: Option<String>,
-        remote_url: Option<String>,
+        remote_urls: Vec<String>,
     },
     Pull {
         local_branch: String,
@@ -1237,7 +1237,7 @@ fn validate_push_plan(
     expected_upstream: Option<&str>,
     target: &HeadTarget,
     remote: &str,
-    remote_url: Option<&str>,
+    remote_urls: &[String],
 ) -> Result<(), String> {
     if Git::new(current_dir())
         .head_target()
@@ -1257,12 +1257,11 @@ fn validate_push_plan(
         return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
     }
     if Git::new(current_dir())
-        .remote_push_url(remote)
-        .map_err(|error| format!("Unable to revalidate push remote URL: {error}"))?
-        .as_deref()
-        != remote_url
+        .remote_push_urls(remote)
+        .map_err(|error| format!("Unable to revalidate push remote URLs: {error}"))?
+        != remote_urls
     {
-        return Err("Push blocked: remote URL changed since the plan was shown.".to_owned());
+        return Err("Push blocked: remote URLs changed since the plan was shown.".to_owned());
     }
     if status.branch.behind > 0 {
         return Err("Push blocked: branch is now behind its upstream.".to_owned());

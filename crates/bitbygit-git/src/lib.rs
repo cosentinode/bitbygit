@@ -143,16 +143,23 @@ impl Git {
             .map(ToOwned::to_owned))
     }
 
-    pub fn remote_push_url(&self, remote: &str) -> Result<Option<String>, GitError> {
+    pub fn remote_push_urls(&self, remote: &str) -> Result<Vec<String>, GitError> {
         match self.run_args(vec![
             "remote".to_owned(),
             "get-url".to_owned(),
             "--push".to_owned(),
+            "--all".to_owned(),
             "--".to_owned(),
             remote.to_owned(),
         ]) {
-            Ok(output) => Ok(Some(output.stdout.trim().to_owned())),
-            Err(GitError::GitFailed { status, .. }) if status.code() == Some(2) => Ok(None),
+            Ok(output) => Ok(output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(2) => Ok(Vec::new()),
             Err(error) => Err(error),
         }
     }
@@ -166,10 +173,10 @@ impl Git {
         remote: &str,
         branch: &str,
         expected_upstream_oid: Option<&str>,
-        expected_head_oid: Option<&str>,
+        expected_target: &HeadTarget,
     ) -> Result<GitOutput, GitError> {
         self.ensure_remote_tracking_unchanged(remote, branch, expected_upstream_oid, "pull")?;
-        self.ensure_head_unchanged(expected_head_oid, "pull")?;
+        self.ensure_head_target_unchanged(expected_target, "pull")?;
         let merge_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
             message: "pull is blocked because the upstream ref is unavailable".to_owned(),
         })?;
@@ -189,7 +196,7 @@ impl Git {
         remote: &str,
         branch: &str,
         expected_upstream_oid: Option<&str>,
-        expected_head_oid: Option<&str>,
+        expected_target: &HeadTarget,
     ) -> Result<GitOutput, GitError> {
         self.ensure_remote_tracking_unchanged(
             remote,
@@ -197,7 +204,7 @@ impl Git {
             expected_upstream_oid,
             "pull rebase",
         )?;
-        self.ensure_head_unchanged(expected_head_oid, "pull rebase")?;
+        self.ensure_head_target_unchanged(expected_target, "pull rebase")?;
         let rebase_target = expected_upstream_oid.ok_or_else(|| GitError::Blocked {
             message: "pull rebase is blocked because the upstream ref is unavailable".to_owned(),
         })?;
@@ -254,15 +261,15 @@ impl Git {
         Ok(())
     }
 
-    fn ensure_head_unchanged(
+    fn ensure_head_target_unchanged(
         &self,
-        expected_head_oid: Option<&str>,
+        expected_target: &HeadTarget,
         operation: &str,
     ) -> Result<(), GitError> {
-        if self.head_commit()?.as_deref() != expected_head_oid {
+        if self.head_target()? != *expected_target {
             return Err(GitError::Blocked {
                 message: format!(
-                    "{operation} is blocked because HEAD changed since the plan was shown"
+                    "{operation} is blocked because the branch target changed since the plan was shown"
                 ),
             });
         }
