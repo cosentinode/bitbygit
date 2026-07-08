@@ -8,7 +8,7 @@ easy to resume across sessions.
 
 Status:
 
-- in review
+- merged
 
 Must have:
 
@@ -23,6 +23,10 @@ Success condition:
 - the repository can be cloned, checked, and understood without manual guessing
 
 ## Phase 1: Product architecture, operation model, and guardrails
+
+Status:
+
+- in review
 
 Must have:
 

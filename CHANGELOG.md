@@ -8,3 +8,5 @@ semantic versioning once releases begin.
 ## Unreleased
 
 - Established the initial repository foundation.
+- Documented the product architecture, guardrail policy, command planner, and
+  system Git ADR.

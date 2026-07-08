@@ -16,7 +16,11 @@ bitbygit/
       src/lib.rs
 
   docs/
+    adr/
+      0001-system-git-first.md
     architecture.md
+    command-planner.md
+    guardrails.md
     mvp-phases.md
     repo-layout.md
 
