@@ -26,7 +26,7 @@ Success condition:
 
 Status:
 
-- in progress
+- in review
 
 Must have:
 

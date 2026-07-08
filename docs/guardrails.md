@@ -15,8 +15,8 @@ explain.
 - Treat missing, invalid, or unreadable config as safe defaults.
 - Do not store GitHub tokens, Git credentials, SSH keys, or credential helper
   output.
-- Sanitize audit entries so secrets in command output are not intentionally
-  persisted.
+- Do not persist raw stdout or stderr by default. Audit entries should store
+  sanitized metadata and redacted diagnostics only when needed.
 
 ## Risk Levels
 
@@ -28,13 +28,12 @@ Low-risk operations can run after normal user selection:
 - stage or unstage selected paths
 - switch active repository
 
-Medium-risk operations require a visible plan and confirmation when they are
-multi-step or affect shared state:
+Medium-risk operations require a visible plan and confirmation:
 
 - commit
 - push current branch
 - push new branch and set upstream
-- pull with configured strategy
+- pull that resolves as fast-forward or configured merge without rebase
 - create branch
 - checkout branch with a clean working tree
 - open pull request
@@ -44,6 +43,7 @@ High-risk operations require explicit confirmation and must explain the reason:
 - merge
 - rebase
 - pull with rebase
+- pull from a diverged branch where Git cannot fast-forward cleanly
 - amend commit
 - abort merge or rebase
 - delete branch
