@@ -83,7 +83,7 @@ impl Git {
             "push".to_owned(),
             "-u".to_owned(),
             remote.to_owned(),
-            branch.to_owned(),
+            format!("HEAD:refs/heads/{branch}"),
         ])
     }
 

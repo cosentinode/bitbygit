@@ -382,19 +382,24 @@ impl App {
                         PendingAction::Commit { .. }
                         | PendingAction::Push { .. }
                         | PendingAction::PushSetUpstream { .. }
-                        | PendingAction::Pull
-                        | PendingAction::PullRebase => unreachable!(),
+                        | PendingAction::Pull { .. }
+                        | PendingAction::PullRebase { .. } => unreachable!(),
                     }
                 })
             }
-            PendingAction::Push { remote, branch } => match validate_push_plan(&branch, true) {
+            PendingAction::Push {
+                local_branch,
+                remote,
+                upstream_branch,
+                upstream,
+            } => match validate_push_plan(&local_branch, Some(&upstream)) {
                 Ok(()) => run_audited_git_operation_with_output("push", "push", || {
-                    Git::new(current_dir()).push_current_branch(&remote, &branch)
+                    Git::new(current_dir()).push_current_branch(&remote, &upstream_branch)
                 }),
                 Err(error) => error,
             },
             PendingAction::PushSetUpstream { remote, branch } => {
-                match validate_push_plan(&branch, false) {
+                match validate_push_plan(&branch, None) {
                     Ok(()) => {
                         run_audited_git_operation_with_output("push", "push_set_upstream", || {
                             Git::new(current_dir())
@@ -404,13 +409,13 @@ impl App {
                     Err(error) => error,
                 }
             }
-            PendingAction::Pull => match validate_pull_plan(false) {
+            PendingAction::Pull { upstream } => match validate_pull_plan(false, &upstream) {
                 Ok(()) => run_audited_git_operation_with_output("pull", "pull", || {
                     Git::new(current_dir()).pull()
                 }),
                 Err(error) => error,
             },
-            PendingAction::PullRebase => match validate_pull_plan(true) {
+            PendingAction::PullRebase { upstream } => match validate_pull_plan(true, &upstream) {
                 Ok(()) => run_audited_git_operation_with_output(
                     "pull rebase",
                     "pull_rebase",
@@ -547,8 +552,10 @@ impl App {
                     return;
                 };
                 self.pending_confirmation = Some(PendingAction::Push {
+                    local_branch: branch.clone(),
                     remote,
-                    branch: upstream_branch,
+                    upstream_branch,
+                    upstream: upstream.clone(),
                 });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {upstream}\n- ahead: {} commit(s)\nPress y to push or n to cancel.",
@@ -594,13 +601,17 @@ impl App {
         self.prompt.clear();
         let upstream = status.branch.upstream.clone().unwrap_or_default();
         if rebase {
-            self.pending_confirmation = Some(PendingAction::PullRebase);
+            self.pending_confirmation = Some(PendingAction::PullRebase {
+                upstream: upstream.clone(),
+            });
             self.details = format!(
                 "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
                 status.branch.behind
             );
         } else {
-            self.pending_confirmation = Some(PendingAction::Pull);
+            self.pending_confirmation = Some(PendingAction::Pull {
+                upstream: upstream.clone(),
+            });
             self.details = format!(
                 "Pull plan:\n- fetch and pull from {upstream} using configured strategy\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
                 status.branch.behind
@@ -634,15 +645,21 @@ enum PendingAction {
     StageAll,
     UnstageAll,
     Push {
+        local_branch: String,
         remote: String,
-        branch: String,
+        upstream_branch: String,
+        upstream: String,
     },
     PushSetUpstream {
         remote: String,
         branch: String,
     },
-    Pull,
-    PullRebase,
+    Pull {
+        upstream: String,
+    },
+    PullRebase {
+        upstream: String,
+    },
     Commit {
         message: String,
         staged_items: Vec<String>,
@@ -658,8 +675,8 @@ impl PendingAction {
             Self::UnstageAll => "unstage all",
             Self::Push { .. } => "push",
             Self::PushSetUpstream { .. } => "push",
-            Self::Pull => "pull",
-            Self::PullRebase => "pull rebase",
+            Self::Pull { .. } => "pull",
+            Self::PullRebase { .. } => "pull rebase",
             Self::Commit { .. } => "commit",
         }
     }
@@ -670,8 +687,8 @@ impl PendingAction {
             Self::UnstageAll => "unstage_all",
             Self::Push { .. } => "push",
             Self::PushSetUpstream { .. } => "push_set_upstream",
-            Self::Pull => "pull",
-            Self::PullRebase => "pull_rebase",
+            Self::Pull { .. } => "pull",
+            Self::PullRebase { .. } => "pull_rebase",
             Self::Commit { .. } => "commit",
         }
     }
@@ -1018,7 +1035,7 @@ fn split_upstream(upstream: &str) -> Option<(String, String)> {
     (!remote.is_empty() && !branch.is_empty()).then(|| (remote.to_owned(), branch.to_owned()))
 }
 
-fn validate_push_plan(branch: &str, expect_upstream: bool) -> Result<(), String> {
+fn validate_push_plan(branch: &str, expected_upstream: Option<&str>) -> Result<(), String> {
     let status = Git::new(current_dir())
         .status()
         .map_err(|error| format!("Unable to revalidate push plan: {error}"))?;
@@ -1026,11 +1043,8 @@ fn validate_push_plan(branch: &str, expect_upstream: bool) -> Result<(), String>
     if current_branch != branch {
         return Err("Push blocked: current branch changed since the plan was shown.".to_owned());
     }
-    if expect_upstream && status.branch.upstream.is_none() {
+    if status.branch.upstream.as_deref() != expected_upstream {
         return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
-    }
-    if !expect_upstream && status.branch.upstream.is_some() {
-        return Err("Push blocked: upstream was added since the plan was shown.".to_owned());
     }
     if status.branch.behind > 0 {
         return Err("Push blocked: branch is now behind its upstream.".to_owned());
@@ -1038,12 +1052,12 @@ fn validate_push_plan(branch: &str, expect_upstream: bool) -> Result<(), String>
     Ok(())
 }
 
-fn validate_pull_plan(rebase: bool) -> Result<(), String> {
+fn validate_pull_plan(rebase: bool, expected_upstream: &str) -> Result<(), String> {
     let status = Git::new(current_dir())
         .status()
         .map_err(|error| format!("Unable to revalidate pull plan: {error}"))?;
-    if status.branch.upstream.is_none() {
-        return Err("Pull blocked: current branch has no upstream.".to_owned());
+    if status.branch.upstream.as_deref() != Some(expected_upstream) {
+        return Err("Pull blocked: upstream changed since the plan was shown.".to_owned());
     }
     if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
         return Err("Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned());
