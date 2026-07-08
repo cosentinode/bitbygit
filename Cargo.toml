@@ -4,6 +4,7 @@ members = [
     "crates/bitbygit-core",
     "crates/bitbygit-git",
     "crates/bitbygit-store",
+    "crates/bitbygit-tui",
 ]
 resolver = "3"
 

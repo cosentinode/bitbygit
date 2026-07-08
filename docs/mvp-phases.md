@@ -62,7 +62,7 @@ Success condition:
 
 Status:
 
-- in progress
+- merged
 
 Must have:
 
@@ -77,6 +77,10 @@ Success condition:
   repository files on disk
 
 ## Phase 4: Responsive single-viewport TUI shell
+
+Status:
+
+- in progress
 
 Must have:
 
