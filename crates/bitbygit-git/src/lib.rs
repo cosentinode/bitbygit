@@ -71,13 +71,19 @@ impl Git {
         remote: &str,
         branch: &str,
         source_oid: &str,
+        expected_remote_oid: Option<&str>,
     ) -> Result<GitOutput, GitError> {
-        self.run_args(vec![
+        self.ensure_push_is_fast_forward(source_oid, expected_remote_oid)?;
+        let mut args = vec![
             "push".to_owned(),
+            force_with_lease_arg(branch, expected_remote_oid),
+        ];
+        args.extend([
             "--".to_owned(),
             remote.to_owned(),
             format!("{source_oid}:refs/heads/{branch}"),
-        ])
+        ]);
+        self.run_args(args)
     }
 
     pub fn push_current_branch_set_upstream(
@@ -85,18 +91,56 @@ impl Git {
         remote: &str,
         branch: &str,
         source_oid: &str,
+        expected_remote_oid: Option<&str>,
     ) -> Result<GitOutput, GitError> {
-        let push = self.run_args(vec![
-            "push".to_owned(),
-            "--".to_owned(),
-            remote.to_owned(),
-            format!("{source_oid}:refs/heads/{branch}"),
-        ])?;
+        let push = self.push_current_branch(remote, branch, source_oid, expected_remote_oid)?;
         let upstream = self.run_args(vec![
             "branch".to_owned(),
             format!("--set-upstream-to={}", remote_tracking_ref(remote, branch)),
+            branch.to_owned(),
         ])?;
         Ok(combine_outputs(push, upstream))
+    }
+
+    fn ensure_push_is_fast_forward(
+        &self,
+        source_oid: &str,
+        expected_remote_oid: Option<&str>,
+    ) -> Result<(), GitError> {
+        let Some(expected_remote_oid) = expected_remote_oid else {
+            return Ok(());
+        };
+        match self.run_args(vec![
+            "merge-base".to_owned(),
+            "--is-ancestor".to_owned(),
+            expected_remote_oid.to_owned(),
+            source_oid.to_owned(),
+        ]) {
+            Ok(_output) => Ok(()),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => {
+                Err(GitError::Blocked {
+                    message: "push is blocked because it would not fast-forward the planned remote"
+                        .to_owned(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn remote_head_oid(&self, remote: &str, branch: &str) -> Result<Option<String>, GitError> {
+        let output = self.run_args(vec![
+            "ls-remote".to_owned(),
+            "--heads".to_owned(),
+            "--".to_owned(),
+            remote.to_owned(),
+            format!("refs/heads/{branch}"),
+        ])?;
+        Ok(output
+            .stdout
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .map(ToOwned::to_owned))
     }
 
     pub fn pull(&self) -> Result<GitOutput, GitError> {
@@ -1184,6 +1228,13 @@ fn remote_tracking_ref(remote: &str, branch: &str) -> String {
     format!("refs/remotes/{remote}/{branch}")
 }
 
+fn force_with_lease_arg(branch: &str, expected_remote_oid: Option<&str>) -> String {
+    format!(
+        "--force-with-lease=refs/heads/{branch}:{}",
+        expected_remote_oid.unwrap_or("")
+    )
+}
+
 fn combine_outputs(first: GitOutput, second: GitOutput) -> GitOutput {
     let stdout = [first.stdout.trim(), second.stdout.trim()]
         .into_iter()
@@ -1692,7 +1743,12 @@ mod tests {
         repo.run_args(&["remote", "add", "origin", &remote_path])?;
 
         let head = repo.git_stdout(["rev-parse", "HEAD"])?;
-        Git::new(repo.path()).push_current_branch_set_upstream("origin", "main", head.trim())?;
+        Git::new(repo.path()).push_current_branch_set_upstream(
+            "origin",
+            "main",
+            head.trim(),
+            None,
+        )?;
 
         assert_eq!(
             Git::new(repo.path()).upstream()?,

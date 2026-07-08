@@ -393,6 +393,7 @@ impl App {
                 remote,
                 upstream_branch,
                 upstream,
+                expected_remote_oid,
             } => match validate_push_plan(&local_branch, Some(&upstream), &target) {
                 Ok(()) => run_audited_git_operation_with_output("push", "push", || {
                     let source_oid = target.oid.as_deref().ok_or_else(|| GitError::Blocked {
@@ -403,6 +404,7 @@ impl App {
                         &remote,
                         &upstream_branch,
                         source_oid,
+                        expected_remote_oid.as_deref(),
                     )
                 }),
                 Err(error) => error,
@@ -411,6 +413,7 @@ impl App {
                 remote,
                 branch,
                 target,
+                expected_remote_oid,
             } => {
                 match validate_push_plan(&branch, None, &target) {
                     Ok(()) => {
@@ -423,7 +426,10 @@ impl App {
                                 }
                             })?;
                             Git::new(current_dir()).push_current_branch_set_upstream(
-                                &remote, &branch, source_oid,
+                                &remote,
+                                &branch,
+                                source_oid,
+                                expected_remote_oid.as_deref(),
                             )
                         })
                     }
@@ -618,12 +624,21 @@ impl App {
                         format!("Push blocked: upstream config does not match {upstream}.");
                     return;
                 }
+                let expected_remote_oid =
+                    match Git::new(current_dir()).remote_head_oid(&remote, &upstream_branch) {
+                        Ok(oid) => oid,
+                        Err(error) => {
+                            self.details = format!("Unable to snapshot push remote: {error}");
+                            return;
+                        }
+                    };
                 self.pending_confirmation = Some(PendingAction::Push {
                     local_branch: branch.clone(),
                     target: head_target.clone(),
                     remote,
                     upstream_branch,
                     upstream: upstream.clone(),
+                    expected_remote_oid,
                 });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {upstream}\n- ahead: {} commit(s)\nPress y to push or n to cancel.",
@@ -635,10 +650,19 @@ impl App {
                     self.details = "Push blocked: no remotes are configured.".to_owned();
                     return;
                 };
+                let expected_remote_oid =
+                    match Git::new(current_dir()).remote_head_oid(&remote, &branch) {
+                        Ok(oid) => oid,
+                        Err(error) => {
+                            self.details = format!("Unable to snapshot push remote: {error}");
+                            return;
+                        }
+                    };
                 self.pending_confirmation = Some(PendingAction::PushSetUpstream {
                     remote: remote.clone(),
                     branch: branch.clone(),
                     target: head_target,
+                    expected_remote_oid,
                 });
                 self.details = format!(
                     "Push plan:\n- push {branch} to {remote}\n- set upstream to {remote}/{branch}\nPress y to push or n to cancel."
@@ -772,11 +796,13 @@ enum PendingAction {
         remote: String,
         upstream_branch: String,
         upstream: String,
+        expected_remote_oid: Option<String>,
     },
     PushSetUpstream {
         remote: String,
         branch: String,
         target: HeadTarget,
+        expected_remote_oid: Option<String>,
     },
     Pull {
         local_branch: String,
