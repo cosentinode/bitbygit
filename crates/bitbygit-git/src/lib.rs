@@ -91,8 +91,27 @@ impl Git {
         self.run(["pull", "--ff-only"])
     }
 
+    pub fn pull_ff_only_from(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+        let fetch = self.fetch_remote_branch(remote, branch)?;
+        let merge = self.run_args(vec![
+            "merge".to_owned(),
+            "--ff-only".to_owned(),
+            remote_tracking_ref(remote, branch),
+        ])?;
+        Ok(combine_outputs(fetch, merge))
+    }
+
     pub fn pull_rebase(&self) -> Result<GitOutput, GitError> {
         self.run(["pull", "--rebase"])
+    }
+
+    pub fn pull_rebase_from(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+        let fetch = self.fetch_remote_branch(remote, branch)?;
+        let rebase = self.run_args(vec![
+            "rebase".to_owned(),
+            remote_tracking_ref(remote, branch),
+        ])?;
+        Ok(combine_outputs(fetch, rebase))
     }
 
     pub fn upstream_push_target(&self, branch: &str) -> Result<Option<(String, String)>, GitError> {
@@ -106,6 +125,17 @@ impl Git {
             .unwrap_or(merge.as_str())
             .to_owned();
         Ok(Some((remote, branch)))
+    }
+
+    fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+        self.run_args(vec![
+            "fetch".to_owned(),
+            remote.to_owned(),
+            format!(
+                "refs/heads/{branch}:{}",
+                remote_tracking_ref(remote, branch)
+            ),
+        ])
     }
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {
@@ -362,6 +392,10 @@ impl Git {
         let output = Command::new("git")
             .current_dir(&self.cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {
@@ -478,6 +512,10 @@ impl Git {
         let mut command = Command::new("git");
         command.current_dir(&self.cwd).args(&args);
         command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env("GIT_ASKPASS", "");
+        command.env("SSH_ASKPASS", "");
+        command.env("SSH_ASKPASS_REQUIRE", "never");
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
         if literal_pathspecs {
             command.env("GIT_LITERAL_PATHSPECS", "1");
         }
@@ -508,6 +546,10 @@ impl Git {
         let output = Command::new("git")
             .current_dir(&self.cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
             .args(&args)
             .output()
             .map_err(|source| GitError::Io {
@@ -1065,6 +1107,28 @@ fn path_from_bytes(value: &[u8]) -> PathBuf {
 fn parse_error(message: &str) -> GitError {
     GitError::Parse {
         message: message.to_owned(),
+    }
+}
+
+fn remote_tracking_ref(remote: &str, branch: &str) -> String {
+    format!("refs/remotes/{remote}/{branch}")
+}
+
+fn combine_outputs(first: GitOutput, second: GitOutput) -> GitOutput {
+    let stdout = [first.stdout.trim(), second.stdout.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stderr = [first.stderr.trim(), second.stderr.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    GitOutput {
+        status: second.status,
+        stdout,
+        stderr,
     }
 }
 

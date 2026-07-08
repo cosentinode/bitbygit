@@ -412,20 +412,24 @@ impl App {
             PendingAction::Pull {
                 local_branch,
                 upstream,
+                remote,
+                upstream_branch,
             } => match validate_pull_plan(false, &local_branch, &upstream) {
                 Ok(()) => run_audited_git_operation_with_output("pull", "pull", || {
-                    Git::new(current_dir()).pull()
+                    Git::new(current_dir()).pull_ff_only_from(&remote, &upstream_branch)
                 }),
                 Err(error) => error,
             },
             PendingAction::PullRebase {
                 local_branch,
                 upstream,
+                remote,
+                upstream_branch,
             } => match validate_pull_plan(true, &local_branch, &upstream) {
                 Ok(()) => run_audited_git_operation_with_output(
                     "pull rebase",
                     "pull_rebase",
-                    || Git::new(current_dir()).pull_rebase(),
+                    || Git::new(current_dir()).pull_rebase_from(&remote, &upstream_branch),
                 ),
                 Err(error) => error,
             },
@@ -628,10 +632,29 @@ impl App {
         }
         self.prompt.clear();
         let upstream = status.branch.upstream.clone().unwrap_or_default();
+        let target = match Git::new(current_dir()).upstream_push_target(&local_branch) {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                self.details = format!("Pull blocked: unable to resolve upstream {upstream}.");
+                return;
+            }
+            Err(error) => {
+                self.details = format!("Unable to prepare pull target: {error}");
+                return;
+            }
+        };
+        let (remote, upstream_branch) = target;
+        let expected_upstream = format!("{remote}/{upstream_branch}");
+        if expected_upstream != upstream {
+            self.details = format!("Pull blocked: upstream config does not match {upstream}.");
+            return;
+        }
         if rebase {
             self.pending_confirmation = Some(PendingAction::PullRebase {
                 local_branch,
                 upstream: upstream.clone(),
+                remote,
+                upstream_branch,
             });
             self.details = format!(
                 "Pull rebase plan:\n- fetch and rebase current branch onto {upstream}\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
@@ -641,6 +664,8 @@ impl App {
             self.pending_confirmation = Some(PendingAction::Pull {
                 local_branch,
                 upstream: upstream.clone(),
+                remote,
+                upstream_branch,
             });
             self.details = format!(
                 "Pull plan:\n- fetch and fast-forward from {upstream}\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
@@ -660,6 +685,10 @@ impl App {
 
     fn clamp_file_scroll_for(&mut self, area: Rect) {
         let visible_len = status_file_visible_len(area);
+        if visible_len == 0 {
+            self.file_scroll = self.selected_file;
+            return;
+        }
         if self.selected_file < self.file_scroll {
             self.file_scroll = self.selected_file;
         }
@@ -687,10 +716,14 @@ enum PendingAction {
     Pull {
         local_branch: String,
         upstream: String,
+        remote: String,
+        upstream_branch: String,
     },
     PullRebase {
         local_branch: String,
         upstream: String,
+        remote: String,
+        upstream_branch: String,
     },
     Commit {
         message: String,
@@ -1121,7 +1154,7 @@ fn status_visible_len(area: Rect) -> usize {
 }
 
 fn status_file_visible_len(area: Rect) -> usize {
-    status_visible_len(area).saturating_sub(1).max(1)
+    status_visible_len(area).saturating_sub(1)
 }
 
 fn details_panel(app: &App) -> Paragraph<'_> {
