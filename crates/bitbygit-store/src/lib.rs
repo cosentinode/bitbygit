@@ -153,7 +153,9 @@ impl LocalStore {
     }
 
     pub fn load_state(&self) -> Result<AppState, StoreError> {
-        let contents = read_snapshot_optional(&self.paths.state_file)?;
+        let contents = read_snapshot_optional(&self.paths.state_file, |snapshot| {
+            parse_state(snapshot).map(|_| ())
+        })?;
         let Some(contents) = contents else {
             return Ok(AppState::default());
         };
@@ -223,7 +225,9 @@ impl LocalStore {
     }
 
     fn load_registry_map(&self) -> Result<BTreeMap<RepoId, RepositoryRecord>, StoreError> {
-        let contents = read_snapshot_optional(&self.paths.registry_file)?;
+        let contents = read_snapshot_optional(&self.paths.registry_file, |snapshot| {
+            parse_registry(snapshot).map(|_| ())
+        })?;
         let Some(contents) = contents else {
             return Ok(BTreeMap::new());
         };
@@ -451,23 +455,42 @@ fn read_optional(path: &Path) -> Result<Option<String>, StoreError> {
     }
 }
 
-fn read_snapshot_optional(path: &Path) -> Result<Option<String>, StoreError> {
+fn read_snapshot_optional(
+    path: &Path,
+    validate: impl Fn(&str) -> Result<(), StoreError>,
+) -> Result<Option<String>, StoreError> {
     let Some(contents) = read_optional(path)? else {
         return Ok(None);
     };
 
     let mut saw_snapshot = false;
-    for line in contents.lines().rev() {
-        let Some(encoded) = line.strip_prefix("snapshot\t") else {
+    let mut lines = contents.lines().collect::<Vec<_>>();
+    if !contents.ends_with('\n') {
+        let _unterminated = lines.pop();
+    }
+    for line in lines.into_iter().rev() {
+        let Some(frame) = line.strip_prefix("snapshot\t") else {
             continue;
         };
         saw_snapshot = true;
+        let Some((length, encoded)) = frame.split_once('\t') else {
+            continue;
+        };
+        let Ok(expected_len) = length.parse::<usize>() else {
+            continue;
+        };
         let Ok(bytes) = decode_bytes(encoded) else {
             continue;
         };
+        if bytes.len() != expected_len {
+            continue;
+        }
         let Ok(snapshot) = String::from_utf8(bytes) else {
             continue;
         };
+        if validate(&snapshot).is_err() {
+            continue;
+        }
         return Ok(Some(snapshot));
     }
 
@@ -488,7 +511,11 @@ fn write_snapshot(path: &Path, contents: &str) -> Result<(), StoreError> {
         })?;
     }
 
-    let line = format!("snapshot\t{}\n", encode_string(contents));
+    let line = format!(
+        "snapshot\t{}\t{}\n",
+        contents.len(),
+        encode_string(contents)
+    );
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -926,6 +953,45 @@ mod tests {
         store.set_active_repository(Some(record.id.clone()))?;
         let mut contents = fs::read_to_string(&store.paths().state_file)?;
         contents.push_str("snapshot\tnot-valid-hex\n");
+        fs::write(&store.paths().state_file, contents)?;
+
+        assert_eq!(store.load_state()?.active_repo, Some(record.id));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_reader_ignores_length_mismatched_snapshot_prefix() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo_a = fixture.git_repo("repo-a")?;
+        let repo_b = fixture.git_repo("repo-b")?;
+        let store = fixture.store()?;
+        let record_a = store.add_repository(repo_a.path())?;
+        let record_b = store.add_repository(repo_b.path())?;
+        let prefix = format_registry([record_a.clone()]);
+        let full = format_registry([record_a.clone(), record_b.clone()]);
+        let torn = format!("snapshot\t{}\t{}\n", full.len(), encode_string(&prefix));
+        let mut contents = fs::read_to_string(&store.paths().registry_file)?;
+        contents.push_str(&torn);
+        fs::write(&store.paths().registry_file, contents)?;
+
+        assert_eq!(store.list_repositories()?, vec![record_a, record_b]);
+        Ok(())
+    }
+
+    #[test]
+    fn state_reader_ignores_unterminated_snapshot_line() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let repo = fixture.git_repo("repo")?;
+        let store = fixture.store()?;
+        let record = store.add_repository(repo.path())?;
+        store.set_active_repository(Some(record.id.clone()))?;
+        let mut contents = fs::read_to_string(&store.paths().state_file)?;
+        let snapshot = format_state(&AppState::default());
+        contents.push_str(&format!(
+            "snapshot\t{}\t{}",
+            snapshot.len(),
+            encode_string(&snapshot)
+        ));
         fs::write(&store.paths().state_file, contents)?;
 
         assert_eq!(store.load_state()?.active_repo, Some(record.id));
