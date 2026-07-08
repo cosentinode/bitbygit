@@ -33,19 +33,7 @@ impl StorePaths {
     }
 
     pub fn from_environment() -> Result<Self, StoreError> {
-        let config_dir = env_path("BITBYGIT_CONFIG_DIR")
-            .or_else(|| env_path("XDG_CONFIG_HOME").map(|path| path.join("bitbygit")))
-            .or_else(|| env_path("APPDATA").map(|path| path.join("bitbygit")))
-            .or_else(|| home_dir().map(|path| path.join(".config").join("bitbygit")))
-            .ok_or(StoreError::HomeDirectoryUnavailable)?;
-
-        let data_dir = env_path("BITBYGIT_DATA_DIR")
-            .or_else(|| env_path("XDG_DATA_HOME").map(|path| path.join("bitbygit")))
-            .or_else(|| env_path("APPDATA").map(|path| path.join("bitbygit").join("data")))
-            .or_else(|| home_dir().map(|path| path.join(".local").join("share").join("bitbygit")))
-            .ok_or(StoreError::HomeDirectoryUnavailable)?;
-
-        Ok(Self::from_roots(config_dir, data_dir))
+        resolve_paths(env_path)
     }
 }
 
@@ -83,19 +71,26 @@ impl LocalStore {
         let mut records = self.load_registry_map()?;
         let mut state = self.load_state()?;
         let old_records = records.clone();
-        let record = records
-            .entry(id.clone())
-            .and_modify(|record| {
-                record.path = root.clone();
-                record.last_seen_at = now;
-            })
-            .or_insert_with(|| RepositoryRecord {
-                id,
+        let record = if let Some(record) = records.get_mut(&id) {
+            if record.path != root {
+                return Err(StoreError::RepositoryIdCollision {
+                    id,
+                    existing_path: record.path.clone(),
+                    new_path: root,
+                });
+            }
+            record.last_seen_at = now;
+            record.clone()
+        } else {
+            let record = RepositoryRecord {
+                id: id.clone(),
                 path: root,
                 added_at: now,
                 last_seen_at: now,
-            })
-            .clone();
+            };
+            records.insert(id, record.clone());
+            record
+        };
         push_recent(&mut state.recent_repos, record.id.clone());
 
         self.save_registry(records.into_values())?;
@@ -272,7 +267,7 @@ impl RepoId {
     }
 
     fn from_path(path: &Path) -> Self {
-        Self(format!("repo-{:016x}", fnv1a(path_bytes(path))))
+        Self(format!("repo-{:016x}", fnv1a(&path_bytes(path))))
     }
 }
 
@@ -353,6 +348,11 @@ pub enum StoreError {
     UnknownRepository {
         id: RepoId,
     },
+    RepositoryIdCollision {
+        id: RepoId,
+        existing_path: PathBuf,
+        new_path: PathBuf,
+    },
 }
 
 impl Display for StoreError {
@@ -378,6 +378,16 @@ impl Display for StoreError {
                 )
             }
             Self::UnknownRepository { id } => write!(formatter, "unknown repository id {id}"),
+            Self::RepositoryIdCollision {
+                id,
+                existing_path,
+                new_path,
+            } => write!(
+                formatter,
+                "repository id {id} maps to both {} and {}",
+                existing_path.display(),
+                new_path.display()
+            ),
         }
     }
 }
@@ -390,7 +400,8 @@ impl Error for StoreError {
             | Self::ClockBeforeUnixEpoch
             | Self::Parse { .. }
             | Self::InvalidRepository { .. }
-            | Self::UnknownRepository { .. } => None,
+            | Self::UnknownRepository { .. }
+            | Self::RepositoryIdCollision { .. } => None,
         }
     }
 }
@@ -401,10 +412,20 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+fn resolve_paths(env: impl Fn(&str) -> Option<PathBuf>) -> Result<StorePaths, StoreError> {
+    let config_dir = env("BITBYGIT_CONFIG_DIR")
+        .or_else(|| env("XDG_CONFIG_HOME").map(|path| path.join("bitbygit")))
+        .or_else(|| env("APPDATA").map(|path| path.join("bitbygit")))
+        .or_else(|| env("HOME").map(|path| path.join(".config").join("bitbygit")))
+        .ok_or(StoreError::HomeDirectoryUnavailable)?;
+
+    let data_dir = env("BITBYGIT_DATA_DIR")
+        .or_else(|| env("XDG_DATA_HOME").map(|path| path.join("bitbygit")))
+        .or_else(|| env("APPDATA").map(|path| path.join("bitbygit").join("data")))
+        .or_else(|| env("HOME").map(|path| path.join(".local").join("share").join("bitbygit")))
+        .ok_or(StoreError::HomeDirectoryUnavailable)?;
+
+    Ok(StorePaths::from_roots(config_dir, data_dir))
 }
 
 fn now_secs() -> Result<u64, StoreError> {
@@ -705,7 +726,7 @@ fn decode_string(value: &str) -> Result<String, StoreError> {
 }
 
 fn encode_path(path: &Path) -> String {
-    encode_bytes(path_bytes(path))
+    encode_bytes(&path_bytes(path))
 }
 
 fn decode_path(value: &str) -> Result<PathBuf, StoreError> {
@@ -713,13 +734,13 @@ fn decode_path(value: &str) -> Result<PathBuf, StoreError> {
 }
 
 #[cfg(unix)]
-fn path_bytes(path: &Path) -> &[u8] {
-    path.as_os_str().as_bytes()
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
 }
 
 #[cfg(not(unix))]
-fn path_bytes(path: &Path) -> &[u8] {
-    path.to_string_lossy().as_bytes()
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
 }
 
 #[cfg(unix)]
@@ -990,6 +1011,40 @@ mod tests {
         assert_eq!(
             paths.audit_file,
             fixture.path.join("data").join("audit.tsv")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn environment_path_resolution_uses_explicit_overrides_first() -> Result<(), Box<dyn Error>> {
+        let paths = resolve_paths(|name| match name {
+            "BITBYGIT_CONFIG_DIR" => Some(PathBuf::from("/custom/config")),
+            "BITBYGIT_DATA_DIR" => Some(PathBuf::from("/custom/data")),
+            "XDG_CONFIG_HOME" => Some(PathBuf::from("/xdg/config")),
+            "XDG_DATA_HOME" => Some(PathBuf::from("/xdg/data")),
+            "HOME" => Some(PathBuf::from("/home/test")),
+            _ => None,
+        })?;
+
+        assert_eq!(paths.config_dir, PathBuf::from("/custom/config"));
+        assert_eq!(paths.data_dir, PathBuf::from("/custom/data"));
+        Ok(())
+    }
+
+    #[test]
+    fn environment_path_resolution_falls_back_to_home() -> Result<(), Box<dyn Error>> {
+        let paths = resolve_paths(|name| match name {
+            "HOME" => Some(PathBuf::from("/home/test")),
+            _ => None,
+        })?;
+
+        assert_eq!(
+            paths.config_dir,
+            PathBuf::from("/home/test/.config/bitbygit")
+        );
+        assert_eq!(
+            paths.data_dir,
+            PathBuf::from("/home/test/.local/share/bitbygit")
         );
         Ok(())
     }
