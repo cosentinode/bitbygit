@@ -185,14 +185,23 @@ impl Display for GitError {
             Self::GitFailed {
                 args,
                 status,
+                stdout,
                 stderr,
                 ..
-            } => write!(
-                formatter,
-                "git {} failed with status {status}: {}",
-                args.join(" "),
-                stderr.trim()
-            ),
+            } => {
+                let detail = if !stderr.trim().is_empty() {
+                    stderr.trim()
+                } else if !stdout.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    "no output"
+                };
+                write!(
+                    formatter,
+                    "git {} failed with status {status}: {detail}",
+                    args.join(" ")
+                )
+            }
             Self::Parse { message } => write!(formatter, "failed to parse git output: {message}"),
         }
     }
@@ -321,6 +330,9 @@ pub struct StatusEntry {
 pub enum StatusEntryType {
     Ordinary,
     Renamed,
+    /// Porcelain v2 reserves the `2` record family for renames and copies. Git
+    /// status does not normally emit copies, but the parser keeps the model
+    /// explicit for forward-compatible callers.
     Copied,
     Untracked,
     Ignored,
@@ -442,6 +454,14 @@ fn parse_status_bytes(input: &[u8]) -> Result<WorktreeStatus, GitError> {
 
         if line.starts_with(b"u ") {
             entries.push(parse_conflict_entry(line)?);
+            continue;
+        }
+
+        if !line.starts_with(b"# ") {
+            return Err(parse_error(&format!(
+                "unknown porcelain v2 record: {}",
+                String::from_utf8_lossy(line)
+            )));
         }
     }
 
