@@ -35,7 +35,13 @@ impl GitHub {
             Err(error) => return Err(error),
         }
 
-        match self.run_status(vec!["auth".to_owned(), "status".to_owned()]) {
+        match self.run_status(vec![
+            "auth".to_owned(),
+            "status".to_owned(),
+            "--active".to_owned(),
+            "--hostname".to_owned(),
+            "github.com".to_owned(),
+        ]) {
             Ok(()) => Ok(GhSetupStatus::Ready),
             Err(GhError::CommandFailed { .. }) => Ok(GhSetupStatus::NotAuthenticated),
             Err(error) => Err(error),
@@ -324,6 +330,22 @@ mod tests {
         assert_eq!(status, GhSetupStatus::NotAuthenticated);
         assert_eq!(status.guidance(), Some(AUTHENTICATE_GH_GUIDANCE));
         assert_eq!(fake.prompt_values()?, "1\n1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn auth_check_ignores_a_stale_account_on_another_host() -> Result<(), Box<dyn Error>> {
+        let fake = FakeGh::new(
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) case \"$3:$4:$5\" in\n--active:--hostname:github.com) exit 0 ;;\n*) exit 1 ;;\nesac ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\nesac",
+        )?;
+
+        let repository = fake.github().repository()?;
+
+        assert_eq!(repository.name_with_owner, "octo/repo");
+        assert!(
+            fake.invocations()?
+                .contains("auth\u{1f}status\u{1f}--active\u{1f}--hostname\u{1f}github.com\u{1f}\n")
+        );
         Ok(())
     }
 
