@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bitbygit-core = { path = "../bitbygit-core" }
 bitbygit-git = { path = "../bitbygit-git" }
 bitbygit-store = { path = "../bitbygit-store" }
 crossterm = "0.28"
