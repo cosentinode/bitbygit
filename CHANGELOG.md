@@ -26,3 +26,8 @@ semantic versioning once releases begin.
   rebase workflows with dirty-tree guardrails and confirmation plans.
 - Added Phase 9 operation planning, typed execution, queued operation preview
   and confirmation, and repo-aware audit visibility.
+- Added Phase 10 deterministic prompt parsing for typed Git operation requests
+  as part of [#12](https://github.com/cosentinode/bitbygit/issues/12), with
+  golden parser tests, manual planner parity, and safe non-provider multi-step
+  prompts; `open pr` prompt execution remains Phase 11 GitHub integration work
+  in [#13](https://github.com/cosentinode/bitbygit/issues/13).

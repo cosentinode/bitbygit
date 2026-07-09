@@ -21,9 +21,9 @@ with suggestions.
 7. Produce a typed operation plan.
 8. Show the preview and required confirmations.
 
-## Supported MVP Prompts
+## Phase 10 Supported Prompts
 
-Initial supported commands should include:
+Completed Phase 10 parser support includes deterministic, typed plans for:
 
 - `fetch`
 - `push`
@@ -35,18 +35,18 @@ Initial supported commands should include:
 - `branch <name> from <base>`
 - `merge <branch>`
 - `rebase <base>`
-- `commit`
+- `commit <message>`
 - `commit -m "message"`
-- `commit and push`
-- `open pr`
-- `commit and push and open pr`
+- `commit -m "message" and push`
 
-The parser should also accept `pull rebase` and `open pull request` as aliases
-when the meaning is unambiguous.
+The parser also accepts `pull rebase` as an alias when the meaning is
+unambiguous.
 
-`open pr` and `open pull request` must produce a plan that previews provider,
-remote, head branch, base branch, title, and target URL before calling a GitHub
-operation.
+`open pr`, `open pull request`, and `commit and push and open pr` are Phase 11
+GitHub integration work, not completed Phase 10 behavior. They depend on
+[#13](https://github.com/cosentinode/bitbygit/issues/13). When implemented,
+those prompts must produce plans that preview provider, remote, head branch,
+base branch, title, and target URL before calling a GitHub operation.
 
 ## Quoted Strings
 
@@ -75,13 +75,14 @@ Rejected prompts should return suggestions, not partial execution.
 ## Multi-Step Plans
 
 Multi-step prompts produce ordered plans. For example,
-`commit and push and open pr` should become:
+`commit -m "sync docs" and push` should become:
 
-1. commit staged changes
+1. commit staged changes with message `sync docs`
 2. push the current branch
-3. open a pull request for the current branch
 
-If step 1 fails, steps 2 and 3 must not run.
+If step 1 fails, step 2 must not run. Provider-backed sequences such as
+`commit and push and open pr` must wait for the Phase 11 GitHub integration in
+[#13](https://github.com/cosentinode/bitbygit/issues/13).
 
 ## Agent Compatibility
 
