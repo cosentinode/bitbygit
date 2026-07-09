@@ -2,6 +2,7 @@
 members = [
     "crates/bitbygit",
     "crates/bitbygit-core",
+    "crates/bitbygit-gh",
     "crates/bitbygit-git",
     "crates/bitbygit-store",
     "crates/bitbygit-tui",
