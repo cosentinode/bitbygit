@@ -13,6 +13,7 @@ name = "bitbygit"
 version = "0.1.0"
 dependencies = [
  "bitbygit-core",
+ "bitbygit-store",
  "bitbygit-tui",
 ]
 

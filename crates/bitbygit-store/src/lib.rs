@@ -277,7 +277,7 @@ impl RepoId {
         &self.0
     }
 
-    fn from_path(path: &Path) -> Self {
+    pub fn from_path(path: &Path) -> Self {
         Self(format!("repo-{:016x}", fnv1a(&path_bytes(path))))
     }
 }
@@ -662,22 +662,27 @@ fn parse_audit_entries(contents: &str) -> Result<Vec<AuditEntry>, StoreError> {
 
 fn parse_audit_entry(line: &str, line_number: usize) -> Result<AuditEntry, StoreError> {
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 5 {
+    if fields.len() != 4 && fields.len() != 5 {
         return Err(parse_store_error(format!(
             "audit line {line_number} has {} fields",
             fields.len()
         )));
     }
+    let (timestamp, repo_id, operation, result, message) = if fields.len() == 5 {
+        (fields[0], fields[1], fields[2], fields[3], fields[4])
+    } else {
+        (fields[0], "-", fields[1], fields[2], fields[3])
+    };
     Ok(AuditEntry {
-        timestamp: parse_u64(fields[0], "timestamp")?,
-        repo_id: if fields[1] == "-" {
+        timestamp: parse_u64(timestamp, "timestamp")?,
+        repo_id: if repo_id == "-" {
             None
         } else {
-            Some(RepoId::parse(fields[1])?)
+            Some(RepoId::parse(repo_id)?)
         },
-        operation: decode_string(fields[2])?,
-        result: decode_string(fields[3])?,
-        message: decode_string(fields[4])?,
+        operation: decode_string(operation)?,
+        result: decode_string(result)?,
+        message: decode_string(message)?,
     })
 }
 
@@ -925,11 +930,42 @@ mod tests {
     fn audit_entries_are_persisted() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new()?;
         let store = fixture.store()?;
-        let entry = AuditEntry::new(None, "refresh", "ok", "ready")?;
+        let repo = fixture.git_repo("repo")?;
+        let entry = AuditEntry::new(
+            Some(RepoId::from_path(repo.path())),
+            "refresh",
+            "ok",
+            "ready",
+        )?;
 
         store.append_audit(entry.clone())?;
 
         assert_eq!(fixture.store()?.list_audit_entries()?, vec![entry]);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_reader_accepts_legacy_entries_without_repo_id() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        fs::write(
+            &store.paths().audit_file,
+            format!(
+                "123\t{}\t{}\t{}\n",
+                encode_string("refresh"),
+                encode_string("ok"),
+                encode_string("ready")
+            ),
+        )?;
+
+        let entries = store.list_audit_entries()?;
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].timestamp, 123);
+        assert_eq!(entries[0].repo_id, None);
+        assert_eq!(entries[0].operation, "refresh");
+        assert_eq!(entries[0].result, "ok");
+        assert_eq!(entries[0].message, "ready");
         Ok(())
     }
 
