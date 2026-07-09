@@ -29,7 +29,8 @@ keeping risky operations visible, typed, previewed, and confirmed.
 
 ## Current Status
 
-The repository is in Phase 8 branch workflow work. See
+The repository has merged through Phase 9 operation planner, preview, queue,
+execution, and audit work. See
 [`docs/mvp-phases.md`](docs/mvp-phases.md) for the implementation roadmap.
 
 ## Development

@@ -24,3 +24,5 @@ semantic versioning once releases begin.
   with confirmations for mutating sync operations and ahead/behind visibility.
 - Added typed branch listing, checkout, branch creation, fast-forward merge, and
   rebase workflows with dirty-tree guardrails and confirmation plans.
+- Added Phase 9 operation planning, typed execution, queued operation preview
+  and confirmation, and repo-aware audit visibility.
