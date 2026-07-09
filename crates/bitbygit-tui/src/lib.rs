@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::KeyModifiers;
@@ -20,8 +21,8 @@ use bitbygit_core::{
     RiskLevel,
 };
 use bitbygit_git::{
-    BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget,
-    StatusEntry, StatusEntryType,
+    BranchInfo, BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head,
+    HeadTarget, StatusEntry, StatusEntryType,
 };
 use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
@@ -374,9 +375,7 @@ impl App {
             return;
         }
         let plan = stage_paths_plan(file_path_labels(&file.pathspecs));
-        let message = run_audited_plan_operation(&plan, || {
-            Git::new(current_dir()).stage_paths(&file.pathspecs)
-        });
+        let message = execute_typed_plan(&plan, ExecutionContext::default());
         self.refresh_status();
         self.details = message;
     }
@@ -390,9 +389,7 @@ impl App {
             return;
         }
         let plan = unstage_paths_plan(file_path_labels(&file.pathspecs));
-        let message = run_audited_plan_operation(&plan, || {
-            Git::new(current_dir()).unstage_paths(&file.pathspecs)
-        });
+        let message = execute_typed_plan(&plan, ExecutionContext::default());
         self.refresh_status();
         self.details = message;
     }
@@ -402,158 +399,7 @@ impl App {
             return;
         };
         let PendingAction { plan, payload } = action;
-        let message = match payload {
-            PendingPayload::StageAll => run_audited_plan_operation(&plan, || {
-                Git::new(current_dir()).stage_all()
-            }),
-            PendingPayload::UnstageAll => run_audited_plan_operation(&plan, || {
-                Git::new(current_dir()).unstage_all()
-            }),
-            PendingPayload::Push {
-                local_branch,
-                target,
-                remote,
-                upstream_branch,
-                upstream,
-                expected_remote_oid,
-                remote_urls,
-            } => match validate_push_plan(
-                &local_branch,
-                Some(&upstream),
-                &target,
-                &remote,
-                &remote_urls,
-            ) {
-                Ok(()) => run_audited_plan_operation_with_output(&plan, || {
-                    let source_oid = target.oid.as_deref().ok_or_else(|| GitError::Blocked {
-                        message: "push is blocked because the planned branch has no commit"
-                            .to_owned(),
-                    })?;
-                    Git::new(current_dir()).push_current_branch(
-                        &remote,
-                        &upstream_branch,
-                        source_oid,
-                        expected_remote_oid.as_deref(),
-                    )
-                }),
-                Err(error) => error,
-            },
-            PendingPayload::PushSetUpstream {
-                remote,
-                branch,
-                target,
-                expected_remote_oid,
-                remote_urls,
-            } => {
-                match validate_push_plan(&branch, None, &target, &remote, &remote_urls) {
-                    Ok(()) => {
-                        run_audited_plan_operation_with_output(&plan, || {
-                            let source_oid = target.oid.as_deref().ok_or_else(|| {
-                                GitError::Blocked {
-                                    message:
-                                        "push is blocked because the planned branch has no commit"
-                                            .to_owned(),
-                                }
-                            })?;
-                            Git::new(current_dir()).push_current_branch_set_upstream(
-                                &remote,
-                                &branch,
-                                source_oid,
-                                expected_remote_oid.as_deref(),
-                            )
-                        })
-                    }
-                    Err(error) => error,
-                }
-            }
-            PendingPayload::Pull {
-                local_branch,
-                target,
-                upstream,
-                remote,
-                upstream_branch,
-                upstream_oid,
-            } => match validate_pull_plan(false, &local_branch, &upstream, &target) {
-                Ok(()) => run_audited_plan_operation_with_output(&plan, || {
-                    Git::new(current_dir()).pull_ff_only_from(
-                        &remote,
-                        &upstream_branch,
-                        upstream_oid.as_deref(),
-                        &target,
-                    )
-                }),
-                Err(error) => error,
-            },
-            PendingPayload::PullRebase {
-                local_branch,
-                target,
-                upstream,
-                remote,
-                upstream_branch,
-                upstream_oid,
-            } => match validate_pull_plan(true, &local_branch, &upstream, &target) {
-                Ok(()) => run_audited_plan_operation_with_output(&plan, || {
-                    Git::new(current_dir()).pull_rebase_from(
-                        &remote,
-                        &upstream_branch,
-                        upstream_oid.as_deref(),
-                        &target,
-                    )
-                }),
-                Err(error) => error,
-            },
-            PendingPayload::Commit {
-                message,
-                staged_items,
-                staged_tree,
-                target,
-            } => match Git::new(current_dir()).status() {
-                Ok(current_status) if staged_plan_items(&current_status.entries) == staged_items =>
-                {
-                    let git = Git::new(current_dir());
-                    match (git.staged_tree(), git.head_target()) {
-                        (Ok(current_tree), Ok(current_target))
-                            if current_tree == staged_tree && current_target == target =>
-                        {
-                            run_audited_plan_operation_with_output(&plan, || {
-                                Git::new(current_dir()).commit_staged_tree(
-                                    &message,
-                                    &staged_tree,
-                                    &target,
-                                )
-                            })
-                        }
-                        (Ok(_current_tree), Ok(_current_target)) => "Commit blocked: repository state changed since the plan was shown. Re-run the commit prompt.".to_owned(),
-                        (Err(error), _) => format!("Unable to validate staged content: {error}"),
-                        (_, Err(error)) => format!("Unable to validate commit target: {error}"),
-                    }
-                }
-                Ok(_current_status) => "Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned(),
-                Err(error) => format!("Unable to validate commit plan: {error}"),
-            },
-            PendingPayload::Checkout { branch, target } => {
-                run_audited_plan_operation_with_output(&plan, || {
-                    Git::new(current_dir()).checkout_branch(&branch, &target)
-                })
-            }
-            PendingPayload::CreateBranch {
-                branch,
-                base,
-                target,
-            } => run_audited_plan_operation_with_output(&plan, || {
-                Git::new(current_dir()).create_branch(&branch, base.as_ref(), &target)
-            }),
-            PendingPayload::Merge { branch, target } => {
-                run_audited_plan_operation_with_output(&plan, || {
-                    Git::new(current_dir()).merge_ff_only(&branch, &target)
-                })
-            }
-            PendingPayload::Rebase { base, target } => {
-                run_audited_plan_operation_with_output(&plan, || {
-                    Git::new(current_dir()).rebase_onto(&base, &target)
-                })
-            }
-        };
+        let message = execute_typed_plan(&plan, ExecutionContext::from_payload(payload));
         self.refresh_status();
         self.details = message;
     }
@@ -623,7 +469,6 @@ impl App {
         self.pending_confirmation = Some(PendingAction::new(
             plan.clone(),
             PendingPayload::Commit {
-                message,
                 staged_items,
                 staged_tree,
                 target,
@@ -636,9 +481,7 @@ impl App {
     fn run_fetch(&mut self) {
         self.prompt.clear();
         let plan = fetch_plan();
-        let message = run_audited_plan_operation_with_output(&plan, || {
-            Git::new(current_dir()).fetch_default_remote()
-        });
+        let message = execute_typed_plan(&plan, ExecutionContext::default());
         self.refresh_status();
         self.details = message;
     }
@@ -885,36 +728,7 @@ impl App {
     fn show_branches(&mut self) {
         self.prompt.clear();
         let plan = branches_plan();
-        let Some(_step) = plan.first_step() else {
-            self.details = "Branches blocked: operation plan has no steps.".to_owned();
-            return;
-        };
-        match Git::new(current_dir()).branches() {
-            Ok(branches) if branches.is_empty() => {
-                self.details = "No branches found.".to_owned();
-            }
-            Ok(branches) => {
-                let lines = branches
-                    .iter()
-                    .map(|branch| {
-                        let marker = if branch.current { "*" } else { " " };
-                        let kind = match branch.kind {
-                            BranchKind::Local => "local",
-                            BranchKind::Remote => "remote",
-                        };
-                        let upstream = branch
-                            .upstream
-                            .as_ref()
-                            .map(|upstream| format!(" -> {upstream}"))
-                            .unwrap_or_default();
-                        format!("{marker} {kind} {}{upstream}", branch.name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.details = format!("Branches:\n{lines}");
-            }
-            Err(error) => self.details = format!("Unable to list branches: {error}"),
-        }
+        self.details = execute_typed_plan(&plan, ExecutionContext::default());
     }
 
     fn prepare_checkout(&mut self, branch: String) {
@@ -1181,7 +995,6 @@ enum PendingPayload {
         upstream_oid: Option<String>,
     },
     Commit {
-        message: String,
         staged_items: Vec<String>,
         staged_tree: String,
         target: HeadTarget,
@@ -1827,20 +1640,21 @@ fn single_push_url<'a>(remote: &str, urls: &'a [String]) -> Result<&'a str, Stri
 }
 
 fn validate_push_plan(
+    git: &Git,
     branch: &str,
     expected_upstream: Option<&str>,
     target: &HeadTarget,
     remote: &str,
     remote_urls: &[String],
 ) -> Result<(), String> {
-    if Git::new(current_dir())
+    if git
         .head_target()
         .map_err(|error| format!("Unable to revalidate push target: {error}"))?
         != *target
     {
         return Err("Push blocked: branch target changed since the plan was shown.".to_owned());
     }
-    let status = Git::new(current_dir())
+    let status = git
         .status()
         .map_err(|error| format!("Unable to revalidate push plan: {error}"))?;
     let current_branch = branch_name(&status.branch)?;
@@ -1850,7 +1664,7 @@ fn validate_push_plan(
     if status.branch.upstream.as_deref() != expected_upstream {
         return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
     }
-    let current_remote_urls = Git::new(current_dir())
+    let current_remote_urls = git
         .remote_push_urls(remote)
         .map_err(|error| format!("Unable to revalidate push remote URLs: {error}"))?;
     if current_remote_urls != remote_urls {
@@ -1864,19 +1678,20 @@ fn validate_push_plan(
 }
 
 fn validate_pull_plan(
+    git: &Git,
     rebase: bool,
     branch: &str,
     expected_upstream: &str,
     target: &HeadTarget,
 ) -> Result<(), String> {
-    if Git::new(current_dir())
+    if git
         .head_target()
         .map_err(|error| format!("Unable to revalidate pull target: {error}"))?
         != *target
     {
         return Err("Pull blocked: branch target changed since the plan was shown.".to_owned());
     }
-    let status = Git::new(current_dir())
+    let status = git
         .status()
         .map_err(|error| format!("Unable to revalidate pull plan: {error}"))?;
     if branch_name(&status.branch)? != branch {
@@ -2039,62 +1854,753 @@ fn operation_message(action: &str, result: Result<(), String>) -> String {
     }
 }
 
-fn run_audited_plan_operation(
-    plan: &OperationPlan,
-    run: impl FnOnce() -> Result<GitOutput, GitError>,
-) -> String {
-    let Some(step) = plan.first_step() else {
-        return operation_message("operation", Err("operation plan has no steps".to_owned()));
-    };
-    run_audited_step(step, run)
+fn execute_typed_plan(plan: &OperationPlan, context: ExecutionContext) -> String {
+    PlanExecutor::current().execute(plan, context).message()
 }
 
-fn run_audited_plan_operation_with_output(
-    plan: &OperationPlan,
-    run: impl FnOnce() -> Result<GitOutput, GitError>,
-) -> String {
-    let Some(step) = plan.first_step() else {
-        return operation_message("operation", Err("operation plan has no steps".to_owned()));
-    };
-    run_audited_step_with_output(step, run)
+#[derive(Debug, Clone, Default)]
+struct ExecutionContext {
+    payload: Option<PendingPayload>,
 }
 
-fn run_audited_step(
-    step: &OperationStep,
-    run: impl FnOnce() -> Result<GitOutput, GitError>,
-) -> String {
-    let audit = match begin_audit_operation(step.kind.audit_operation()) {
-        Ok(audit) => audit,
-        Err(error) => return operation_message(step.kind.action_label(), Err(error)),
-    };
-    let result = run();
-    operation_message(step.kind.action_label(), audit.finish(&result))
-}
-
-fn run_audited_step_with_output(
-    step: &OperationStep,
-    run: impl FnOnce() -> Result<GitOutput, GitError>,
-) -> String {
-    let action = step.kind.action_label();
-    let audit = match begin_audit_operation(step.kind.audit_operation()) {
-        Ok(audit) => audit,
-        Err(error) => return operation_message(action, Err(error)),
-    };
-    let result = run();
-    let output = git_result_output(&result);
-    let audit_result = audit.finish(&result);
-    match (result.is_ok(), audit_result) {
-        (true, Ok(())) if output.is_empty() => format!("{action} succeeded"),
-        (true, Ok(())) => format!("{action} succeeded:\n{output}"),
-        (true, Err(error)) if output.is_empty() => {
-            format!("{action} succeeded, but audit finalization failed: {error}")
+impl ExecutionContext {
+    fn from_payload(payload: PendingPayload) -> Self {
+        Self {
+            payload: Some(payload),
         }
-        (true, Err(error)) => {
-            format!("{action} succeeded, but audit finalization failed: {error}\n{output}")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlanExecutor {
+    repo_root: PathBuf,
+    audit: AuditDestination,
+}
+
+impl PlanExecutor {
+    fn current() -> Self {
+        Self {
+            repo_root: current_dir(),
+            audit: AuditDestination::Environment,
         }
-        (false, Err(error)) if output.is_empty() => format!("{action} failed: {error}"),
-        (false, Err(error)) => format!("{action} failed: {error}\n{output}"),
-        (false, Ok(())) => format!("{action} failed"),
+    }
+
+    #[cfg(test)]
+    fn with_audit_paths(repo_root: impl Into<PathBuf>, paths: StorePaths) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+            audit: AuditDestination::Paths(paths),
+        }
+    }
+
+    fn execute(&self, plan: &OperationPlan, context: ExecutionContext) -> PlanExecutionResult {
+        if plan.steps.is_empty() {
+            return PlanExecutionResult {
+                planned_step_count: 0,
+                step_results: Vec::new(),
+                plan_error: Some("operation plan has no steps".to_owned()),
+            };
+        }
+
+        let mut step_results = Vec::new();
+        for step in &plan.steps {
+            let step_result = self.execute_step(plan, step, &context);
+            let should_continue = step_result.succeeded() || step.continue_on_failure;
+            step_results.push(step_result);
+            if !should_continue {
+                break;
+            }
+        }
+
+        PlanExecutionResult {
+            planned_step_count: plan.steps.len(),
+            step_results,
+            plan_error: None,
+        }
+    }
+
+    fn execute_step(
+        &self,
+        plan: &OperationPlan,
+        step: &OperationStep,
+        context: &ExecutionContext,
+    ) -> StepExecutionResult {
+        let audit = match self.audit.begin(step.kind.audit_operation()) {
+            Ok(audit) => audit,
+            Err(error) => {
+                return StepExecutionResult {
+                    kind: step.kind,
+                    summary: step.summary.clone(),
+                    outcome: StepExecutionOutcome::AuditStartFailed { error },
+                };
+            }
+        };
+        let result = self.run_step(plan, step, context);
+        let audit_result = audit.finish(&AuditTerminalResult::from_step_result(&result));
+
+        StepExecutionResult {
+            kind: step.kind,
+            summary: step.summary.clone(),
+            outcome: StepExecutionOutcome::Ran {
+                result,
+                audit_result,
+            },
+        }
+    }
+
+    fn run_step(
+        &self,
+        plan: &OperationPlan,
+        step: &OperationStep,
+        context: &ExecutionContext,
+    ) -> StepRunResult {
+        let git = self.git();
+        match step.kind {
+            OperationKind::Fetch => git_output(git.fetch_default_remote()),
+            OperationKind::StagePaths => {
+                let paths = stage_paths_from_request(plan)?;
+                git_output(git.stage_paths(&paths))
+            }
+            OperationKind::UnstagePaths => {
+                let paths = unstage_paths_from_request(plan)?;
+                git_output(git.unstage_paths(&paths))
+            }
+            OperationKind::StageAll => git_output(git.stage_all()),
+            OperationKind::UnstageAll => git_output(git.unstage_all()),
+            OperationKind::Commit => self.run_commit_step(plan, context, &git),
+            OperationKind::PushCurrentBranch => self.run_push_current_branch_step(context, &git),
+            OperationKind::PushSetUpstream => self.run_push_set_upstream_step(context, &git),
+            OperationKind::PullFastForward => self.run_pull_fast_forward_step(plan, context, &git),
+            OperationKind::PullRebase => self.run_pull_rebase_step(plan, context, &git),
+            OperationKind::Branches => git
+                .branches()
+                .map(ExecutionOutput::Branches)
+                .map_err(StepExecutionError::Git),
+            OperationKind::CheckoutBranch => self.run_checkout_step(plan, context, &git),
+            OperationKind::CreateBranch => self.run_create_branch_step(plan, context, &git),
+            OperationKind::MergeFastForward => self.run_merge_step(plan, context, &git),
+            OperationKind::Rebase => self.run_rebase_step(plan, context, &git),
+            OperationKind::RefreshStatus | OperationKind::ViewDiff => {
+                Err(StepExecutionError::Unsupported(format!(
+                    "{} step is not executable by the typed operation executor",
+                    step.kind.action_label()
+                )))
+            }
+        }
+    }
+
+    fn git(&self) -> Git {
+        Git::new(self.repo_root.clone())
+    }
+
+    fn run_commit_step(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        let OperationRequest::Commit { message } = &plan.request else {
+            return Err(StepExecutionError::Unsupported(
+                "commit step requires a typed commit request".to_owned(),
+            ));
+        };
+        let PendingPayload::Commit {
+            staged_items,
+            staged_tree,
+            target,
+        } = typed_payload(context, OperationKind::Commit)?
+        else {
+            return Err(mismatched_context(OperationKind::Commit));
+        };
+        let current_status = git.status().map_err(|error| {
+            StepExecutionError::Blocked(format!("Unable to validate commit plan: {error}"))
+        })?;
+        if staged_plan_items(&current_status.entries) != *staged_items {
+            return Err(StepExecutionError::Blocked("Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned()));
+        }
+        let current_tree = git.staged_tree().map_err(|error| {
+            StepExecutionError::Blocked(format!("Unable to validate staged content: {error}"))
+        })?;
+        let current_target = git.head_target().map_err(|error| {
+            StepExecutionError::Blocked(format!("Unable to validate commit target: {error}"))
+        })?;
+        if current_tree != *staged_tree || current_target != *target {
+            return Err(StepExecutionError::Blocked("Commit blocked: repository state changed since the plan was shown. Re-run the commit prompt.".to_owned()));
+        }
+
+        git_output(git.commit_staged_tree(message, staged_tree, target))
+    }
+
+    fn run_push_current_branch_step(&self, context: &ExecutionContext, git: &Git) -> StepRunResult {
+        let PendingPayload::Push {
+            local_branch,
+            target,
+            remote,
+            upstream_branch,
+            upstream,
+            expected_remote_oid,
+            remote_urls,
+        } = typed_payload(context, OperationKind::PushCurrentBranch)?
+        else {
+            return Err(mismatched_context(OperationKind::PushCurrentBranch));
+        };
+        validate_push_plan(
+            git,
+            local_branch,
+            Some(upstream),
+            target,
+            remote,
+            remote_urls,
+        )
+        .map_err(StepExecutionError::Blocked)?;
+        let source_oid = target.oid.as_deref().ok_or_else(|| {
+            StepExecutionError::Git(GitError::Blocked {
+                message: "push is blocked because the planned branch has no commit".to_owned(),
+            })
+        })?;
+        git_output(git.push_current_branch(
+            remote,
+            upstream_branch,
+            source_oid,
+            expected_remote_oid.as_deref(),
+        ))
+    }
+
+    fn run_push_set_upstream_step(&self, context: &ExecutionContext, git: &Git) -> StepRunResult {
+        let PendingPayload::PushSetUpstream {
+            remote,
+            branch,
+            target,
+            expected_remote_oid,
+            remote_urls,
+        } = typed_payload(context, OperationKind::PushSetUpstream)?
+        else {
+            return Err(mismatched_context(OperationKind::PushSetUpstream));
+        };
+        validate_push_plan(git, branch, None, target, remote, remote_urls)
+            .map_err(StepExecutionError::Blocked)?;
+        let source_oid = target.oid.as_deref().ok_or_else(|| {
+            StepExecutionError::Git(GitError::Blocked {
+                message: "push is blocked because the planned branch has no commit".to_owned(),
+            })
+        })?;
+        git_output(git.push_current_branch_set_upstream(
+            remote,
+            branch,
+            source_oid,
+            expected_remote_oid.as_deref(),
+        ))
+    }
+
+    fn run_pull_fast_forward_step(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        require_pull_request(plan, false)?;
+        let PendingPayload::Pull {
+            local_branch,
+            target,
+            upstream,
+            remote,
+            upstream_branch,
+            upstream_oid,
+        } = typed_payload(context, OperationKind::PullFastForward)?
+        else {
+            return Err(mismatched_context(OperationKind::PullFastForward));
+        };
+        validate_pull_plan(git, false, local_branch, upstream, target)
+            .map_err(StepExecutionError::Blocked)?;
+        git_output(git.pull_ff_only_from(remote, upstream_branch, upstream_oid.as_deref(), target))
+    }
+
+    fn run_pull_rebase_step(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        require_pull_request(plan, true)?;
+        let PendingPayload::PullRebase {
+            local_branch,
+            target,
+            upstream,
+            remote,
+            upstream_branch,
+            upstream_oid,
+        } = typed_payload(context, OperationKind::PullRebase)?
+        else {
+            return Err(mismatched_context(OperationKind::PullRebase));
+        };
+        validate_pull_plan(git, true, local_branch, upstream, target)
+            .map_err(StepExecutionError::Blocked)?;
+        git_output(git.pull_rebase_from(remote, upstream_branch, upstream_oid.as_deref(), target))
+    }
+
+    fn run_checkout_step(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        let OperationRequest::Checkout { branch } = &plan.request else {
+            return Err(StepExecutionError::Unsupported(
+                "checkout step requires a typed checkout request".to_owned(),
+            ));
+        };
+        let PendingPayload::Checkout {
+            branch: target,
+            target: head,
+        } = typed_payload(context, OperationKind::CheckoutBranch)?
+        else {
+            return Err(mismatched_context(OperationKind::CheckoutBranch));
+        };
+        if target.name != *branch {
+            return Err(StepExecutionError::Unsupported(
+                "checkout step request does not match its typed execution context".to_owned(),
+            ));
+        }
+        git_output(git.checkout_branch(target, head))
+    }
+
+    fn run_create_branch_step(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        let OperationRequest::CreateBranch {
+            branch: requested_branch,
+            base: requested_base,
+        } = &plan.request
+        else {
+            return Err(StepExecutionError::Unsupported(
+                "create branch step requires a typed create branch request".to_owned(),
+            ));
+        };
+        let PendingPayload::CreateBranch {
+            branch,
+            base,
+            target,
+        } = typed_payload(context, OperationKind::CreateBranch)?
+        else {
+            return Err(mismatched_context(OperationKind::CreateBranch));
+        };
+        if branch != requested_branch
+            || base.as_ref().map(|base| &base.name) != requested_base.as_ref()
+        {
+            return Err(StepExecutionError::Unsupported(
+                "create branch step request does not match its typed execution context".to_owned(),
+            ));
+        }
+        git_output(git.create_branch(branch, base.as_ref(), target))
+    }
+
+    fn run_merge_step(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        let OperationRequest::Merge { branch } = &plan.request else {
+            return Err(StepExecutionError::Unsupported(
+                "merge step requires a typed merge request".to_owned(),
+            ));
+        };
+        let PendingPayload::Merge {
+            branch: target,
+            target: head,
+        } = typed_payload(context, OperationKind::MergeFastForward)?
+        else {
+            return Err(mismatched_context(OperationKind::MergeFastForward));
+        };
+        if target.name != *branch {
+            return Err(StepExecutionError::Unsupported(
+                "merge step request does not match its typed execution context".to_owned(),
+            ));
+        }
+        git_output(git.merge_ff_only(target, head))
+    }
+
+    fn run_rebase_step(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        let OperationRequest::Rebase { base } = &plan.request else {
+            return Err(StepExecutionError::Unsupported(
+                "rebase step requires a typed rebase request".to_owned(),
+            ));
+        };
+        let PendingPayload::Rebase {
+            base: target,
+            target: head,
+        } = typed_payload(context, OperationKind::Rebase)?
+        else {
+            return Err(mismatched_context(OperationKind::Rebase));
+        };
+        if target.name != *base {
+            return Err(StepExecutionError::Unsupported(
+                "rebase step request does not match its typed execution context".to_owned(),
+            ));
+        }
+        git_output(git.rebase_onto(target, head))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AuditDestination {
+    Environment,
+    #[cfg(test)]
+    Paths(StorePaths),
+}
+
+impl AuditDestination {
+    fn begin(&self, operation: &str) -> Result<PendingAudit, String> {
+        match self {
+            Self::Environment => begin_audit_operation(operation),
+            #[cfg(test)]
+            Self::Paths(paths) => begin_audit_operation_with_paths(operation, paths.clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlanExecutionResult {
+    planned_step_count: usize,
+    step_results: Vec<StepExecutionResult>,
+    plan_error: Option<String>,
+}
+
+impl PlanExecutionResult {
+    fn message(&self) -> String {
+        if let Some(error) = &self.plan_error {
+            return operation_message("operation", Err(error.clone()));
+        }
+        if self.planned_step_count == 1 {
+            return self
+                .step_results
+                .first()
+                .map(StepExecutionResult::message)
+                .unwrap_or_else(|| {
+                    operation_message("operation", Err("operation plan has no steps".to_owned()))
+                });
+        }
+
+        let failed_step = self
+            .step_results
+            .iter()
+            .position(|step_result| !step_result.succeeded());
+        let stopped_early = self.step_results.len() < self.planned_step_count;
+        let mut lines = match (failed_step, stopped_early) {
+            (Some(index), true) => vec![format!(
+                "Operation stopped after step {} of {}.",
+                index + 1,
+                self.planned_step_count
+            )],
+            (Some(_index), false) => vec![format!(
+                "Operation completed {} step(s) with failures.",
+                self.step_results.len()
+            )],
+            (None, _) => vec![format!(
+                "Operation completed {} step(s).",
+                self.step_results.len()
+            )],
+        };
+        lines.extend(
+            self.step_results
+                .iter()
+                .enumerate()
+                .map(|(index, step_result)| {
+                    format!(
+                        "Step {} ({}): {}",
+                        index + 1,
+                        step_result.summary,
+                        step_result.message()
+                    )
+                }),
+        );
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug)]
+struct StepExecutionResult {
+    kind: OperationKind,
+    summary: String,
+    outcome: StepExecutionOutcome,
+}
+
+impl StepExecutionResult {
+    fn succeeded(&self) -> bool {
+        matches!(
+            &self.outcome,
+            StepExecutionOutcome::Ran {
+                result: Ok(_),
+                audit_result: Ok(())
+            }
+        )
+    }
+
+    fn message(&self) -> String {
+        let action = self.kind.action_label();
+        match &self.outcome {
+            StepExecutionOutcome::AuditStartFailed { error } => {
+                operation_message(action, Err(error.clone()))
+            }
+            StepExecutionOutcome::Ran {
+                result: Ok(output),
+                audit_result: Ok(()),
+            } => success_message(self.kind, action, output),
+            StepExecutionOutcome::Ran {
+                result: Ok(output),
+                audit_result: Err(error),
+            } => success_with_audit_error_message(self.kind, action, output, error),
+            StepExecutionOutcome::Ran {
+                result: Err(error),
+                audit_result: Ok(()),
+            } => failure_message(self.kind, action, error, None),
+            StepExecutionOutcome::Ran {
+                result: Err(error),
+                audit_result: Err(audit_error),
+            } => failure_message(self.kind, action, error, Some(audit_error)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StepExecutionOutcome {
+    AuditStartFailed {
+        error: String,
+    },
+    Ran {
+        result: StepRunResult,
+        audit_result: Result<(), String>,
+    },
+}
+
+type StepRunResult = Result<ExecutionOutput, StepExecutionError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutionOutput {
+    Git(GitOutput),
+    Branches(Vec<BranchInfo>),
+}
+
+#[derive(Debug)]
+enum StepExecutionError {
+    Git(GitError),
+    Blocked(String),
+    Unsupported(String),
+}
+
+impl StepExecutionError {
+    fn audit_message(&self) -> String {
+        match self {
+            Self::Git(error) => sanitized_git_error(error),
+            Self::Blocked(message) => format!("operation blocked: {message}"),
+            Self::Unsupported(message) => message.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for StepExecutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Git(error) => write!(formatter, "{error}"),
+            Self::Blocked(message) | Self::Unsupported(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
+fn git_output(result: Result<GitOutput, GitError>) -> StepRunResult {
+    result
+        .map(ExecutionOutput::Git)
+        .map_err(StepExecutionError::Git)
+}
+
+fn stage_paths_from_request(plan: &OperationPlan) -> Result<Vec<PathBuf>, StepExecutionError> {
+    let OperationRequest::StagePaths { paths } = &plan.request else {
+        return Err(StepExecutionError::Unsupported(
+            "stage step requires a typed stage paths request".to_owned(),
+        ));
+    };
+    Ok(paths.iter().map(PathBuf::from).collect())
+}
+
+fn unstage_paths_from_request(plan: &OperationPlan) -> Result<Vec<PathBuf>, StepExecutionError> {
+    let OperationRequest::UnstagePaths { paths } = &plan.request else {
+        return Err(StepExecutionError::Unsupported(
+            "unstage step requires a typed unstage paths request".to_owned(),
+        ));
+    };
+    Ok(paths.iter().map(PathBuf::from).collect())
+}
+
+fn require_pull_request(plan: &OperationPlan, rebase: bool) -> Result<(), StepExecutionError> {
+    match &plan.request {
+        OperationRequest::Pull { rebase: requested } if *requested == rebase => Ok(()),
+        _ if rebase => Err(StepExecutionError::Unsupported(
+            "pull rebase step requires a typed pull rebase request".to_owned(),
+        )),
+        _ => Err(StepExecutionError::Unsupported(
+            "pull step requires a typed pull request".to_owned(),
+        )),
+    }
+}
+
+fn typed_payload(
+    context: &ExecutionContext,
+    kind: OperationKind,
+) -> Result<&PendingPayload, StepExecutionError> {
+    context.payload.as_ref().ok_or_else(|| {
+        StepExecutionError::Unsupported(format!(
+            "{} step requires typed execution context",
+            kind.action_label()
+        ))
+    })
+}
+
+fn mismatched_context(kind: OperationKind) -> StepExecutionError {
+    StepExecutionError::Unsupported(format!(
+        "{} step received mismatched typed execution context",
+        kind.action_label()
+    ))
+}
+
+fn success_message(kind: OperationKind, action: &str, output: &ExecutionOutput) -> String {
+    match output {
+        ExecutionOutput::Branches(branches) => branch_list_message(branches),
+        ExecutionOutput::Git(output) => {
+            let output = git_output_text(output);
+            if should_show_git_output(kind) && !output.is_empty() {
+                format!("{action} succeeded:\n{output}")
+            } else {
+                format!("{action} succeeded")
+            }
+        }
+    }
+}
+
+fn success_with_audit_error_message(
+    kind: OperationKind,
+    action: &str,
+    output: &ExecutionOutput,
+    audit_error: &str,
+) -> String {
+    let success = success_message(kind, action, output);
+    match output {
+        ExecutionOutput::Branches(_) => {
+            format!("{action} succeeded, but audit finalization failed: {audit_error}\n{success}")
+        }
+        ExecutionOutput::Git(output) => {
+            let output = git_output_text(output);
+            if should_show_git_output(kind) && !output.is_empty() {
+                format!(
+                    "{action} succeeded, but audit finalization failed: {audit_error}\n{output}"
+                )
+            } else {
+                format!("{action} succeeded, but audit finalization failed: {audit_error}")
+            }
+        }
+    }
+}
+
+fn failure_message(
+    kind: OperationKind,
+    action: &str,
+    error: &StepExecutionError,
+    audit_error: Option<&String>,
+) -> String {
+    let mut message = match (kind, error) {
+        (OperationKind::Branches, StepExecutionError::Git(error)) => {
+            format!("Unable to list branches: {error}")
+        }
+        (_, StepExecutionError::Blocked(message)) => message.clone(),
+        _ => format!("{action} failed: {error}"),
+    };
+    if let Some(audit_error) = audit_error {
+        message.push_str(&format!("; audit finalization failed: {audit_error}"));
+    }
+    message
+}
+
+fn should_show_git_output(kind: OperationKind) -> bool {
+    matches!(
+        kind,
+        OperationKind::Fetch
+            | OperationKind::Commit
+            | OperationKind::PushCurrentBranch
+            | OperationKind::PushSetUpstream
+            | OperationKind::PullFastForward
+            | OperationKind::PullRebase
+            | OperationKind::CheckoutBranch
+            | OperationKind::CreateBranch
+            | OperationKind::MergeFastForward
+            | OperationKind::Rebase
+    )
+}
+
+fn branch_list_message(branches: &[BranchInfo]) -> String {
+    if branches.is_empty() {
+        return "No branches found.".to_owned();
+    }
+    let lines = branches
+        .iter()
+        .map(|branch| {
+            let marker = if branch.current { "*" } else { " " };
+            let kind = match branch.kind {
+                BranchKind::Local => "local",
+                BranchKind::Remote => "remote",
+            };
+            let upstream = branch
+                .upstream
+                .as_ref()
+                .map(|upstream| format!(" -> {upstream}"))
+                .unwrap_or_default();
+            format!("{marker} {kind} {}{upstream}", branch.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Branches:\n{lines}")
+}
+
+fn git_output_text(output: &GitOutput) -> String {
+    [output.stdout.trim(), output.stderr.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditTerminalResult {
+    result_label: &'static str,
+    message: String,
+}
+
+impl AuditTerminalResult {
+    fn completed() -> Self {
+        Self {
+            result_label: "ok",
+            message: "completed".to_owned(),
+        }
+    }
+
+    fn error(message: String) -> Self {
+        Self {
+            result_label: "error",
+            message,
+        }
+    }
+
+    fn from_step_result(result: &StepRunResult) -> Self {
+        match result {
+            Ok(_output) => Self::completed(),
+            Err(error) => Self::error(error.audit_message()),
+        }
     }
 }
 
@@ -2127,25 +2633,17 @@ struct PendingAudit {
 }
 
 impl PendingAudit {
-    fn finish(self, result: &Result<GitOutput, GitError>) -> Result<(), String> {
-        let result_label = if result.is_ok() { "ok" } else { "error" };
-        let message = audit_result_message(result);
-        let entry = AuditEntry::new(None, self.operation, result_label, message.clone())
-            .map_err(|error| format!("{message}; audit failed: {error}"))?;
+    fn finish(self, result: &AuditTerminalResult) -> Result<(), String> {
+        let entry = AuditEntry::new(
+            None,
+            self.operation,
+            result.result_label,
+            result.message.clone(),
+        )
+        .map_err(|error| format!("audit failed: {error}"))?;
         self.store
             .append_audit(entry)
-            .map_err(|error| format!("{message}; audit failed: {error}"))?;
-        result
-            .as_ref()
-            .map(|_output| ())
-            .map_err(ToString::to_string)
-    }
-}
-
-fn audit_result_message(result: &Result<GitOutput, GitError>) -> String {
-    match result {
-        Ok(_output) => "completed".to_owned(),
-        Err(error) => sanitized_git_error(error),
+            .map_err(|error| format!("audit failed: {error}"))
     }
 }
 
@@ -2156,17 +2654,6 @@ fn sanitized_git_error(error: &GitError) -> String {
         GitError::Utf8 { stream, .. } => format!("git returned non-UTF-8 {stream}"),
         GitError::Blocked { message } => format!("operation blocked: {message}"),
         GitError::Parse { message } => format!("failed to parse git output: {message}"),
-    }
-}
-
-fn git_result_output(result: &Result<GitOutput, GitError>) -> String {
-    match result {
-        Ok(output) => [output.stdout.trim(), output.stderr.trim()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Err(error) => error.to_string(),
     }
 }
 
@@ -2804,14 +3291,7 @@ mod tests {
     #[test]
     fn stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
         let paths = isolated_store_paths("stage-audit")?;
-        let output = std::process::Command::new("git")
-            .arg("--version")
-            .output()?;
-        let result: Result<GitOutput, GitError> = Ok(GitOutput {
-            status: output.status,
-            stdout: String::from_utf8(output.stdout)?,
-            stderr: String::from_utf8(output.stderr)?,
-        });
+        let result = AuditTerminalResult::completed();
 
         for operation in [
             "stage_path",
@@ -2864,13 +3344,12 @@ mod tests {
     #[test]
     fn failed_stage_operations_are_audited() -> Result<(), Box<dyn Error>> {
         let paths = isolated_store_paths("failed-stage-audit")?;
-        let result = Git::new("/definitely/not/a/bitbygit/repo").stage_all();
+        let result = AuditTerminalResult::error("operation blocked: test failure".to_owned());
 
         let audit = begin_audit_operation_with_paths("stage_all", paths.clone())?;
         let audit_result = audit.finish(&result);
 
-        assert!(result.is_err());
-        assert!(audit_result.is_err());
+        assert!(audit_result.is_ok());
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].operation, "stage_all");
@@ -2888,23 +3367,139 @@ mod tests {
             .arg("not-a-real-bitbygit-command")
             .output()?
             .status;
-        let result: Result<GitOutput, GitError> = Err(GitError::GitFailed {
+        let error = StepExecutionError::Git(GitError::GitFailed {
             args: vec!["commit-tree".to_owned(), "<tree>".to_owned()],
             status,
             stdout: "raw stdout token".to_owned(),
             stderr: "raw stderr secret".to_owned(),
         });
+        let result = AuditTerminalResult::error(error.audit_message());
 
         let audit = begin_audit_operation_with_paths("commit", paths.clone())?;
         let audit_result = audit.finish(&result);
 
-        assert!(audit_result.is_err());
+        assert!(audit_result.is_ok());
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].result, "error");
         assert!(entries[1].message.contains("git failed with status"));
         assert!(!entries[1].message.contains("raw stdout token"));
         assert!(!entries[1].message.contains("raw stderr secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_executor_stops_after_first_failed_step() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("executor-stop")?;
+        let plan = two_step_staging_plan(false);
+
+        let execution =
+            PlanExecutor::with_audit_paths("/definitely/not/a/bitbygit/repo", paths.clone())
+                .execute(&plan, ExecutionContext::default());
+
+        assert_eq!(execution.step_results.len(), 1);
+        assert!(!execution.step_results[0].succeeded());
+        assert!(
+            execution
+                .message()
+                .contains("Operation stopped after step 1 of 2.")
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.operation == "stage_all"));
+        assert_eq!(entries[0].result, "started");
+        assert_eq!(entries[1].result, "error");
+        Ok(())
+    }
+
+    #[test]
+    fn typed_executor_continues_only_when_step_allows_it() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("executor-continue")?;
+        let plan = two_step_staging_plan(true);
+
+        let execution =
+            PlanExecutor::with_audit_paths("/definitely/not/a/bitbygit/repo", paths.clone())
+                .execute(&plan, ExecutionContext::default());
+
+        assert_eq!(execution.step_results.len(), 2);
+        assert!(
+            execution
+                .step_results
+                .iter()
+                .all(|result| !result.succeeded())
+        );
+        assert!(
+            execution
+                .message()
+                .contains("Operation completed 2 step(s) with failures.")
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        let operations = entries
+            .iter()
+            .map(|entry| entry.operation.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            vec!["stage_all", "stage_all", "unstage_all", "unstage_all"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_stage_all_workflow_executes_through_typed_steps() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("typed-stage-all")?;
+        std::fs::write(repo.join("file.txt"), "hello\n")?;
+        let paths = isolated_store_paths("typed-stage-all-audit")?;
+        let plan = stage_all_plan();
+
+        let execution = PlanExecutor::with_audit_paths(&repo, paths.clone()).execute(
+            &plan,
+            ExecutionContext::from_payload(PendingPayload::StageAll),
+        );
+
+        assert_eq!(execution.step_results.len(), 1);
+        assert!(
+            execution.step_results[0].succeeded(),
+            "{}",
+            execution.message()
+        );
+        assert_eq!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"])?.trim(),
+            "file.txt"
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].result, "started");
+        assert_eq!(entries[1].result, "ok");
+        Ok(())
+    }
+
+    #[test]
+    fn executor_does_not_use_prompt_text_as_execution_input() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("typed-no-raw-prompt")?;
+        std::fs::write(repo.join("file.txt"), "hello\n")?;
+        let paths = isolated_store_paths("typed-no-raw-prompt-audit")?;
+        let plan = OperationPlan::new(
+            OperationRequest::Fetch,
+            "Prompt text plan",
+            vec![OperationStep::new(
+                OperationKind::StagePaths,
+                RiskLevel::Low,
+                "stage from prompt text",
+            )],
+            "stage file.txt",
+        );
+
+        let execution = PlanExecutor::with_audit_paths(&repo, paths)
+            .execute(&plan, ExecutionContext::default());
+
+        assert_eq!(execution.step_results.len(), 1);
+        assert!(execution.message().contains("typed stage paths request"));
+        assert!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"])?
+                .trim()
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -3000,15 +3595,78 @@ mod tests {
         Ok(())
     }
 
+    fn two_step_staging_plan(continue_after_failure: bool) -> OperationPlan {
+        let first_step = OperationStep::new(
+            OperationKind::StageAll,
+            RiskLevel::Medium,
+            "stage all working tree changes",
+        );
+        let first_step = if continue_after_failure {
+            first_step.allow_safe_continuation_after_failure()
+        } else {
+            first_step
+        };
+        OperationPlan::new(
+            OperationRequest::StageAll,
+            "Two-step staging plan",
+            vec![
+                first_step,
+                OperationStep::new(
+                    OperationKind::UnstageAll,
+                    RiskLevel::Medium,
+                    "unstage all staged changes",
+                ),
+            ],
+            "",
+        )
+    }
+
+    fn isolated_git_repo(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let root = isolated_temp_root(name)?;
+        std::fs::create_dir_all(&root)?;
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .arg(&root)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "git init failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(root)
+    }
+
+    fn git_stdout(repo: &std::path::Path, args: &[&str]) -> Result<String, Box<dyn Error>> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
     fn isolated_store_paths(name: &str) -> Result<StorePaths, Box<dyn Error>> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("bitbygit-tui-{name}-{}-{now}", std::process::id()));
+        let root = isolated_temp_root(name)?;
         Ok(StorePaths::from_roots(
             root.join("config"),
             root.join("data"),
         ))
+    }
+
+    fn isolated_temp_root(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        Ok(std::env::temp_dir().join(format!("bitbygit-tui-{name}-{}-{now}", std::process::id())))
     }
 }
