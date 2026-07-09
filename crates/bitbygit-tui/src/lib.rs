@@ -374,8 +374,12 @@ impl App {
             self.details = "Selected row has no unstaged changes to stage.".to_owned();
             return;
         }
-        let plan = stage_paths_plan(file_path_labels(&file.pathspecs));
-        let message = execute_typed_plan(&plan, ExecutionContext::default());
+        let pathspecs = file.pathspecs.clone();
+        let plan = stage_paths_plan(file_path_labels(&pathspecs));
+        let message = execute_typed_plan(
+            &plan,
+            ExecutionContext::from_payload(PendingPayload::StagePaths { paths: pathspecs }),
+        );
         self.refresh_status();
         self.details = message;
     }
@@ -388,8 +392,12 @@ impl App {
             self.details = "Selected row has no staged changes to unstage.".to_owned();
             return;
         }
-        let plan = unstage_paths_plan(file_path_labels(&file.pathspecs));
-        let message = execute_typed_plan(&plan, ExecutionContext::default());
+        let pathspecs = file.pathspecs.clone();
+        let plan = unstage_paths_plan(file_path_labels(&pathspecs));
+        let message = execute_typed_plan(
+            &plan,
+            ExecutionContext::from_payload(PendingPayload::UnstagePaths { paths: pathspecs }),
+        );
         self.refresh_status();
         self.details = message;
     }
@@ -960,6 +968,12 @@ impl PendingAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingPayload {
+    StagePaths {
+        paths: Vec<PathBuf>,
+    },
+    UnstagePaths {
+        paths: Vec<PathBuf>,
+    },
     StageAll,
     UnstageAll,
     Push {
@@ -1958,11 +1972,11 @@ impl PlanExecutor {
         match step.kind {
             OperationKind::Fetch => git_output(git.fetch_default_remote()),
             OperationKind::StagePaths => {
-                let paths = stage_paths_from_request(plan)?;
+                let paths = stage_paths_for_step(plan, context)?;
                 git_output(git.stage_paths(&paths))
             }
             OperationKind::UnstagePaths => {
-                let paths = unstage_paths_from_request(plan)?;
+                let paths = unstage_paths_for_step(plan, context)?;
                 git_output(git.unstage_paths(&paths))
             }
             OperationKind::StageAll => git_output(git.stage_all()),
@@ -2421,21 +2435,39 @@ fn git_output(result: Result<GitOutput, GitError>) -> StepRunResult {
         .map_err(StepExecutionError::Git)
 }
 
-fn stage_paths_from_request(plan: &OperationPlan) -> Result<Vec<PathBuf>, StepExecutionError> {
+fn stage_paths_for_step(
+    plan: &OperationPlan,
+    context: &ExecutionContext,
+) -> Result<Vec<PathBuf>, StepExecutionError> {
     let OperationRequest::StagePaths { paths } = &plan.request else {
         return Err(StepExecutionError::Unsupported(
             "stage step requires a typed stage paths request".to_owned(),
         ));
     };
+    if let Some(payload) = &context.payload {
+        let PendingPayload::StagePaths { paths } = payload else {
+            return Err(mismatched_context(OperationKind::StagePaths));
+        };
+        return Ok(paths.clone());
+    }
     Ok(paths.iter().map(PathBuf::from).collect())
 }
 
-fn unstage_paths_from_request(plan: &OperationPlan) -> Result<Vec<PathBuf>, StepExecutionError> {
+fn unstage_paths_for_step(
+    plan: &OperationPlan,
+    context: &ExecutionContext,
+) -> Result<Vec<PathBuf>, StepExecutionError> {
     let OperationRequest::UnstagePaths { paths } = &plan.request else {
         return Err(StepExecutionError::Unsupported(
             "unstage step requires a typed unstage paths request".to_owned(),
         ));
     };
+    if let Some(payload) = &context.payload {
+        let PendingPayload::UnstagePaths { paths } = payload else {
+            return Err(mismatched_context(OperationKind::UnstagePaths));
+        };
+        return Ok(paths.clone());
+    }
     Ok(paths.iter().map(PathBuf::from).collect())
 }
 
