@@ -1209,7 +1209,11 @@ fn open_pull_request_plan(
     existing_url: Option<&str>,
 ) -> OperationPlan {
     let target = existing_url.map(ToOwned::to_owned).unwrap_or_else(|| {
-        format!("https://github.com/{repository}/compare/{base}...{head}?expand=1")
+        format!(
+            "https://github.com/{repository}/compare/{}...{}?expand=1",
+            compare_url_ref(base),
+            compare_url_ref(head)
+        )
     });
     let summary = if existing_url.is_some() {
         format!("surface existing pull request for {head}")
@@ -1233,6 +1237,25 @@ fn open_pull_request_plan(
         ],
         "Press y to open or surface the pull request or n to cancel.",
     )
+}
+
+fn compare_url_ref(reference: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(reference.len());
+    for byte in reference.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    encoded
 }
 
 fn prompt_sequence_plan(
@@ -1930,7 +1953,8 @@ impl OperationPlanner {
             .existing_pull_requests(&branch)
             .map_err(open_pull_request_gh_error)?;
         let existing_url = existing
-            .first()
+            .iter()
+            .find(|pull_request| pull_request.base_ref_name == base)
             .map(|pull_request| pull_request.url.as_str());
         let title = branch.clone();
         let request = OperationRequest::OpenPullRequest {
@@ -2760,7 +2784,7 @@ impl PlanExecutor {
             .existing_pull_requests(branch)
             .map_err(StepExecutionError::GitHub)?
             .into_iter()
-            .next()
+            .find(|pull_request| pull_request.base_ref_name == *base)
         {
             return Ok(ExecutionOutput::PullRequest {
                 url: existing.url,
@@ -2780,7 +2804,7 @@ impl PlanExecutor {
             Err(error) => match github.existing_pull_requests(branch) {
                 Ok(existing) => existing
                     .into_iter()
-                    .next()
+                    .find(|pull_request| pull_request.base_ref_name == *base)
                     .map(|pull_request| ExecutionOutput::PullRequest {
                         url: pull_request.url,
                         existing: true,
@@ -3985,6 +4009,65 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_for_other_base_is_not_surfaced_after_create_failure()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-other-base")?;
+        let fake_gh = fake_gh_with_pull_requests(
+            "open-pr-other-base",
+            "[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\"}]",
+            false,
+        )?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+        };
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest {
+                base: Some("release".to_owned()),
+            })
+            .map_err(std::io::Error::other)?;
+
+        assert!(
+            operation
+                .plan
+                .preview_text()
+                .contains("https://github.com/octo/repo/compare/release...feature/open-pr")
+        );
+        let execution = PlanExecutor::with_audit_paths(
+            &repo,
+            isolated_store_paths("open-pr-other-base-audit")?,
+        )
+        .execute(&operation.plan, operation.context);
+
+        assert!(!execution.succeeded());
+        assert!(!execution.message().contains("pull/42"));
+        assert!(
+            std::fs::read_to_string(fake_gh.with_file_name("invocations"))?
+                .contains("--base release")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_pull_request_plan_encodes_compare_ref_names() {
+        let plan = open_pull_request_plan(
+            OperationRequest::OpenPullRequest {
+                base: Some("release#candidate".to_owned()),
+            },
+            "origin",
+            "feature%ready",
+            "release#candidate",
+            "feature%ready",
+            "octo/repo",
+            None,
+        );
+
+        assert!(plan.preview_text().contains(
+            "https://github.com/octo/repo/compare/release%23candidate...feature%25ready?expand=1"
+        ));
+    }
+
+    #[test]
     fn open_pull_request_blocks_missing_upstream_and_matching_base() -> Result<(), Box<dyn Error>> {
         let repo = isolated_git_repo("open-pr-invalid-state")?;
         configure_git_identity(&repo)?;
@@ -4808,23 +4891,37 @@ mod tests {
     }
 
     fn fake_gh(name: &str, existing: bool) -> Result<PathBuf, Box<dyn Error>> {
+        let pull_requests = if existing {
+            "[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\"}]"
+        } else {
+            "[]"
+        };
+        fake_gh_with_pull_requests(name, pull_requests, true)
+    }
+
+    fn fake_gh_with_pull_requests(
+        name: &str,
+        pull_requests: &str,
+        create_succeeds: bool,
+    ) -> Result<PathBuf, Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt;
 
         let root = isolated_temp_root(&format!("fake-gh-{name}"))?;
         std::fs::create_dir_all(&root)?;
         let executable = root.join("gh");
         let invocations = root.join("invocations");
-        let pull_requests = if existing {
-            "[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\"}]"
+        let create_response = if create_succeeds {
+            "printf '%s\\n' 'https://github.com/octo/repo/pull/43' ;;"
         } else {
-            "[]"
+            "exit 1 ;;"
         };
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s:%s\\n' \"$1\" \"$2\" >> '{}'\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}' ;;\npr:list) printf '%s\\n' '{}' ;;\npr:create) printf '%s\\n' 'https://github.com/octo/repo/pull/43' ;;\n*) exit 1 ;;\nesac\n",
+                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}' ;;\npr:list) printf '%s\\n' '{}' ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
                 invocations.display(),
-                pull_requests
+                pull_requests,
+                create_response
             ),
         )?;
         let mut permissions = std::fs::metadata(&executable)?.permissions();
