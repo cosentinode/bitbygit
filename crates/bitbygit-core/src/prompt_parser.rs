@@ -254,6 +254,10 @@ fn parse_commit_prompt(input: &str) -> Result<String, PromptParseError> {
         message = "";
     } else if let Some(after_flag) = message.strip_prefix("-m ") {
         message = after_flag.trim_start();
+    } else if message.starts_with('-') {
+        return Err(parse_error(
+            "Unsupported prompt. Try: commit -m \"message\"",
+        ));
     }
     parse_commit_message(message)
 }
@@ -406,6 +410,18 @@ mod tests {
             (
                 "commit -m",
                 "Commit message required. Try: commit -m \"message\"".to_owned(),
+            ),
+            (
+                "commit --amend",
+                "Unsupported prompt. Try: commit -m \"message\"".to_owned(),
+            ),
+            (
+                "commit --no-verify",
+                "Unsupported prompt. Try: commit -m \"message\"".to_owned(),
+            ),
+            (
+                "commit -S -m \"signed\"",
+                "Unsupported prompt. Try: commit -m \"message\"".to_owned(),
             ),
             (
                 "commit -m \"message\" trailing",
