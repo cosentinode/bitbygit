@@ -39,6 +39,9 @@ pub enum OperationRequest {
     Rebase {
         base: String,
     },
+    OpenPullRequest {
+        base: Option<String>,
+    },
     PromptSequence {
         requests: Vec<OperationRequest>,
     },
@@ -63,6 +66,7 @@ pub enum OperationKind {
     CreateBranch,
     MergeFastForward,
     Rebase,
+    OpenPullRequest,
 }
 
 impl OperationKind {
@@ -84,6 +88,7 @@ impl OperationKind {
             Self::CreateBranch => "create branch",
             Self::MergeFastForward => "merge",
             Self::Rebase => "rebase",
+            Self::OpenPullRequest => "open pull request",
         }
     }
 
@@ -106,6 +111,7 @@ impl OperationKind {
             Self::CreateBranch => "create_branch",
             Self::MergeFastForward => "merge_ff_only",
             Self::Rebase => "rebase",
+            Self::OpenPullRequest => "open_pull_request",
         }
     }
 }

@@ -3,8 +3,8 @@ use std::fmt;
 
 use crate::OperationRequest;
 
-const PROMPT_EXAMPLES: &str = "branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, commit -m \"message\", fetch, push, pull, or pull --rebase";
-pub const UNSUPPORTED_PROMPT_MESSAGE: &str = "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, commit -m \"message\", fetch, push, pull, or pull --rebase";
+const PROMPT_EXAMPLES: &str = "branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, open pr, commit -m \"message\", fetch, push, pull, or pull --rebase";
+pub const UNSUPPORTED_PROMPT_MESSAGE: &str = "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, open pr, commit -m \"message\", fetch, push, pull, or pull --rebase";
 const SHELL_SYNTAX_MESSAGE: &str =
     "Shell-style prompt syntax is not supported. Use one guarded prompt at a time.";
 const RAW_GIT_MESSAGE: &str =
@@ -168,6 +168,7 @@ fn parse_single_prompt(input: &str) -> Result<OperationRequest, PromptParseError
         "branches" => Ok(OperationRequest::Branches),
         "fetch" => Ok(OperationRequest::Fetch),
         "push" => Ok(OperationRequest::Push),
+        "open pr" | "open pull request" => Ok(OperationRequest::OpenPullRequest { base: None }),
         "pull" => Ok(OperationRequest::Pull { rebase: false }),
         "pull --rebase" | "pull rebase" => Ok(OperationRequest::Pull { rebase: true }),
         _ if lower.starts_with("checkout ") => parse_one_arg_prompt(trimmed, "checkout")
@@ -178,12 +179,40 @@ fn parse_single_prompt(input: &str) -> Result<OperationRequest, PromptParseError
         _ if lower.starts_with("rebase ") => {
             parse_one_arg_prompt(trimmed, "rebase").map(|base| OperationRequest::Rebase { base })
         }
+        _ if lower.starts_with("open pr to ") => parse_open_pull_request_prompt(trimmed, "open pr"),
+        _ if lower.starts_with("open pull request to ") => {
+            parse_open_pull_request_prompt(trimmed, "open pull request")
+        }
         _ if lower.starts_with("branch ") => parse_branch_prompt(trimmed),
         _ if lower == "commit" || lower.starts_with("commit ") => {
             parse_commit_prompt(trimmed).map(|message| OperationRequest::Commit { message })
         }
         _ => Err(parse_error(UNSUPPORTED_PROMPT_MESSAGE)),
     }
+}
+
+fn parse_open_pull_request_prompt(
+    input: &str,
+    command: &str,
+) -> Result<OperationRequest, PromptParseError> {
+    let Some(rest) = input.get(command.len()..) else {
+        return Err(parse_error("Expected: open pr or open pr to <base>"));
+    };
+    let rest = rest.trim_start();
+    let Some(base) = rest
+        .get(..2)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("to"))
+        .and_then(|_prefix| rest.get(2..))
+        .filter(|base| base.starts_with(char::is_whitespace))
+    else {
+        return Err(parse_error("Expected: open pr or open pr to <base>"));
+    };
+    Ok(OperationRequest::OpenPullRequest {
+        base: Some(parse_branch_arg(
+            base.trim(),
+            "Expected: open pr or open pr to <base>",
+        )?),
+    })
 }
 
 fn parse_one_arg_prompt(input: &str, command: &str) -> Result<String, PromptParseError> {
@@ -304,6 +333,23 @@ mod tests {
             ("branches", OperationRequest::Branches),
             ("fetch", OperationRequest::Fetch),
             ("push", OperationRequest::Push),
+            ("open pr", OperationRequest::OpenPullRequest { base: None }),
+            (
+                "open pull request",
+                OperationRequest::OpenPullRequest { base: None },
+            ),
+            (
+                "open pull request to develop",
+                OperationRequest::OpenPullRequest {
+                    base: Some("develop".to_owned()),
+                },
+            ),
+            (
+                "OPEN PR TO release",
+                OperationRequest::OpenPullRequest {
+                    base: Some("release".to_owned()),
+                },
+            ),
             ("pull", OperationRequest::Pull { rebase: false }),
             ("pull --rebase", OperationRequest::Pull { rebase: true }),
             ("pull rebase", OperationRequest::Pull { rebase: true }),
