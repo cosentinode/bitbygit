@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use bitbygit_core::{
     ConfirmationRequirement, OperationKind, OperationPlan, OperationRequest, OperationStep,
     RiskLevel,
-    prompt_parser::{ParsedPrompt, UNSUPPORTED_PROMPT_MESSAGE, parse_prompt},
+    prompt_parser::{ParsedPrompt, parse_prompt},
 };
 use bitbygit_git::{
     BranchInfo, BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head,
@@ -207,18 +207,10 @@ impl App {
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
             KeyCode::Char('a') if self.focus == Focus::Status => {
-                let plan = stage_all_plan();
-                self.submit_operation(
-                    plan,
-                    ExecutionContext::from_payload(PendingPayload::StageAll),
-                );
+                self.submit_operation_request(OperationRequest::StageAll);
             }
             KeyCode::Char('A') if self.focus == Focus::Status => {
-                let plan = unstage_all_plan();
-                self.submit_operation(
-                    plan,
-                    ExecutionContext::from_payload(PendingPayload::UnstageAll),
-                );
+                self.submit_operation_request(OperationRequest::UnstageAll);
             }
             KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
             KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
@@ -391,11 +383,7 @@ impl App {
             return;
         }
         let pathspecs = file.pathspecs.clone();
-        let plan = stage_paths_plan(file_path_labels(&pathspecs));
-        self.submit_operation(
-            plan,
-            ExecutionContext::from_payload(PendingPayload::StagePaths { paths: pathspecs }),
-        );
+        self.submit_prepared_operation(OperationPlanner::current().plan_stage_pathspecs(pathspecs));
     }
 
     fn unstage_selected_file(&mut self) {
@@ -407,11 +395,20 @@ impl App {
             return;
         }
         let pathspecs = file.pathspecs.clone();
-        let plan = unstage_paths_plan(file_path_labels(&pathspecs));
-        self.submit_operation(
-            plan,
-            ExecutionContext::from_payload(PendingPayload::UnstagePaths { paths: pathspecs }),
+        self.submit_prepared_operation(
+            OperationPlanner::current().plan_unstage_pathspecs(pathspecs),
         );
+    }
+
+    fn submit_operation_request(&mut self, request: OperationRequest) {
+        match OperationPlanner::current().plan_request(request) {
+            Ok(operation) => self.submit_prepared_operation(operation),
+            Err(error) => self.details = error,
+        }
+    }
+
+    fn submit_prepared_operation(&mut self, operation: PreparedOperation) {
+        self.submit_operation(operation.plan, operation.context);
     }
 
     fn submit_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
@@ -458,502 +455,13 @@ impl App {
                 return;
             }
         };
-        match request {
-            OperationRequest::Commit { message } => self.prepare_commit(message),
-            OperationRequest::Fetch => self.run_fetch(),
-            OperationRequest::Push => self.prepare_push(),
-            OperationRequest::Pull { rebase } => self.prepare_pull(rebase),
-            OperationRequest::Branches => self.show_branches(),
-            OperationRequest::Checkout { branch } => self.prepare_checkout(branch),
-            OperationRequest::CreateBranch { branch, base } => {
-                self.prepare_create_branch(branch, base)
+        match OperationPlanner::current().plan_request(request) {
+            Ok(operation) => {
+                self.prompt.clear();
+                self.submit_prepared_operation(operation);
             }
-            OperationRequest::Merge { branch } => self.prepare_merge(branch),
-            OperationRequest::Rebase { base } => self.prepare_rebase(base),
-            OperationRequest::RefreshStatus
-            | OperationRequest::ViewDiff { .. }
-            | OperationRequest::StagePaths { .. }
-            | OperationRequest::UnstagePaths { .. }
-            | OperationRequest::StageAll
-            | OperationRequest::UnstageAll => {
-                self.details = UNSUPPORTED_PROMPT_MESSAGE.to_owned();
-            }
+            Err(error) => self.details = error,
         }
-    }
-
-    fn prepare_commit(&mut self, message: String) {
-        let git = Git::new(current_dir());
-        let status = match git.status() {
-            Ok(status) => status,
-            Err(error) => {
-                self.details = format!("Unable to prepare commit plan: {error}");
-                return;
-            }
-        };
-        let staged_items = staged_plan_items(&status.entries);
-        if staged_items.is_empty() {
-            self.details = "Commit blocked: there are no staged changes.".to_owned();
-            return;
-        }
-        let staged_tree = match git.staged_tree() {
-            Ok(staged_tree) => staged_tree,
-            Err(error) => {
-                self.details = format!("Unable to snapshot staged content: {error}");
-                return;
-            }
-        };
-        let target = match git.head_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.details = format!("Unable to snapshot commit target: {error}");
-                return;
-            }
-        };
-        let staged_count = staged_items.len();
-        let plan = commit_plan(&message, staged_count);
-
-        self.submit_operation(
-            plan.clone(),
-            ExecutionContext::from_payload(PendingPayload::Commit {
-                staged_items,
-                staged_tree,
-                target,
-            }),
-        );
-        self.prompt.clear();
-    }
-
-    fn run_fetch(&mut self) {
-        self.prompt.clear();
-        let plan = fetch_plan();
-        self.submit_operation(plan, ExecutionContext::default());
-    }
-
-    fn prepare_push(&mut self) {
-        let status = match Git::new(current_dir()).status() {
-            Ok(status) => status,
-            Err(error) => {
-                self.details = format!("Unable to prepare push plan: {error}");
-                return;
-            }
-        };
-        let branch = match branch_name(&status.branch) {
-            Ok(branch) => branch,
-            Err(error) => {
-                self.details = error;
-                return;
-            }
-        };
-        if status.branch.behind > 0 {
-            self.details = "Push blocked: branch is behind its upstream. Pull or resolve divergence before pushing.".to_owned();
-            return;
-        }
-        let head_target = match Git::new(current_dir()).head_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.details = format!("Unable to snapshot push target: {error}");
-                return;
-            }
-        };
-        self.prompt.clear();
-        match &status.branch.upstream {
-            Some(upstream) => {
-                let push_target = match Git::new(current_dir()).upstream_push_target(&branch) {
-                    Ok(Some(target)) => target,
-                    Ok(None) => {
-                        self.details =
-                            format!("Push blocked: unable to resolve upstream {upstream}.");
-                        return;
-                    }
-                    Err(error) => {
-                        self.details = format!("Unable to prepare push target: {error}");
-                        return;
-                    }
-                };
-                let (remote, upstream_branch) = push_target;
-                let expected_upstream = format!("{remote}/{upstream_branch}");
-                if expected_upstream != *upstream {
-                    self.details =
-                        format!("Push blocked: upstream config does not match {upstream}.");
-                    return;
-                }
-                let remote_urls = match Git::new(current_dir()).remote_push_urls(&remote) {
-                    Ok(urls) => urls,
-                    Err(error) => {
-                        self.details = format!("Unable to snapshot push remote URLs: {error}");
-                        return;
-                    }
-                };
-                let push_url = match single_push_url(&remote, &remote_urls) {
-                    Ok(url) => url,
-                    Err(error) => {
-                        self.details = error;
-                        return;
-                    }
-                };
-                let expected_remote_oid =
-                    match Git::new(current_dir()).remote_url_head_oid(push_url, &upstream_branch) {
-                        Ok(oid) => oid,
-                        Err(error) => {
-                            self.details = format!("Unable to snapshot push remote: {error}");
-                            return;
-                        }
-                    };
-                let plan = push_plan(&branch, upstream, status.branch.ahead);
-                self.submit_operation(
-                    plan.clone(),
-                    ExecutionContext::from_payload(PendingPayload::Push {
-                        local_branch: branch.clone(),
-                        target: head_target.clone(),
-                        remote,
-                        upstream_branch,
-                        upstream: upstream.clone(),
-                        expected_remote_oid,
-                        remote_urls,
-                    }),
-                );
-            }
-            None => {
-                let Some(remote) = default_remote_name() else {
-                    self.details = "Push blocked: no remotes are configured.".to_owned();
-                    return;
-                };
-                let remote_urls = match Git::new(current_dir()).remote_push_urls(&remote) {
-                    Ok(urls) => urls,
-                    Err(error) => {
-                        self.details = format!("Unable to snapshot push remote URLs: {error}");
-                        return;
-                    }
-                };
-                let push_url = match single_push_url(&remote, &remote_urls) {
-                    Ok(url) => url,
-                    Err(error) => {
-                        self.details = error;
-                        return;
-                    }
-                };
-                let expected_remote_oid =
-                    match Git::new(current_dir()).remote_url_head_oid(push_url, &branch) {
-                        Ok(oid) => oid,
-                        Err(error) => {
-                            self.details = format!("Unable to snapshot push remote: {error}");
-                            return;
-                        }
-                    };
-                let plan = push_set_upstream_plan(&branch, &remote);
-                self.submit_operation(
-                    plan.clone(),
-                    ExecutionContext::from_payload(PendingPayload::PushSetUpstream {
-                        remote: remote.clone(),
-                        branch: branch.clone(),
-                        target: head_target,
-                        expected_remote_oid,
-                        remote_urls,
-                    }),
-                );
-            }
-        }
-    }
-
-    fn prepare_pull(&mut self, rebase: bool) {
-        let status = match Git::new(current_dir()).status() {
-            Ok(status) => status,
-            Err(error) => {
-                self.details = format!("Unable to prepare pull plan: {error}");
-                return;
-            }
-        };
-        if status.branch.upstream.is_none() {
-            self.details = "Pull blocked: current branch has no upstream.".to_owned();
-            return;
-        }
-        let local_branch = match branch_name(&status.branch) {
-            Ok(branch) => branch,
-            Err(error) => {
-                self.details = error;
-                return;
-            }
-        };
-        let head_target = match Git::new(current_dir()).head_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.details = format!("Unable to snapshot pull target: {error}");
-                return;
-            }
-        };
-        let upstream = status.branch.upstream.clone().unwrap_or_default();
-        let pull_target = match Git::new(current_dir()).upstream_push_target(&local_branch) {
-            Ok(Some(target)) => target,
-            Ok(None) => {
-                self.details = format!("Pull blocked: unable to resolve upstream {upstream}.");
-                return;
-            }
-            Err(error) => {
-                self.details = format!("Unable to prepare pull target: {error}");
-                return;
-            }
-        };
-        let (remote, upstream_branch) = pull_target;
-        let expected_upstream = format!("{remote}/{upstream_branch}");
-        if expected_upstream != upstream {
-            self.details = format!("Pull blocked: upstream config does not match {upstream}.");
-            return;
-        }
-        let fetch = Git::new(current_dir()).fetch_remote_branch(&remote, &upstream_branch);
-        if let Err(error) = fetch {
-            self.details = format!("Unable to fetch pull target: {error}");
-            return;
-        }
-        let status = match Git::new(current_dir()).status() {
-            Ok(status) => status,
-            Err(error) => {
-                self.details = format!("Unable to refresh pull plan after fetch: {error}");
-                return;
-            }
-        };
-        if branch_name(&status.branch).as_deref() != Ok(local_branch.as_str()) {
-            self.details = "Pull blocked: current branch changed during fetch.".to_owned();
-            return;
-        }
-        if status.branch.upstream.as_deref() != Some(upstream.as_str()) {
-            self.details = "Pull blocked: upstream changed during fetch.".to_owned();
-            return;
-        }
-        if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
-            self.details = "Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned();
-            return;
-        }
-        if rebase && !status.is_clean() {
-            self.details = "Pull rebase blocked: working tree must be clean.".to_owned();
-            return;
-        }
-        let upstream_oid =
-            match Git::new(current_dir()).remote_tracking_oid(&remote, &upstream_branch) {
-                Ok(upstream_oid) => upstream_oid,
-                Err(error) => {
-                    self.details = format!("Unable to snapshot pull upstream: {error}");
-                    return;
-                }
-            };
-        self.prompt.clear();
-        let plan = pull_plan(rebase, &upstream, status.branch.behind);
-        if rebase {
-            self.submit_operation(
-                plan.clone(),
-                ExecutionContext::from_payload(PendingPayload::PullRebase {
-                    local_branch,
-                    target: head_target,
-                    upstream: upstream.clone(),
-                    remote,
-                    upstream_branch,
-                    upstream_oid,
-                }),
-            );
-        } else {
-            self.submit_operation(
-                plan.clone(),
-                ExecutionContext::from_payload(PendingPayload::Pull {
-                    local_branch,
-                    target: head_target,
-                    upstream: upstream.clone(),
-                    remote,
-                    upstream_branch,
-                    upstream_oid,
-                }),
-            );
-        }
-    }
-
-    fn show_branches(&mut self) {
-        self.prompt.clear();
-        let plan = branches_plan();
-        self.submit_operation(plan, ExecutionContext::default());
-    }
-
-    fn prepare_checkout(&mut self, branch: String) {
-        if let Err(error) = ensure_clean_branch_worktree("Checkout") {
-            self.details = error;
-            return;
-        }
-        let target = match Git::new(current_dir()).head_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.details = format!("Unable to snapshot checkout target: {error}");
-                return;
-            }
-        };
-        let branch_target = match Git::new(current_dir()).branch_target(&branch) {
-            Ok(Some(branch)) => branch,
-            Ok(None) => {
-                self.details = format!("Checkout blocked: branch {branch} was not found.");
-                return;
-            }
-            Err(error) => {
-                self.details = format!("Unable to prepare checkout plan: {error}");
-                return;
-            }
-        };
-        if let Err(error) =
-            Git::new(current_dir()).ensure_remote_checkout_target_available(&branch_target)
-        {
-            self.details = format!("Checkout blocked: {error}");
-            return;
-        }
-        self.prompt.clear();
-        let plan = checkout_plan(&branch_target);
-        self.submit_operation(
-            plan.clone(),
-            ExecutionContext::from_payload(PendingPayload::Checkout {
-                branch: branch_target.clone(),
-                target,
-            }),
-        );
-    }
-
-    fn prepare_create_branch(&mut self, branch: String, base: Option<String>) {
-        if let Err(error) = ensure_clean_branch_worktree("Create branch") {
-            self.details = error;
-            return;
-        }
-        let target = match Git::new(current_dir()).head_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.details = format!("Unable to snapshot branch target: {error}");
-                return;
-            }
-        };
-        match Git::new(current_dir()).branch_target(&branch) {
-            Ok(Some(_branch)) => {
-                self.details = format!("Create branch blocked: {branch} already exists.");
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.details = format!("Unable to prepare branch plan: {error}");
-                return;
-            }
-        }
-        let base_target = match base {
-            Some(base) => match Git::new(current_dir()).branch_target(&base) {
-                Ok(Some(base)) => Some(base),
-                Ok(None) => {
-                    self.details = format!("Create branch blocked: base {base} was not found.");
-                    return;
-                }
-                Err(error) => {
-                    self.details = format!("Unable to prepare branch base: {error}");
-                    return;
-                }
-            },
-            None => None,
-        };
-        if base_target.is_none() && target.oid.is_none() {
-            self.details =
-                "Create branch blocked: current branch needs a commit before branching.".to_owned();
-            return;
-        }
-        let base_label = base_target
-            .as_ref()
-            .map(|base| format!("{} at {}", base.name, short_oid(&base.oid)))
-            .or_else(|| {
-                target
-                    .oid
-                    .as_ref()
-                    .map(|oid| format!("HEAD at {}", short_oid(oid)))
-            })
-            .unwrap_or_else(|| "unborn HEAD".to_owned());
-        self.prompt.clear();
-        let plan = create_branch_plan(&branch, base_target.as_ref(), &base_label);
-        self.submit_operation(
-            plan.clone(),
-            ExecutionContext::from_payload(PendingPayload::CreateBranch {
-                branch: branch.clone(),
-                base: base_target,
-                target,
-            }),
-        );
-    }
-
-    fn prepare_merge(&mut self, branch: String) {
-        let current = match current_branch_for_branch_operation("Merge") {
-            Ok(current) => current,
-            Err(error) => {
-                self.details = error;
-                return;
-            }
-        };
-        let target = match Git::new(current_dir()).head_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.details = format!("Unable to snapshot merge target: {error}");
-                return;
-            }
-        };
-        let branch_target = match Git::new(current_dir()).branch_target(&branch) {
-            Ok(Some(branch)) => branch,
-            Ok(None) => {
-                self.details = format!("Merge blocked: branch {branch} was not found.");
-                return;
-            }
-            Err(error) => {
-                self.details = format!("Unable to prepare merge plan: {error}");
-                return;
-            }
-        };
-        if branch_target.name == current {
-            self.details = "Merge blocked: selected branch is already checked out.".to_owned();
-            return;
-        }
-        self.prompt.clear();
-        let plan = merge_plan(&current, &branch_target);
-        self.submit_operation(
-            plan.clone(),
-            ExecutionContext::from_payload(PendingPayload::Merge {
-                branch: branch_target.clone(),
-                target,
-            }),
-        );
-    }
-
-    fn prepare_rebase(&mut self, base: String) {
-        let current = match current_branch_for_branch_operation("Rebase") {
-            Ok(current) => current,
-            Err(error) => {
-                self.details = error;
-                return;
-            }
-        };
-        let target = match Git::new(current_dir()).head_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.details = format!("Unable to snapshot rebase target: {error}");
-                return;
-            }
-        };
-        let base_target = match Git::new(current_dir()).branch_target(&base) {
-            Ok(Some(base)) => base,
-            Ok(None) => {
-                self.details = format!("Rebase blocked: base {base} was not found.");
-                return;
-            }
-            Err(error) => {
-                self.details = format!("Unable to prepare rebase plan: {error}");
-                return;
-            }
-        };
-        if base_target.name == current {
-            self.details = "Rebase blocked: selected base is already checked out.".to_owned();
-            return;
-        }
-        self.prompt.clear();
-        let plan = rebase_plan(&current, &base_target);
-        self.submit_operation(
-            plan.clone(),
-            ExecutionContext::from_payload(PendingPayload::Rebase {
-                base: base_target.clone(),
-                target,
-            }),
-        );
     }
 
     fn cancel_pending(&mut self) {
@@ -1022,6 +530,18 @@ impl QueuedOperation {
     #[cfg(test)]
     fn with_payload(plan: OperationPlan, payload: PendingPayload) -> Self {
         Self::new(plan, ExecutionContext::from_payload(payload))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedOperation {
+    plan: OperationPlan,
+    context: ExecutionContext,
+}
+
+impl PreparedOperation {
+    fn new(plan: OperationPlan, context: ExecutionContext) -> Self {
+        Self { plan, context }
     }
 }
 
@@ -1673,31 +1193,394 @@ fn branch_name(branch: &BranchState) -> Result<String, String> {
     }
 }
 
-fn ensure_clean_branch_worktree(action: &str) -> Result<(), String> {
-    Git::new(current_dir())
-        .ensure_clean_worktree(&action.to_ascii_lowercase())
-        .map_err(|error| format!("{action} blocked: {error}"))
-}
-
-fn current_branch_for_branch_operation(action: &str) -> Result<String, String> {
-    ensure_clean_branch_worktree(action)?;
-    let status = Git::new(current_dir())
-        .status()
-        .map_err(|error| format!("{action} blocked: unable to read repository status: {error}"))?;
-    branch_name(&status.branch).map_err(|error| error.replace("Operation", action))
-}
-
 fn short_oid(oid: &str) -> String {
     oid.chars().take(12).collect()
 }
 
-fn default_remote_name() -> Option<String> {
-    let remotes = Git::new(current_dir()).remotes().ok()?;
-    remotes
-        .iter()
-        .find(|remote| remote.name == "origin")
-        .or_else(|| remotes.first())
-        .map(|remote| remote.name.clone())
+#[derive(Debug, Clone)]
+struct OperationPlanner {
+    repo_root: PathBuf,
+}
+
+impl OperationPlanner {
+    fn current() -> Self {
+        Self {
+            repo_root: current_dir(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new(repo_root: impl Into<PathBuf>) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+        }
+    }
+
+    fn plan_request(&self, request: OperationRequest) -> Result<PreparedOperation, String> {
+        match request {
+            OperationRequest::RefreshStatus => {
+                Err("Refresh status is handled directly by the UI.".to_owned())
+            }
+            OperationRequest::ViewDiff { .. } => {
+                Err("View diff is handled directly by the UI.".to_owned())
+            }
+            OperationRequest::StagePaths { paths } => {
+                Ok(self.plan_stage_pathspecs(paths.into_iter().map(PathBuf::from).collect()))
+            }
+            OperationRequest::UnstagePaths { paths } => {
+                Ok(self.plan_unstage_pathspecs(paths.into_iter().map(PathBuf::from).collect()))
+            }
+            OperationRequest::StageAll => Ok(PreparedOperation::new(
+                stage_all_plan(),
+                ExecutionContext::from_payload(PendingPayload::StageAll),
+            )),
+            OperationRequest::UnstageAll => Ok(PreparedOperation::new(
+                unstage_all_plan(),
+                ExecutionContext::from_payload(PendingPayload::UnstageAll),
+            )),
+            OperationRequest::Commit { message } => self.plan_commit(message),
+            OperationRequest::Fetch => Ok(PreparedOperation::new(
+                fetch_plan(),
+                ExecutionContext::default(),
+            )),
+            OperationRequest::Push => self.plan_push(),
+            OperationRequest::Pull { rebase } => self.plan_pull(rebase),
+            OperationRequest::Branches => Ok(PreparedOperation::new(
+                branches_plan(),
+                ExecutionContext::default(),
+            )),
+            OperationRequest::Checkout { branch } => self.plan_checkout(branch),
+            OperationRequest::CreateBranch { branch, base } => {
+                self.plan_create_branch(branch, base)
+            }
+            OperationRequest::Merge { branch } => self.plan_merge(branch),
+            OperationRequest::Rebase { base } => self.plan_rebase(base),
+        }
+    }
+
+    fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
+        PreparedOperation::new(
+            stage_paths_plan(file_path_labels(&paths)),
+            ExecutionContext::from_payload(PendingPayload::StagePaths { paths }),
+        )
+    }
+
+    fn plan_unstage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
+        PreparedOperation::new(
+            unstage_paths_plan(file_path_labels(&paths)),
+            ExecutionContext::from_payload(PendingPayload::UnstagePaths { paths }),
+        )
+    }
+
+    fn plan_commit(&self, message: String) -> Result<PreparedOperation, String> {
+        let git = self.git();
+        let status = git
+            .status()
+            .map_err(|error| format!("Unable to prepare commit plan: {error}"))?;
+        let staged_items = staged_plan_items(&status.entries);
+        if staged_items.is_empty() {
+            return Err("Commit blocked: there are no staged changes.".to_owned());
+        }
+        let staged_tree = git
+            .staged_tree()
+            .map_err(|error| format!("Unable to snapshot staged content: {error}"))?;
+        let target = git
+            .head_target()
+            .map_err(|error| format!("Unable to snapshot commit target: {error}"))?;
+        let staged_count = staged_items.len();
+
+        Ok(PreparedOperation::new(
+            commit_plan(&message, staged_count),
+            ExecutionContext::from_payload(PendingPayload::Commit {
+                staged_items,
+                staged_tree,
+                target,
+            }),
+        ))
+    }
+
+    fn plan_push(&self) -> Result<PreparedOperation, String> {
+        let git = self.git();
+        let status = git
+            .status()
+            .map_err(|error| format!("Unable to prepare push plan: {error}"))?;
+        let branch = branch_name(&status.branch)?;
+        if status.branch.behind > 0 {
+            return Err("Push blocked: branch is behind its upstream. Pull or resolve divergence before pushing.".to_owned());
+        }
+        let head_target = git
+            .head_target()
+            .map_err(|error| format!("Unable to snapshot push target: {error}"))?;
+        let ahead = status.branch.ahead;
+
+        match status.branch.upstream {
+            Some(upstream) => {
+                let (remote, upstream_branch) = git
+                    .upstream_push_target(&branch)
+                    .map_err(|error| format!("Unable to prepare push target: {error}"))?
+                    .ok_or_else(|| {
+                        format!("Push blocked: unable to resolve upstream {upstream}.")
+                    })?;
+                let expected_upstream = format!("{remote}/{upstream_branch}");
+                if expected_upstream != upstream {
+                    return Err(format!(
+                        "Push blocked: upstream config does not match {upstream}."
+                    ));
+                }
+                let remote_urls = git
+                    .remote_push_urls(&remote)
+                    .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
+                let push_url = single_push_url(&remote, &remote_urls)?;
+                let expected_remote_oid = git
+                    .remote_url_head_oid(push_url, &upstream_branch)
+                    .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
+                Ok(PreparedOperation::new(
+                    push_plan(&branch, &upstream, ahead),
+                    ExecutionContext::from_payload(PendingPayload::Push {
+                        local_branch: branch,
+                        target: head_target,
+                        remote,
+                        upstream_branch,
+                        upstream,
+                        expected_remote_oid,
+                        remote_urls,
+                    }),
+                ))
+            }
+            None => {
+                let Some(remote) = self.default_remote_name() else {
+                    return Err("Push blocked: no remotes are configured.".to_owned());
+                };
+                let remote_urls = git
+                    .remote_push_urls(&remote)
+                    .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
+                let push_url = single_push_url(&remote, &remote_urls)?;
+                let expected_remote_oid = git
+                    .remote_url_head_oid(push_url, &branch)
+                    .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
+                Ok(PreparedOperation::new(
+                    push_set_upstream_plan(&branch, &remote),
+                    ExecutionContext::from_payload(PendingPayload::PushSetUpstream {
+                        remote,
+                        branch,
+                        target: head_target,
+                        expected_remote_oid,
+                        remote_urls,
+                    }),
+                ))
+            }
+        }
+    }
+
+    fn plan_pull(&self, rebase: bool) -> Result<PreparedOperation, String> {
+        let git = self.git();
+        let status = git
+            .status()
+            .map_err(|error| format!("Unable to prepare pull plan: {error}"))?;
+        let Some(upstream) = status.branch.upstream.clone() else {
+            return Err("Pull blocked: current branch has no upstream.".to_owned());
+        };
+        let local_branch = branch_name(&status.branch)?;
+        let head_target = git
+            .head_target()
+            .map_err(|error| format!("Unable to snapshot pull target: {error}"))?;
+        let (remote, upstream_branch) = git
+            .upstream_push_target(&local_branch)
+            .map_err(|error| format!("Unable to prepare pull target: {error}"))?
+            .ok_or_else(|| format!("Pull blocked: unable to resolve upstream {upstream}."))?;
+        let expected_upstream = format!("{remote}/{upstream_branch}");
+        if expected_upstream != upstream {
+            return Err(format!(
+                "Pull blocked: upstream config does not match {upstream}."
+            ));
+        }
+        git.fetch_remote_branch(&remote, &upstream_branch)
+            .map_err(|error| format!("Unable to fetch pull target: {error}"))?;
+        let status = git
+            .status()
+            .map_err(|error| format!("Unable to refresh pull plan after fetch: {error}"))?;
+        if branch_name(&status.branch).as_deref() != Ok(local_branch.as_str()) {
+            return Err("Pull blocked: current branch changed during fetch.".to_owned());
+        }
+        if status.branch.upstream.as_deref() != Some(upstream.as_str()) {
+            return Err("Pull blocked: upstream changed during fetch.".to_owned());
+        }
+        if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
+            return Err("Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned());
+        }
+        if rebase && !status.is_clean() {
+            return Err("Pull rebase blocked: working tree must be clean.".to_owned());
+        }
+        let upstream_oid = git
+            .remote_tracking_oid(&remote, &upstream_branch)
+            .map_err(|error| format!("Unable to snapshot pull upstream: {error}"))?;
+        let plan = pull_plan(rebase, &upstream, status.branch.behind);
+        let payload = if rebase {
+            PendingPayload::PullRebase {
+                local_branch,
+                target: head_target,
+                upstream,
+                remote,
+                upstream_branch,
+                upstream_oid,
+            }
+        } else {
+            PendingPayload::Pull {
+                local_branch,
+                target: head_target,
+                upstream,
+                remote,
+                upstream_branch,
+                upstream_oid,
+            }
+        };
+        Ok(PreparedOperation::new(
+            plan,
+            ExecutionContext::from_payload(payload),
+        ))
+    }
+
+    fn plan_checkout(&self, branch: String) -> Result<PreparedOperation, String> {
+        self.ensure_clean_branch_worktree("Checkout")?;
+        let git = self.git();
+        let target = git
+            .head_target()
+            .map_err(|error| format!("Unable to snapshot checkout target: {error}"))?;
+        let branch_target = git
+            .branch_target(&branch)
+            .map_err(|error| format!("Unable to prepare checkout plan: {error}"))?
+            .ok_or_else(|| format!("Checkout blocked: branch {branch} was not found."))?;
+        git.ensure_remote_checkout_target_available(&branch_target)
+            .map_err(|error| format!("Checkout blocked: {error}"))?;
+        Ok(PreparedOperation::new(
+            checkout_plan(&branch_target),
+            ExecutionContext::from_payload(PendingPayload::Checkout {
+                branch: branch_target,
+                target,
+            }),
+        ))
+    }
+
+    fn plan_create_branch(
+        &self,
+        branch: String,
+        base: Option<String>,
+    ) -> Result<PreparedOperation, String> {
+        self.ensure_clean_branch_worktree("Create branch")?;
+        let git = self.git();
+        let target = git
+            .head_target()
+            .map_err(|error| format!("Unable to snapshot branch target: {error}"))?;
+        if git
+            .branch_target(&branch)
+            .map_err(|error| format!("Unable to prepare branch plan: {error}"))?
+            .is_some()
+        {
+            return Err(format!("Create branch blocked: {branch} already exists."));
+        }
+        let base_target = match base {
+            Some(base) => Some(
+                git.branch_target(&base)
+                    .map_err(|error| format!("Unable to prepare branch base: {error}"))?
+                    .ok_or_else(|| format!("Create branch blocked: base {base} was not found."))?,
+            ),
+            None => None,
+        };
+        if base_target.is_none() && target.oid.is_none() {
+            return Err(
+                "Create branch blocked: current branch needs a commit before branching.".to_owned(),
+            );
+        }
+        let base_label = base_target
+            .as_ref()
+            .map(|base| format!("{} at {}", base.name, short_oid(&base.oid)))
+            .or_else(|| {
+                target
+                    .oid
+                    .as_ref()
+                    .map(|oid| format!("HEAD at {}", short_oid(oid)))
+            })
+            .unwrap_or_else(|| "unborn HEAD".to_owned());
+        Ok(PreparedOperation::new(
+            create_branch_plan(&branch, base_target.as_ref(), &base_label),
+            ExecutionContext::from_payload(PendingPayload::CreateBranch {
+                branch,
+                base: base_target,
+                target,
+            }),
+        ))
+    }
+
+    fn plan_merge(&self, branch: String) -> Result<PreparedOperation, String> {
+        let current = self.current_branch_for_branch_operation("Merge")?;
+        let git = self.git();
+        let target = git
+            .head_target()
+            .map_err(|error| format!("Unable to snapshot merge target: {error}"))?;
+        let branch_target = git
+            .branch_target(&branch)
+            .map_err(|error| format!("Unable to prepare merge plan: {error}"))?
+            .ok_or_else(|| format!("Merge blocked: branch {branch} was not found."))?;
+        if branch_target.name == current {
+            return Err("Merge blocked: selected branch is already checked out.".to_owned());
+        }
+        Ok(PreparedOperation::new(
+            merge_plan(&current, &branch_target),
+            ExecutionContext::from_payload(PendingPayload::Merge {
+                branch: branch_target,
+                target,
+            }),
+        ))
+    }
+
+    fn plan_rebase(&self, base: String) -> Result<PreparedOperation, String> {
+        let current = self.current_branch_for_branch_operation("Rebase")?;
+        let git = self.git();
+        let target = git
+            .head_target()
+            .map_err(|error| format!("Unable to snapshot rebase target: {error}"))?;
+        let base_target = git
+            .branch_target(&base)
+            .map_err(|error| format!("Unable to prepare rebase plan: {error}"))?
+            .ok_or_else(|| format!("Rebase blocked: base {base} was not found."))?;
+        if base_target.name == current {
+            return Err("Rebase blocked: selected base is already checked out.".to_owned());
+        }
+        Ok(PreparedOperation::new(
+            rebase_plan(&current, &base_target),
+            ExecutionContext::from_payload(PendingPayload::Rebase {
+                base: base_target,
+                target,
+            }),
+        ))
+    }
+
+    fn ensure_clean_branch_worktree(&self, action: &str) -> Result<(), String> {
+        self.git()
+            .ensure_clean_worktree(&action.to_ascii_lowercase())
+            .map_err(|error| format!("{action} blocked: {error}"))
+    }
+
+    fn current_branch_for_branch_operation(&self, action: &str) -> Result<String, String> {
+        self.ensure_clean_branch_worktree(action)?;
+        let status = self.git().status().map_err(|error| {
+            format!("{action} blocked: unable to read repository status: {error}")
+        })?;
+        branch_name(&status.branch).map_err(|error| error.replace("Operation", action))
+    }
+
+    fn default_remote_name(&self) -> Option<String> {
+        let remotes = self.git().remotes().ok()?;
+        remotes
+            .iter()
+            .find(|remote| remote.name == "origin")
+            .or_else(|| remotes.first())
+            .map(|remote| remote.name.clone())
+    }
+
+    fn git(&self) -> Git {
+        Git::new(self.repo_root.clone())
+    }
 }
 
 fn single_push_url<'a>(remote: &str, urls: &'a [String]) -> Result<&'a str, String> {
@@ -2952,6 +2835,116 @@ mod tests {
     }
 
     #[test]
+    fn manual_bulk_actions_queue_same_plan_as_request_planner() -> Result<(), Box<dyn Error>> {
+        for (key_code, request) in [
+            (KeyCode::Char('a'), OperationRequest::StageAll),
+            (KeyCode::Char('A'), OperationRequest::UnstageAll),
+        ] {
+            let expected = OperationPlanner::current()
+                .plan_request(request)
+                .map_err(std::io::Error::other)?;
+            let mut app = App::new();
+            app.focus = Focus::Status;
+
+            app.handle_key(key(key_code));
+
+            let Some(pending) = app.operation_queue.pending() else {
+                return Err(std::io::Error::other("missing pending operation").into());
+            };
+            assert_eq!(pending.plan, expected.plan);
+            assert_eq!(pending.context, expected.context);
+            assert_eq!(app.details, expected.plan.preview_text());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_commit_prompt_matches_manual_planner_output() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-planner-commit")?;
+        std::fs::write(repo.join("file.txt"), "hello\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        let ParsedPrompt::Single(request) = parse_prompt("commit -m \"ship staged\"")? else {
+            return Err(std::io::Error::other("expected single prompt").into());
+        };
+        let planner = OperationPlanner::new(repo);
+
+        let prompt_operation = planner
+            .plan_request(request)
+            .map_err(std::io::Error::other)?;
+        let manual_operation = planner
+            .plan_request(OperationRequest::Commit {
+                message: "ship staged".to_owned(),
+            })
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(prompt_operation, manual_operation);
+        assert_eq!(
+            prompt_operation.plan.confirmation.requirement,
+            ConfirmationRequirement::VisiblePlan
+        );
+        assert!(!prompt_operation.plan.preview_text().contains("commit -m"));
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_low_risk_prompts_match_manual_planner_output() -> Result<(), Box<dyn Error>> {
+        let planner = OperationPlanner::current();
+        for (prompt, request) in [
+            ("fetch", OperationRequest::Fetch),
+            ("branches", OperationRequest::Branches),
+        ] {
+            let ParsedPrompt::Single(parsed_request) = parse_prompt(prompt)? else {
+                return Err(std::io::Error::other("expected single prompt").into());
+            };
+
+            let prompt_operation = planner
+                .plan_request(parsed_request)
+                .map_err(std::io::Error::other)?;
+            let manual_operation = planner
+                .plan_request(request)
+                .map_err(std::io::Error::other)?;
+
+            assert_eq!(prompt_operation, manual_operation);
+            assert_eq!(
+                prompt_operation.plan.confirmation.requirement,
+                ConfirmationRequirement::NormalSelection
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_high_risk_prompt_keeps_explicit_confirmation() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-planner-rebase")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let base = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        git_stdout(&repo, &["checkout", "-b", "feature/rebase"])?;
+        let ParsedPrompt::Single(request) = parse_prompt(&format!("rebase {base}"))? else {
+            return Err(std::io::Error::other("expected single prompt").into());
+        };
+
+        let operation = OperationPlanner::new(repo)
+            .plan_request(request)
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            operation.plan.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        assert_eq!(operation.plan.request, OperationRequest::Rebase { base });
+        assert!(matches!(
+            operation.context.payload,
+            Some(PendingPayload::Rebase { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn operation_plans_use_guardrail_risk_levels() {
         let branch = BranchTarget {
             name: "feature/auth".to_owned(),
@@ -3719,6 +3712,13 @@ mod tests {
             .into());
         }
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn configure_git_identity(repo: &std::path::Path) -> Result<(), Box<dyn Error>> {
+        git_stdout(repo, &["config", "user.email", "bitbygit@example.invalid"])?;
+        git_stdout(repo, &["config", "user.name", "bitbygit tests"])?;
+        git_stdout(repo, &["config", "commit.gpgsign", "false"])?;
+        Ok(())
     }
 
     fn isolated_store_paths(name: &str) -> Result<StorePaths, Box<dyn Error>> {
