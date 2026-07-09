@@ -15,7 +15,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use bitbygit_core::{OperationKind, OperationPlan, OperationRequest, OperationStep, RiskLevel};
+use bitbygit_core::{
+    ConfirmationRequirement, OperationKind, OperationPlan, OperationRequest, OperationStep,
+    RiskLevel,
+};
 use bitbygit_git::{
     BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget,
     StatusEntry, StatusEntryType,
@@ -151,9 +154,27 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if self.pending_confirmation.is_some() {
+        if let Some(requirement) = self
+            .pending_confirmation
+            .as_ref()
+            .map(|action| action.plan.confirmation.requirement)
+        {
             match key.code {
-                KeyCode::Char('y') => self.confirm_pending(),
+                KeyCode::Char('Y')
+                    if requirement == ConfirmationRequirement::ExplicitConfirmation =>
+                {
+                    self.confirm_pending();
+                }
+                KeyCode::Char('y')
+                    if requirement == ConfirmationRequirement::ExplicitConfirmation =>
+                {
+                    self.details =
+                        "Explicit confirmation required: press uppercase Y to confirm or n to cancel."
+                            .to_owned();
+                }
+                KeyCode::Char('y') if requirement != ConfirmationRequirement::Blocked => {
+                    self.confirm_pending();
+                }
                 KeyCode::Char('n') | KeyCode::Esc => self.cancel_pending(),
                 _ => self.cancel_pending(),
             }
@@ -1587,7 +1608,7 @@ fn pull_plan(rebase: bool, upstream: &str, behind: u32) -> OperationPlan {
                 .with_detail("block if the fetched upstream changes before confirmation")
                 .with_detail(format!("locally behind: {behind} commit(s)")),
             ],
-            "Press y to rebase or n to cancel.",
+            "Explicit confirmation required: press uppercase Y to rebase or n to cancel.",
         )
     } else {
         OperationPlan::new(
@@ -1690,7 +1711,7 @@ fn rebase_plan(current: &str, base: &BranchTarget) -> OperationPlan {
             .with_detail("block if the working tree, current target, or base changes")
             .with_detail("Git may stop for conflicts that require manual resolution"),
         ],
-        "Press y to rebase or n to cancel.",
+        "Explicit confirmation required: press uppercase Y to rebase or n to cancel.",
     )
 }
 
@@ -2707,6 +2728,60 @@ mod tests {
 
         assert_eq!(app.pending_confirmation, None);
         assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn high_risk_rebase_confirmations_reject_plain_y() {
+        let branch = BranchTarget {
+            name: "origin/main".to_owned(),
+            reference: "refs/remotes/origin/main".to_owned(),
+            oid: "abcdef1234567890".to_owned(),
+            kind: BranchKind::Remote,
+        };
+        let target = HeadTarget {
+            oid: Some("1234567890abcdef".to_owned()),
+            reference: Some("refs/heads/feature/new".to_owned()),
+        };
+
+        let actions = [
+            PendingAction::new(
+                pull_plan(true, "origin/main", 1),
+                PendingPayload::PullRebase {
+                    local_branch: "feature/new".to_owned(),
+                    target: target.clone(),
+                    upstream: "origin/main".to_owned(),
+                    remote: "origin".to_owned(),
+                    upstream_branch: "main".to_owned(),
+                    upstream_oid: Some("abcdef1234567890".to_owned()),
+                },
+            ),
+            PendingAction::new(
+                rebase_plan("feature/new", &branch),
+                PendingPayload::Rebase {
+                    base: branch,
+                    target,
+                },
+            ),
+        ];
+
+        for action in actions {
+            let mut app = App::new();
+            let payload = action.payload.clone();
+            app.pending_confirmation = Some(action);
+
+            app.handle_key(key(KeyCode::Char('y')));
+
+            assert_eq!(
+                app.pending_confirmation
+                    .as_ref()
+                    .map(|action| &action.payload),
+                Some(&payload)
+            );
+            assert_eq!(
+                app.details,
+                "Explicit confirmation required: press uppercase Y to confirm or n to cancel."
+            );
+        }
     }
 
     #[test]
