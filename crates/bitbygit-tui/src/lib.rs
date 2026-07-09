@@ -1954,7 +1954,16 @@ impl OperationPlanner {
             .map_err(open_pull_request_gh_error)?;
         let existing_url = existing
             .iter()
-            .find(|pull_request| pull_request.base_ref_name == base)
+            .find(|pull_request| {
+                pull_request.base_ref_name == base
+                    && pull_request.head_ref_name == branch
+                    && pull_request
+                        .head_repository
+                        .as_ref()
+                        .is_some_and(|head_repository| {
+                            head_repository.name_with_owner == repository.name_with_owner
+                        })
+            })
             .map(|pull_request| pull_request.url.as_str());
         let title = branch.clone();
         let request = OperationRequest::OpenPullRequest {
@@ -2784,7 +2793,16 @@ impl PlanExecutor {
             .existing_pull_requests(branch)
             .map_err(StepExecutionError::GitHub)?
             .into_iter()
-            .find(|pull_request| pull_request.base_ref_name == *base)
+            .find(|pull_request| {
+                pull_request.base_ref_name == *base
+                    && pull_request.head_ref_name == *branch
+                    && pull_request
+                        .head_repository
+                        .as_ref()
+                        .is_some_and(|head_repository| {
+                            head_repository.name_with_owner == current_repository.name_with_owner
+                        })
+            })
         {
             return Ok(ExecutionOutput::PullRequest {
                 url: existing.url,
@@ -2804,7 +2822,16 @@ impl PlanExecutor {
             Err(error) => match github.existing_pull_requests(branch) {
                 Ok(existing) => existing
                     .into_iter()
-                    .find(|pull_request| pull_request.base_ref_name == *base)
+                    .find(|pull_request| {
+                        pull_request.base_ref_name == *base
+                            && pull_request.head_ref_name == *branch
+                            && pull_request.head_repository.as_ref().is_some_and(
+                                |head_repository| {
+                                    head_repository.name_with_owner
+                                        == current_repository.name_with_owner
+                                },
+                            )
+                    })
                     .map(|pull_request| ExecutionOutput::PullRequest {
                         url: pull_request.url,
                         existing: true,
@@ -4049,6 +4076,40 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_from_another_fork_is_not_surfaced() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-fork-collision")?;
+        let fake_gh = fake_gh_with_pull_requests(
+            "open-pr-fork-collision",
+            "[{\"number\":42,\"url\":\"https://github.com/bob/repo/pull/42\",\"title\":\"Other fork PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\",\"headRepository\":{\"nameWithOwner\":\"bob/repo\"}}]",
+            true,
+        )?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+        };
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        assert!(!operation.plan.preview_text().contains("pull/42"));
+        let execution = PlanExecutor::with_audit_paths(
+            &repo,
+            isolated_store_paths("open-pr-fork-collision-audit")?,
+        )
+        .execute(&operation.plan, operation.context);
+
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert_eq!(
+            execution.message(),
+            "Pull request created: https://github.com/octo/repo/pull/43"
+        );
+        assert!(
+            std::fs::read_to_string(fake_gh.with_file_name("invocations"))?.contains("pr:create")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn open_pull_request_plan_encodes_compare_ref_names() {
         let plan = open_pull_request_plan(
             OperationRequest::OpenPullRequest {
@@ -4892,7 +4953,7 @@ mod tests {
 
     fn fake_gh(name: &str, existing: bool) -> Result<PathBuf, Box<dyn Error>> {
         let pull_requests = if existing {
-            "[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\"}]"
+            "[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\",\"headRepository\":{\"nameWithOwner\":\"octo/repo\"}}]"
         } else {
             "[]"
         };

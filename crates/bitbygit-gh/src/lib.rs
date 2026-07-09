@@ -82,7 +82,7 @@ impl GitHub {
             "--limit".to_owned(),
             "0".to_owned(),
             "--json".to_owned(),
-            "number,url,title,baseRefName,headRefName".to_owned(),
+            "number,url,title,baseRefName,headRefName,headRepository".to_owned(),
         ])?;
         parse_json(&output, "pull request query")
     }
@@ -202,6 +202,14 @@ pub struct PullRequest {
     pub base_ref_name: String,
     #[serde(rename = "headRefName")]
     pub head_ref_name: String,
+    #[serde(rename = "headRepository")]
+    pub head_repository: Option<PullRequestRepository>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRequestRepository {
+    #[serde(rename = "nameWithOwner")]
+    pub name_with_owner: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,7 +391,7 @@ mod tests {
     #[test]
     fn queries_repository_and_all_existing_pull_requests() -> Result<(), Box<dyn Error>> {
         let fake = FakeGh::new(
-            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\npr:list) printf '%s\\n' '[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature\"}]' ;;\nesac",
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\npr:list) printf '%s\\n' '[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRepository\":{\"nameWithOwner\":\"octo/repo\"}}]' ;;\nesac",
         )?;
         let github = fake.github();
 
@@ -395,8 +403,15 @@ mod tests {
         assert_eq!(pull_requests.len(), 1);
         assert_eq!(pull_requests[0].number, 42);
         assert_eq!(pull_requests[0].url, "https://github.com/octo/repo/pull/42");
+        assert_eq!(
+            pull_requests[0]
+                .head_repository
+                .as_ref()
+                .map(|repository| repository.name_with_owner.as_str()),
+            Some("octo/repo")
+        );
         assert!(fake.invocations()?.contains(
-            "pr\u{1f}list\u{1f}--head\u{1f}feature\u{1f}--state\u{1f}open\u{1f}--limit\u{1f}0\u{1f}--json\u{1f}number,url,title,baseRefName,headRefName\u{1f}\n"
+            "pr\u{1f}list\u{1f}--head\u{1f}feature\u{1f}--state\u{1f}open\u{1f}--limit\u{1f}0\u{1f}--json\u{1f}number,url,title,baseRefName,headRefName,headRepository\u{1f}\n"
         ));
         assert_eq!(fake.prompt_values()?, "1\n1\n1\n1\n1\n1\n");
         Ok(())
