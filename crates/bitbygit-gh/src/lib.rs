@@ -118,17 +118,19 @@ impl GitHub {
     }
 
     fn run_status(&self, args: Vec<String>) -> Result<(), GhError> {
-        let status = self.command(&args).status().map_err(|source| {
+        let output = self.command(&args).output().map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
                 GhError::MissingCli
             } else {
                 GhError::Io { source }
             }
         })?;
-        if status.success() {
+        if output.status.success() {
             Ok(())
         } else {
-            Err(GhError::CommandFailed { status })
+            Err(GhError::CommandFailed {
+                status: output.status,
+            })
         }
     }
 
@@ -322,6 +324,35 @@ mod tests {
         assert_eq!(status, GhSetupStatus::NotAuthenticated);
         assert_eq!(status.guidance(), Some(AUTHENTICATE_GH_GUIDANCE));
         assert_eq!(fake.prompt_values()?, "1\n1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn setup_checks_do_not_expose_command_output() -> Result<(), Box<dyn Error>> {
+        const MARKER: &str = "setup-check-output-must-not-be-exposed";
+        const CHILD_ENV: &str = "BITBYGIT_GH_SETUP_OUTPUT_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let fake = FakeGh::new(&format!(
+                "case \"$1:$2\" in\n--version:*) printf '%s\\n' '{MARKER}'; printf '%s\\n' '{MARKER}' >&2; exit 0 ;;\nauth:status) printf '%s\\n' '{MARKER}'; printf '%s\\n' '{MARKER}' >&2; exit 0 ;;\nrepo:view) printf '%s\\n' '{{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}' ;;\nesac"
+            ))?;
+
+            fake.github().repository()?;
+            return Ok(());
+        }
+
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::setup_checks_do_not_expose_command_output",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()?;
+
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(MARKER));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(MARKER));
         Ok(())
     }
 
