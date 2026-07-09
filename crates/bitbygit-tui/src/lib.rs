@@ -24,10 +24,24 @@ use bitbygit_git::{
     BranchInfo, BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head,
     HeadTarget, StatusEntry, StatusEntryType,
 };
-use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
+use bitbygit_store::{AuditEntry, LocalStore, RepoId, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
+const MAX_AUDIT_MESSAGE_LEN: usize = 512;
 const UNSUPPORTED_PROMPT: &str = "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, commit -m \"message\", fetch, push, pull, or pull --rebase";
+const AUDIT_SECRET_MARKERS: &[&str] = &[
+    "authorization",
+    "credential",
+    "github_pat_",
+    "gho_",
+    "ghp_",
+    "glpat-",
+    "oauth",
+    "passwd",
+    "password",
+    "secret",
+    "token",
+];
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
@@ -2039,7 +2053,8 @@ impl PlanExecutor {
         step: &OperationStep,
         context: &ExecutionContext,
     ) -> StepExecutionResult {
-        let audit = match self.audit.begin(step.kind.audit_operation()) {
+        let repo_id = self.audit_repo_id();
+        let audit = match self.audit.begin(repo_id, step.kind.audit_operation()) {
             Ok(audit) => audit,
             Err(error) => {
                 return StepExecutionResult {
@@ -2105,6 +2120,13 @@ impl PlanExecutor {
 
     fn git(&self) -> Git {
         Git::new(self.repo_root.clone())
+    }
+
+    fn audit_repo_id(&self) -> Option<RepoId> {
+        self.git()
+            .repo_root()
+            .ok()
+            .map(|root| RepoId::from_path(&root))
     }
 
     fn run_commit_step(
@@ -2372,11 +2394,13 @@ enum AuditDestination {
 }
 
 impl AuditDestination {
-    fn begin(&self, operation: &str) -> Result<PendingAudit, String> {
+    fn begin(&self, repo_id: Option<RepoId>, operation: &str) -> Result<PendingAudit, String> {
         match self {
-            Self::Environment => begin_audit_operation(operation),
+            Self::Environment => begin_audit_operation(repo_id, operation),
             #[cfg(test)]
-            Self::Paths(paths) => begin_audit_operation_with_paths(operation, paths.clone()),
+            Self::Paths(paths) => {
+                begin_audit_operation_with_paths(repo_id, operation, paths.clone())
+            }
         }
     }
 }
@@ -2724,7 +2748,7 @@ impl AuditTerminalResult {
     fn error(message: String) -> Self {
         Self {
             result_label: "error",
-            message,
+            message: sanitize_audit_message(&message),
         }
     }
 
@@ -2736,30 +2760,33 @@ impl AuditTerminalResult {
     }
 }
 
-fn begin_audit_operation(operation: &str) -> Result<PendingAudit, String> {
+fn begin_audit_operation(repo_id: Option<RepoId>, operation: &str) -> Result<PendingAudit, String> {
     let paths = StorePaths::from_environment()
         .map_err(|error| format!("audit failed before operation: {error}"))?;
-    begin_audit_operation_with_paths(operation, paths)
+    begin_audit_operation_with_paths(repo_id, operation, paths)
 }
 
 fn begin_audit_operation_with_paths(
+    repo_id: Option<RepoId>,
     operation: &str,
     paths: StorePaths,
 ) -> Result<PendingAudit, String> {
     let store = LocalStore::open(paths)
         .map_err(|error| format!("audit failed before operation: {error}"))?;
-    let entry = AuditEntry::new(None, operation, "started", "pending")
+    let entry = AuditEntry::new(repo_id.clone(), operation, "started", "pending")
         .map_err(|error| format!("audit failed before operation: {error}"))?;
     store
         .append_audit(entry)
         .map_err(|error| format!("audit failed before operation: {error}"))?;
     Ok(PendingAudit {
+        repo_id,
         operation: operation.to_owned(),
         store,
     })
 }
 
 struct PendingAudit {
+    repo_id: Option<RepoId>,
     operation: String,
     store: LocalStore,
 }
@@ -2767,7 +2794,7 @@ struct PendingAudit {
 impl PendingAudit {
     fn finish(self, result: &AuditTerminalResult) -> Result<(), String> {
         let entry = AuditEntry::new(
-            None,
+            self.repo_id,
             self.operation,
             result.result_label,
             result.message.clone(),
@@ -2777,6 +2804,52 @@ impl PendingAudit {
             .append_audit(entry)
             .map_err(|error| format!("audit failed: {error}"))
     }
+}
+
+fn sanitize_audit_message(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = normalized
+        .split(' ')
+        .filter(|part| !part.is_empty())
+        .map(redact_audit_word)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sanitized = if redacted.is_empty() {
+        "empty message".to_owned()
+    } else {
+        redacted
+    };
+    truncate_audit_message(&sanitized)
+}
+
+fn redact_audit_word(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    if !AUDIT_SECRET_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return word.to_owned();
+    }
+
+    if let Some((key, _value)) = word.split_once('=') {
+        return format!("{key}=[redacted]");
+    }
+    if let Some((key, _value)) = word.split_once(':') {
+        return format!("{key}:[redacted]");
+    }
+    "[redacted]".to_owned()
+}
+
+fn truncate_audit_message(message: &str) -> String {
+    let mut output = String::new();
+    for (index, character) in message.chars().enumerate() {
+        if index == MAX_AUDIT_MESSAGE_LEN {
+            output.push_str("...");
+            return output;
+        }
+        output.push(character);
+    }
+    output
 }
 
 fn sanitized_git_error(error: &GitError) -> String {
@@ -3446,7 +3519,7 @@ mod tests {
             "unstage_all",
             "commit",
         ] {
-            let audit = begin_audit_operation_with_paths(operation, paths.clone())?;
+            let audit = begin_audit_operation_with_paths(None, operation, paths.clone())?;
             audit.finish(&result)?;
         }
 
@@ -3492,7 +3565,7 @@ mod tests {
         let paths = isolated_store_paths("failed-stage-audit")?;
         let result = AuditTerminalResult::error("operation blocked: test failure".to_owned());
 
-        let audit = begin_audit_operation_with_paths("stage_all", paths.clone())?;
+        let audit = begin_audit_operation_with_paths(None, "stage_all", paths.clone())?;
         let audit_result = audit.finish(&result);
 
         assert!(audit_result.is_ok());
@@ -3521,7 +3594,7 @@ mod tests {
         });
         let result = AuditTerminalResult::error(error.audit_message());
 
-        let audit = begin_audit_operation_with_paths("commit", paths.clone())?;
+        let audit = begin_audit_operation_with_paths(None, "commit", paths.clone())?;
         let audit_result = audit.finish(&result);
 
         assert!(audit_result.is_ok());
@@ -3531,6 +3604,28 @@ mod tests {
         assert!(entries[1].message.contains("git failed with status"));
         assert!(!entries[1].message.contains("raw stdout token"));
         assert!(!entries[1].message.contains("raw stderr secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_messages_redact_common_secret_markers() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("redacted-audit")?;
+        let result = AuditTerminalResult::error(
+            "credential helper failed token=raw-token secret=raw-secret Authorization: gho_raw"
+                .to_owned(),
+        );
+
+        let audit = begin_audit_operation_with_paths(None, "push", paths.clone())?;
+        let audit_result = audit.finish(&result);
+
+        assert!(audit_result.is_ok());
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert!(!entries[1].message.contains("raw-token"));
+        assert!(!entries[1].message.contains("raw-secret"));
+        assert!(!entries[1].message.contains("gho_raw"));
+        assert!(!entries[1].message.contains('\n'));
+        assert!(entries[1].message.contains("[redacted]"));
         Ok(())
     }
 
@@ -3617,6 +3712,12 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].result, "started");
         assert_eq!(entries[1].result, "ok");
+        let expected_repo_id = Some(RepoId::from_path(&repo));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.repo_id.as_ref() == expected_repo_id.as_ref())
+        );
         Ok(())
     }
 
