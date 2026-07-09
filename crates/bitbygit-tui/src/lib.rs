@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use bitbygit_core::{
     ConfirmationRequirement, OperationKind, OperationPlan, OperationRequest, OperationStep,
     RiskLevel,
+    prompt_parser::{ParsedPrompt, UNSUPPORTED_PROMPT_MESSAGE, parse_prompt},
 };
 use bitbygit_git::{
     BranchInfo, BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head,
@@ -28,7 +29,6 @@ use bitbygit_store::{AuditEntry, LocalStore, RepoId, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
 const MAX_AUDIT_MESSAGE_LEN: usize = 512;
-const UNSUPPORTED_PROMPT: &str = "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, commit -m \"message\", fetch, push, pull, or pull --rebase";
 const AUDIT_SECRET_MARKERS: &[&str] = &[
     "authorization",
     "credential",
@@ -445,9 +445,16 @@ impl App {
 
     fn submit_prompt(&mut self) {
         let request = match parse_prompt(&self.prompt) {
-            Ok(request) => request,
+            Ok(ParsedPrompt::Single(request)) => request,
+            Ok(ParsedPrompt::Sequence(requests)) => {
+                self.details = format!(
+                    "Prompt sequences are parsed but not executable yet ({} steps). Run one prompt at a time for now.",
+                    requests.len()
+                );
+                return;
+            }
             Err(error) => {
-                self.details = error;
+                self.details = error.to_string();
                 return;
             }
         };
@@ -469,7 +476,7 @@ impl App {
             | OperationRequest::UnstagePaths { .. }
             | OperationRequest::StageAll
             | OperationRequest::UnstageAll => {
-                self.details = UNSUPPORTED_PROMPT.to_owned();
+                self.details = UNSUPPORTED_PROMPT_MESSAGE.to_owned();
             }
         }
     }
@@ -1775,75 +1782,6 @@ fn validate_pull_plan(
     Ok(())
 }
 
-fn parse_prompt(input: &str) -> Result<OperationRequest, String> {
-    let trimmed = input.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    match lower.as_str() {
-        "branches" => Ok(OperationRequest::Branches),
-        "fetch" => Ok(OperationRequest::Fetch),
-        "push" => Ok(OperationRequest::Push),
-        "pull" => Ok(OperationRequest::Pull { rebase: false }),
-        "pull --rebase" | "pull rebase" => Ok(OperationRequest::Pull { rebase: true }),
-        _ if lower.starts_with("checkout ") => parse_one_arg_prompt(trimmed, "checkout")
-            .map(|branch| OperationRequest::Checkout { branch }),
-        _ if lower.starts_with("merge ") => {
-            parse_one_arg_prompt(trimmed, "merge").map(|branch| OperationRequest::Merge { branch })
-        }
-        _ if lower.starts_with("rebase ") => {
-            parse_one_arg_prompt(trimmed, "rebase").map(|base| OperationRequest::Rebase { base })
-        }
-        _ if lower.starts_with("branch ") => parse_branch_prompt(trimmed),
-        _ if lower == "commit" || lower.starts_with("commit ") => {
-            parse_commit_prompt(trimmed).map(|message| OperationRequest::Commit { message })
-        }
-        _ => Err(UNSUPPORTED_PROMPT.to_owned()),
-    }
-}
-
-fn parse_one_arg_prompt(input: &str, command: &str) -> Result<String, String> {
-    let Some(rest) = input.get(command.len()..) else {
-        return Err(format!("Expected: {command} <branch>"));
-    };
-    parse_branch_arg(rest.trim(), &format!("Expected: {command} <branch>"))
-}
-
-fn parse_branch_prompt(input: &str) -> Result<OperationRequest, String> {
-    let Some(rest) = input.get("branch".len()..) else {
-        return Err("Expected: branch <name> or branch <name> from <base>".to_owned());
-    };
-    let parts = rest.split_whitespace().collect::<Vec<_>>();
-    match parts.as_slice() {
-        [branch] if branch.eq_ignore_ascii_case("list") => {
-            Err("Use `branches` to list branches.".to_owned())
-        }
-        [branch] => Ok(OperationRequest::CreateBranch {
-            branch: parse_branch_arg(branch, "Expected: branch <name>")?,
-            base: None,
-        }),
-        [branch, keyword, base] if keyword.eq_ignore_ascii_case("from") => {
-            Ok(OperationRequest::CreateBranch {
-                branch: parse_branch_arg(branch, "Expected: branch <name> from <base>")?,
-                base: Some(parse_branch_arg(
-                    base,
-                    "Expected: branch <name> from <base>",
-                )?),
-            })
-        }
-        _ => Err("Expected: branch <name> or branch <name> from <base>".to_owned()),
-    }
-}
-
-fn parse_branch_arg(value: &str, usage: &str) -> Result<String, String> {
-    if value.is_empty()
-        || value.starts_with('-')
-        || value.contains(char::is_whitespace)
-        || value.contains('\0')
-    {
-        return Err(usage.to_owned());
-    }
-    Ok(value.to_owned())
-}
-
 fn status_visible_len(area: Rect) -> usize {
     area.height.saturating_sub(2).max(1) as usize
 }
@@ -2862,48 +2800,6 @@ fn sanitized_git_error(error: &GitError) -> String {
     }
 }
 
-fn parse_commit_prompt(input: &str) -> Result<String, String> {
-    let trimmed = input.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower != "commit" && !lower.starts_with("commit ") {
-        return Err("Unsupported prompt. Try: commit -m \"message\"".to_owned());
-    }
-    let Some(rest) = trimmed.get("commit".len()..) else {
-        return Err("Unsupported prompt. Try: commit -m \"message\"".to_owned());
-    };
-    let mut message = rest.trim_start();
-    if message.is_empty() {
-        return Err("Commit message required. Try: commit -m \"message\"".to_owned());
-    }
-    if message == "-m" {
-        message = "";
-    } else if let Some(after_flag) = message.strip_prefix("-m ") {
-        message = after_flag.trim_start();
-    }
-    parse_commit_message(message)
-}
-
-fn parse_commit_message(input: &str) -> Result<String, String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err("Commit message required. Try: commit -m \"message\"".to_owned());
-    }
-    if let Some(rest) = trimmed.strip_prefix('"') {
-        let Some(end) = rest.find('"') else {
-            return Err("Unclosed commit message quote.".to_owned());
-        };
-        if !rest[end + 1..].trim().is_empty() {
-            return Err("Unexpected text after commit message.".to_owned());
-        }
-        let message = &rest[..end];
-        if message.trim().is_empty() {
-            return Err("Commit message cannot be empty.".to_owned());
-        }
-        return Ok(message.to_owned());
-    }
-    Ok(trimmed.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3041,95 +2937,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_commit_prompt_with_message() {
-        assert_eq!(
-            parse_commit_prompt("commit -m \"fix auth and routing\""),
-            Ok("fix auth and routing".to_owned())
-        );
-        assert_eq!(
-            parse_commit_prompt("commit ship staged work"),
-            Ok("ship staged work".to_owned())
-        );
-    }
+    fn prompt_sequences_are_not_executed_yet() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        app.prompt = "fetch and push".to_owned();
 
-    #[test]
-    fn rejects_invalid_commit_prompts() {
-        assert!(parse_commit_prompt("commit").is_err());
-        assert!(parse_commit_prompt("commit -m \"").is_err());
-        assert!(parse_commit_prompt("commit -m \"message\" trailing").is_err());
-        assert!(parse_commit_prompt("commitment -m \"message\"").is_err());
-        assert!(parse_commit_prompt("git commit -m \"message\"").is_err());
-    }
+        app.submit_prompt();
 
-    #[test]
-    fn parses_sync_prompts() {
-        assert_eq!(parse_prompt("fetch"), Ok(OperationRequest::Fetch));
-        assert_eq!(parse_prompt("push"), Ok(OperationRequest::Push));
-        assert_eq!(
-            parse_prompt("pull"),
-            Ok(OperationRequest::Pull { rebase: false })
+        assert!(
+            app.details
+                .contains("Prompt sequences are parsed but not executable yet")
         );
-        assert_eq!(
-            parse_prompt("pull --rebase"),
-            Ok(OperationRequest::Pull { rebase: true })
-        );
-        assert_eq!(
-            parse_prompt("pull rebase"),
-            Ok(OperationRequest::Pull { rebase: true })
-        );
-        assert_eq!(
-            parse_prompt("commit -m \"sync docs\""),
-            Ok(OperationRequest::Commit {
-                message: "sync docs".to_owned()
-            })
-        );
-    }
-
-    #[test]
-    fn parses_branch_prompts() {
-        assert_eq!(parse_prompt("branches"), Ok(OperationRequest::Branches));
-        assert_eq!(
-            parse_prompt("checkout feature/auth"),
-            Ok(OperationRequest::Checkout {
-                branch: "feature/auth".to_owned()
-            })
-        );
-        assert_eq!(
-            parse_prompt("branch feature/auth"),
-            Ok(OperationRequest::CreateBranch {
-                branch: "feature/auth".to_owned(),
-                base: None,
-            })
-        );
-        assert!(parse_prompt("branch list").is_err());
-        assert_eq!(
-            parse_prompt("branch feature/auth from origin/main"),
-            Ok(OperationRequest::CreateBranch {
-                branch: "feature/auth".to_owned(),
-                base: Some("origin/main".to_owned()),
-            })
-        );
-        assert_eq!(
-            parse_prompt("merge feature/auth"),
-            Ok(OperationRequest::Merge {
-                branch: "feature/auth".to_owned()
-            })
-        );
-        assert_eq!(
-            parse_prompt("rebase origin/main"),
-            Ok(OperationRequest::Rebase {
-                base: "origin/main".to_owned()
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_raw_git_sync_prompts() {
-        assert!(parse_prompt("git push").is_err());
-        assert!(parse_prompt("push --force").is_err());
-        assert!(parse_prompt("pull --ff-only").is_err());
-        assert!(parse_prompt("checkout --detach").is_err());
-        assert!(parse_prompt("branch feature from").is_err());
+        assert_eq!(app.operation_queue.pending(), None);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+pub mod prompt_parser;
+
 pub const APP_NAME: &str = "bitbygit";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
