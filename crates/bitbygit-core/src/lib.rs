@@ -162,6 +162,7 @@ pub struct OperationStep {
     pub risk_level: RiskLevel,
     pub summary: String,
     pub details: Vec<String>,
+    pub continue_on_failure: bool,
 }
 
 impl OperationStep {
@@ -171,11 +172,17 @@ impl OperationStep {
             risk_level,
             summary: summary.into(),
             details: Vec::new(),
+            continue_on_failure: false,
         }
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.details.push(detail.into());
+        self
+    }
+
+    pub fn allow_safe_continuation_after_failure(mut self) -> Self {
+        self.continue_on_failure = true;
         self
     }
 }
