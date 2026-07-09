@@ -184,12 +184,20 @@ Success condition:
 
 ## Phase 10: Deterministic prompt parser
 
+Status:
+
+- merged as part of [#12](https://github.com/cosentinode/bitbygit/issues/12)
+
 Must have:
 
-- parse simple commands such as `commit`, `commit and push`, `fetch`, `push`,
-  `open pr`, and `commit and push and open PR`
+- parse simple commands such as `branches`, `checkout <branch>`,
+  `branch <name>`, `merge <branch>`, `rebase <base>`, `commit -m "message"`,
+  `fetch`, `push`, `pull`, `pull --rebase`, and safe non-provider sequences
+  such as `commit -m "message" and push`
 - reject unsupported prompts safely
 - produce typed plans only
+- cover parser behavior with golden tests and keep prompt/manual planner output
+  aligned
 
 Success condition:
 
@@ -203,6 +211,9 @@ Must have:
 - create pull request for current branch
 - confirm base branch
 - surface PR URL
+- add `open pr`, `open pull request`, and `commit and push and open pr` prompt
+  execution after the GitHub provider integration in
+  [#13](https://github.com/cosentinode/bitbygit/issues/13)
 
 Success condition:
 

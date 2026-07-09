@@ -29,8 +29,11 @@ keeping risky operations visible, typed, previewed, and confirmed.
 
 ## Current Status
 
-The repository has merged through Phase 9 operation planner, preview, queue,
-execution, and audit work. See
+The repository has merged through Phase 10 deterministic prompt parser work as
+part of [#12](https://github.com/cosentinode/bitbygit/issues/12), including
+golden parser tests, manual planner parity, and safe non-provider multi-step
+prompts. Pull request creation from `open pr` remains Phase 11 work in
+[#13](https://github.com/cosentinode/bitbygit/issues/13). See
 [`docs/mvp-phases.md`](docs/mvp-phases.md) for the implementation roadmap.
 
 ## Development
