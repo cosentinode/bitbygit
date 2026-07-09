@@ -37,6 +37,7 @@ Medium-risk operations require a visible plan and confirmation:
   rebasing
 - create branch
 - checkout branch with a clean working tree
+- fast-forward-only merge with a clean working tree
 - open pull request
 
 Fast-forward pull detection should be implementation-specific, such as fetch
@@ -48,7 +49,7 @@ title, and target URL before execution.
 
 High-risk operations require explicit confirmation and must explain the reason:
 
-- merge
+- merge that would create a merge commit or conflicts
 - rebase
 - pull with rebase
 - pull that would create a merge commit

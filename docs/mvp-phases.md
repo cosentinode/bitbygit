@@ -130,7 +130,7 @@ Success condition:
 
 Status:
 
-- in progress
+- merged
 
 Must have:
 
@@ -145,6 +145,10 @@ Success condition:
 - common remote sync workflows are safe and clear
 
 ## Phase 8: Branch workflows
+
+Status:
+
+- in progress
 
 Must have:
 

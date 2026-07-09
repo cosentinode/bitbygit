@@ -22,13 +22,17 @@ or responsive layout behavior.
    runs and refreshes status.
 10. Focus the prompt and enter `push`, `pull`, and `pull --rebase`; confirm
     visible risky plans can be cancelled with `n`.
-11. Press `Esc`, `q` outside the prompt, and `Ctrl+C` in separate runs; each should
+11. Focus the prompt and enter `branches`, `checkout <branch>`,
+    `branch <name>`, `merge <branch>`, and `rebase <base>` in a clean test repo;
+    confirm branch-changing plans are visible and cancellable with `n`.
+12. Press `Esc`, `q` outside the prompt, and `Ctrl+C` in separate runs; each should
     exit cleanly.
-12. After exit, confirm the shell prompt, cursor, mouse behavior, and terminal echo
+13. After exit, confirm the shell prompt, cursor, mouse behavior, and terminal echo
     are restored.
 
 ## Automated Coverage
 
 Unit tests cover focus cycling, compact layout behavior, prompt input guards,
-mouse focus/selection, guarded commit and sync prompt parsing, branch summaries,
-and render smoke tests with `ratatui`'s test backend.
+mouse focus/selection, guarded commit, sync and branch prompt parsing, branch
+summaries, typed branch workflow temp-repo behavior, and render smoke tests with
+`ratatui`'s test backend.

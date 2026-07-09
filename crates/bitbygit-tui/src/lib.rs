@@ -16,8 +16,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use bitbygit_git::{
-    BranchState, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget, StatusEntry,
-    StatusEntryType,
+    BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget,
+    StatusEntry, StatusEntryType,
 };
 use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
@@ -384,6 +384,10 @@ impl App {
                         | PendingAction::PushSetUpstream { .. }
                         | PendingAction::Pull { .. }
                         | PendingAction::PullRebase { .. } => unreachable!(),
+                        PendingAction::Checkout { .. }
+                        | PendingAction::CreateBranch { .. }
+                        | PendingAction::Merge { .. }
+                        | PendingAction::Rebase { .. } => unreachable!(),
                     }
                 })
             }
@@ -507,6 +511,28 @@ impl App {
                 Ok(_current_status) => "Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned(),
                 Err(error) => format!("Unable to validate commit plan: {error}"),
             },
+            PendingAction::Checkout { branch, target } => {
+                run_audited_git_operation_with_output("checkout", "checkout_branch", || {
+                    Git::new(current_dir()).checkout_branch(&branch, &target)
+                })
+            }
+            PendingAction::CreateBranch {
+                branch,
+                base,
+                target,
+            } => run_audited_git_operation_with_output("create branch", "create_branch", || {
+                Git::new(current_dir()).create_branch(&branch, base.as_ref(), &target)
+            }),
+            PendingAction::Merge { branch, target } => {
+                run_audited_git_operation_with_output("merge", "merge_ff_only", || {
+                    Git::new(current_dir()).merge_ff_only(&branch, &target)
+                })
+            }
+            PendingAction::Rebase { base, target } => {
+                run_audited_git_operation_with_output("rebase", "rebase", || {
+                    Git::new(current_dir()).rebase_onto(&base, &target)
+                })
+            }
         };
         self.refresh_status();
         self.details = message;
@@ -526,6 +552,13 @@ impl App {
             PromptCommand::Push => self.prepare_push(),
             PromptCommand::Pull => self.prepare_pull(false),
             PromptCommand::PullRebase => self.prepare_pull(true),
+            PromptCommand::Branches => self.show_branches(),
+            PromptCommand::Checkout(branch) => self.prepare_checkout(branch),
+            PromptCommand::CreateBranch { branch, base } => {
+                self.prepare_create_branch(branch, base)
+            }
+            PromptCommand::Merge(branch) => self.prepare_merge(branch),
+            PromptCommand::Rebase(base) => self.prepare_rebase(base),
         }
     }
 
@@ -815,6 +848,224 @@ impl App {
         }
     }
 
+    fn show_branches(&mut self) {
+        self.prompt.clear();
+        match Git::new(current_dir()).branches() {
+            Ok(branches) if branches.is_empty() => {
+                self.details = "No branches found.".to_owned();
+            }
+            Ok(branches) => {
+                let lines = branches
+                    .iter()
+                    .map(|branch| {
+                        let marker = if branch.current { "*" } else { " " };
+                        let kind = match branch.kind {
+                            BranchKind::Local => "local",
+                            BranchKind::Remote => "remote",
+                        };
+                        let upstream = branch
+                            .upstream
+                            .as_ref()
+                            .map(|upstream| format!(" -> {upstream}"))
+                            .unwrap_or_default();
+                        format!("{marker} {kind} {}{upstream}", branch.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.details = format!("Branches:\n{lines}");
+            }
+            Err(error) => self.details = format!("Unable to list branches: {error}"),
+        }
+    }
+
+    fn prepare_checkout(&mut self, branch: String) {
+        if let Err(error) = ensure_clean_branch_worktree("Checkout") {
+            self.details = error;
+            return;
+        }
+        let target = match Git::new(current_dir()).head_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.details = format!("Unable to snapshot checkout target: {error}");
+                return;
+            }
+        };
+        let branch_target = match Git::new(current_dir()).branch_target(&branch) {
+            Ok(Some(branch)) => branch,
+            Ok(None) => {
+                self.details = format!("Checkout blocked: branch {branch} was not found.");
+                return;
+            }
+            Err(error) => {
+                self.details = format!("Unable to prepare checkout plan: {error}");
+                return;
+            }
+        };
+        if let Err(error) =
+            Git::new(current_dir()).ensure_remote_checkout_target_available(&branch_target)
+        {
+            self.details = format!("Checkout blocked: {error}");
+            return;
+        }
+        self.prompt.clear();
+        self.pending_confirmation = Some(PendingAction::Checkout {
+            branch: branch_target.clone(),
+            target,
+        });
+        self.details = format!(
+            "Checkout plan:\n- switch to {} at {}\n- block if the working tree or branch target changes\nPress y to checkout or n to cancel.",
+            branch_target.name,
+            short_oid(&branch_target.oid)
+        );
+    }
+
+    fn prepare_create_branch(&mut self, branch: String, base: Option<String>) {
+        if let Err(error) = ensure_clean_branch_worktree("Create branch") {
+            self.details = error;
+            return;
+        }
+        let target = match Git::new(current_dir()).head_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.details = format!("Unable to snapshot branch target: {error}");
+                return;
+            }
+        };
+        match Git::new(current_dir()).branch_target(&branch) {
+            Ok(Some(_branch)) => {
+                self.details = format!("Create branch blocked: {branch} already exists.");
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.details = format!("Unable to prepare branch plan: {error}");
+                return;
+            }
+        }
+        let base_target = match base {
+            Some(base) => match Git::new(current_dir()).branch_target(&base) {
+                Ok(Some(base)) => Some(base),
+                Ok(None) => {
+                    self.details = format!("Create branch blocked: base {base} was not found.");
+                    return;
+                }
+                Err(error) => {
+                    self.details = format!("Unable to prepare branch base: {error}");
+                    return;
+                }
+            },
+            None => None,
+        };
+        if base_target.is_none() && target.oid.is_none() {
+            self.details =
+                "Create branch blocked: current branch needs a commit before branching.".to_owned();
+            return;
+        }
+        let base_label = base_target
+            .as_ref()
+            .map(|base| format!("{} at {}", base.name, short_oid(&base.oid)))
+            .or_else(|| {
+                target
+                    .oid
+                    .as_ref()
+                    .map(|oid| format!("HEAD at {}", short_oid(oid)))
+            })
+            .unwrap_or_else(|| "unborn HEAD".to_owned());
+        self.prompt.clear();
+        self.pending_confirmation = Some(PendingAction::CreateBranch {
+            branch: branch.clone(),
+            base: base_target,
+            target,
+        });
+        self.details = format!(
+            "Create branch plan:\n- create and switch to {branch}\n- base: {base_label}\n- block if the working tree, current target, or base changes\nPress y to create branch or n to cancel."
+        );
+    }
+
+    fn prepare_merge(&mut self, branch: String) {
+        let current = match current_branch_for_branch_operation("Merge") {
+            Ok(current) => current,
+            Err(error) => {
+                self.details = error;
+                return;
+            }
+        };
+        let target = match Git::new(current_dir()).head_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.details = format!("Unable to snapshot merge target: {error}");
+                return;
+            }
+        };
+        let branch_target = match Git::new(current_dir()).branch_target(&branch) {
+            Ok(Some(branch)) => branch,
+            Ok(None) => {
+                self.details = format!("Merge blocked: branch {branch} was not found.");
+                return;
+            }
+            Err(error) => {
+                self.details = format!("Unable to prepare merge plan: {error}");
+                return;
+            }
+        };
+        if branch_target.name == current {
+            self.details = "Merge blocked: selected branch is already checked out.".to_owned();
+            return;
+        }
+        self.prompt.clear();
+        self.pending_confirmation = Some(PendingAction::Merge {
+            branch: branch_target.clone(),
+            target,
+        });
+        self.details = format!(
+            "Merge plan:\n- fast-forward {current} to {} at {}\n- merge commits and conflicts are out of scope for this guarded action\nPress y to merge or n to cancel.",
+            branch_target.name,
+            short_oid(&branch_target.oid)
+        );
+    }
+
+    fn prepare_rebase(&mut self, base: String) {
+        let current = match current_branch_for_branch_operation("Rebase") {
+            Ok(current) => current,
+            Err(error) => {
+                self.details = error;
+                return;
+            }
+        };
+        let target = match Git::new(current_dir()).head_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.details = format!("Unable to snapshot rebase target: {error}");
+                return;
+            }
+        };
+        let base_target = match Git::new(current_dir()).branch_target(&base) {
+            Ok(Some(base)) => base,
+            Ok(None) => {
+                self.details = format!("Rebase blocked: base {base} was not found.");
+                return;
+            }
+            Err(error) => {
+                self.details = format!("Unable to prepare rebase plan: {error}");
+                return;
+            }
+        };
+        if base_target.name == current {
+            self.details = "Rebase blocked: selected base is already checked out.".to_owned();
+            return;
+        }
+        self.prompt.clear();
+        self.pending_confirmation = Some(PendingAction::Rebase {
+            base: base_target.clone(),
+            target,
+        });
+        self.details = format!(
+            "Rebase plan:\n- rebase {current} onto {} at {}\n- block if the working tree, current target, or base changes\n- Git may stop for conflicts that require manual resolution\nPress y to rebase or n to cancel.",
+            base_target.name,
+            short_oid(&base_target.oid)
+        );
+    }
+
     fn cancel_pending(&mut self) {
         self.pending_confirmation = None;
         self.details = "Operation cancelled.".to_owned();
@@ -882,6 +1133,23 @@ enum PendingAction {
         staged_tree: String,
         target: HeadTarget,
     },
+    Checkout {
+        branch: BranchTarget,
+        target: HeadTarget,
+    },
+    CreateBranch {
+        branch: String,
+        base: Option<BranchTarget>,
+        target: HeadTarget,
+    },
+    Merge {
+        branch: BranchTarget,
+        target: HeadTarget,
+    },
+    Rebase {
+        base: BranchTarget,
+        target: HeadTarget,
+    },
 }
 
 impl PendingAction {
@@ -894,6 +1162,10 @@ impl PendingAction {
             Self::Pull { .. } => "pull",
             Self::PullRebase { .. } => "pull rebase",
             Self::Commit { .. } => "commit",
+            Self::Checkout { .. } => "checkout",
+            Self::CreateBranch { .. } => "create branch",
+            Self::Merge { .. } => "merge",
+            Self::Rebase { .. } => "rebase",
         }
     }
 
@@ -906,6 +1178,10 @@ impl PendingAction {
             Self::Pull { .. } => "pull",
             Self::PullRebase { .. } => "pull_rebase",
             Self::Commit { .. } => "commit",
+            Self::Checkout { .. } => "checkout_branch",
+            Self::CreateBranch { .. } => "create_branch",
+            Self::Merge { .. } => "merge_ff_only",
+            Self::Rebase { .. } => "rebase",
         }
     }
 }
@@ -917,6 +1193,14 @@ enum PromptCommand {
     Push,
     Pull,
     PullRebase,
+    Branches,
+    Checkout(String),
+    CreateBranch {
+        branch: String,
+        base: Option<String>,
+    },
+    Merge(String),
+    Rebase(String),
 }
 
 fn prompt_accepts_modifiers(modifiers: KeyModifiers) -> bool {
@@ -1237,6 +1521,24 @@ fn branch_name(branch: &BranchState) -> Result<String, String> {
     }
 }
 
+fn ensure_clean_branch_worktree(action: &str) -> Result<(), String> {
+    Git::new(current_dir())
+        .ensure_clean_worktree(&action.to_ascii_lowercase())
+        .map_err(|error| format!("{action} blocked: {error}"))
+}
+
+fn current_branch_for_branch_operation(action: &str) -> Result<String, String> {
+    ensure_clean_branch_worktree(action)?;
+    let status = Git::new(current_dir())
+        .status()
+        .map_err(|error| format!("{action} blocked: unable to read repository status: {error}"))?;
+    branch_name(&status.branch).map_err(|error| error.replace("Operation", action))
+}
+
+fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
+}
+
 fn default_remote_name() -> Option<String> {
     let remotes = Git::new(current_dir()).remotes().ok()?;
     remotes
@@ -1330,18 +1632,72 @@ fn parse_prompt(input: &str) -> Result<PromptCommand, String> {
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
+        "branches" => Ok(PromptCommand::Branches),
         "fetch" => Ok(PromptCommand::Fetch),
         "push" => Ok(PromptCommand::Push),
         "pull" => Ok(PromptCommand::Pull),
         "pull --rebase" | "pull rebase" => Ok(PromptCommand::PullRebase),
+        _ if lower.starts_with("checkout ") => parse_one_arg_prompt(trimmed, "checkout")
+            .map(PromptCommand::Checkout),
+        _ if lower.starts_with("merge ") => {
+            parse_one_arg_prompt(trimmed, "merge").map(PromptCommand::Merge)
+        }
+        _ if lower.starts_with("rebase ") => {
+            parse_one_arg_prompt(trimmed, "rebase").map(PromptCommand::Rebase)
+        }
+        _ if lower.starts_with("branch ") => parse_branch_prompt(trimmed),
         _ if lower == "commit" || lower.starts_with("commit ") => {
             parse_commit_prompt(trimmed).map(PromptCommand::Commit)
         }
         _ => Err(
-            "Unsupported prompt. Try: commit -m \"message\", fetch, push, pull, or pull --rebase"
+            "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, commit -m \"message\", fetch, push, pull, or pull --rebase"
                 .to_owned(),
         ),
     }
+}
+
+fn parse_one_arg_prompt(input: &str, command: &str) -> Result<String, String> {
+    let Some(rest) = input.get(command.len()..) else {
+        return Err(format!("Expected: {command} <branch>"));
+    };
+    parse_branch_arg(rest.trim(), &format!("Expected: {command} <branch>"))
+}
+
+fn parse_branch_prompt(input: &str) -> Result<PromptCommand, String> {
+    let Some(rest) = input.get("branch".len()..) else {
+        return Err("Expected: branch <name> or branch <name> from <base>".to_owned());
+    };
+    let parts = rest.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [branch] if branch.eq_ignore_ascii_case("list") => {
+            Err("Use `branches` to list branches.".to_owned())
+        }
+        [branch] => Ok(PromptCommand::CreateBranch {
+            branch: parse_branch_arg(branch, "Expected: branch <name>")?,
+            base: None,
+        }),
+        [branch, keyword, base] if keyword.eq_ignore_ascii_case("from") => {
+            Ok(PromptCommand::CreateBranch {
+                branch: parse_branch_arg(branch, "Expected: branch <name> from <base>")?,
+                base: Some(parse_branch_arg(
+                    base,
+                    "Expected: branch <name> from <base>",
+                )?),
+            })
+        }
+        _ => Err("Expected: branch <name> or branch <name> from <base>".to_owned()),
+    }
+}
+
+fn parse_branch_arg(value: &str, usage: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.contains(char::is_whitespace)
+        || value.contains('\0')
+    {
+        return Err(usage.to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 fn status_visible_len(area: Rect) -> usize {
@@ -1745,10 +2101,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_branch_prompts() {
+        assert_eq!(parse_prompt("branches"), Ok(PromptCommand::Branches));
+        assert_eq!(
+            parse_prompt("checkout feature/auth"),
+            Ok(PromptCommand::Checkout("feature/auth".to_owned()))
+        );
+        assert_eq!(
+            parse_prompt("branch feature/auth"),
+            Ok(PromptCommand::CreateBranch {
+                branch: "feature/auth".to_owned(),
+                base: None,
+            })
+        );
+        assert!(parse_prompt("branch list").is_err());
+        assert_eq!(
+            parse_prompt("branch feature/auth from origin/main"),
+            Ok(PromptCommand::CreateBranch {
+                branch: "feature/auth".to_owned(),
+                base: Some("origin/main".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_prompt("merge feature/auth"),
+            Ok(PromptCommand::Merge("feature/auth".to_owned()))
+        );
+        assert_eq!(
+            parse_prompt("rebase origin/main"),
+            Ok(PromptCommand::Rebase("origin/main".to_owned()))
+        );
+    }
+
+    #[test]
     fn rejects_raw_git_sync_prompts() {
         assert!(parse_prompt("git push").is_err());
         assert!(parse_prompt("push --force").is_err());
         assert!(parse_prompt("pull --ff-only").is_err());
+        assert!(parse_prompt("checkout --detach").is_err());
+        assert!(parse_prompt("branch feature from").is_err());
     }
 
     #[test]
