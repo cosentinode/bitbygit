@@ -15,6 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+use bitbygit_core::{OperationKind, OperationPlan, OperationRequest, OperationStep, RiskLevel};
 use bitbygit_git::{
     BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head, HeadTarget,
     StatusEntry, StatusEntryType,
@@ -22,6 +23,7 @@ use bitbygit_git::{
 use bitbygit_store::{AuditEntry, LocalStore, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
+const UNSUPPORTED_PROMPT: &str = "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, commit -m \"message\", fetch, push, pull, or pull --rebase";
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
@@ -169,12 +171,16 @@ impl App {
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
             KeyCode::Char('a') if self.focus == Focus::Status => {
-                self.pending_confirmation = Some(PendingAction::StageAll);
-                self.details = "Stage all changes? Press y to confirm or n to cancel.".to_owned();
+                let plan = stage_all_plan();
+                self.details = plan.preview_text();
+                self.pending_confirmation =
+                    Some(PendingAction::new(plan, PendingPayload::StageAll));
             }
             KeyCode::Char('A') if self.focus == Focus::Status => {
-                self.pending_confirmation = Some(PendingAction::UnstageAll);
-                self.details = "Unstage all changes? Press y to confirm or n to cancel.".to_owned();
+                let plan = unstage_all_plan();
+                self.details = plan.preview_text();
+                self.pending_confirmation =
+                    Some(PendingAction::new(plan, PendingPayload::UnstageAll));
             }
             KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
             KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
@@ -346,7 +352,8 @@ impl App {
             self.details = "Selected row has no unstaged changes to stage.".to_owned();
             return;
         }
-        let message = run_audited_git_operation("stage", "stage_path", || {
+        let plan = stage_paths_plan(file_path_labels(&file.pathspecs));
+        let message = run_audited_plan_operation(&plan, || {
             Git::new(current_dir()).stage_paths(&file.pathspecs)
         });
         self.refresh_status();
@@ -361,7 +368,8 @@ impl App {
             self.details = "Selected row has no staged changes to unstage.".to_owned();
             return;
         }
-        let message = run_audited_git_operation("unstage", "unstage_path", || {
+        let plan = unstage_paths_plan(file_path_labels(&file.pathspecs));
+        let message = run_audited_plan_operation(&plan, || {
             Git::new(current_dir()).unstage_paths(&file.pathspecs)
         });
         self.refresh_status();
@@ -372,26 +380,15 @@ impl App {
         let Some(action) = self.pending_confirmation.take() else {
             return;
         };
-        let message = match action {
-            action @ (PendingAction::StageAll | PendingAction::UnstageAll) => {
-                run_audited_git_operation(action.label(), action.operation(), || {
-                    let git = Git::new(current_dir());
-                    match action {
-                        PendingAction::StageAll => git.stage_all(),
-                        PendingAction::UnstageAll => git.unstage_all(),
-                        PendingAction::Commit { .. }
-                        | PendingAction::Push { .. }
-                        | PendingAction::PushSetUpstream { .. }
-                        | PendingAction::Pull { .. }
-                        | PendingAction::PullRebase { .. } => unreachable!(),
-                        PendingAction::Checkout { .. }
-                        | PendingAction::CreateBranch { .. }
-                        | PendingAction::Merge { .. }
-                        | PendingAction::Rebase { .. } => unreachable!(),
-                    }
-                })
-            }
-            PendingAction::Push {
+        let PendingAction { plan, payload } = action;
+        let message = match payload {
+            PendingPayload::StageAll => run_audited_plan_operation(&plan, || {
+                Git::new(current_dir()).stage_all()
+            }),
+            PendingPayload::UnstageAll => run_audited_plan_operation(&plan, || {
+                Git::new(current_dir()).unstage_all()
+            }),
+            PendingPayload::Push {
                 local_branch,
                 target,
                 remote,
@@ -399,8 +396,14 @@ impl App {
                 upstream,
                 expected_remote_oid,
                 remote_urls,
-            } => match validate_push_plan(&local_branch, Some(&upstream), &target, &remote, &remote_urls) {
-                Ok(()) => run_audited_git_operation_with_output("push", "push", || {
+            } => match validate_push_plan(
+                &local_branch,
+                Some(&upstream),
+                &target,
+                &remote,
+                &remote_urls,
+            ) {
+                Ok(()) => run_audited_plan_operation_with_output(&plan, || {
                     let source_oid = target.oid.as_deref().ok_or_else(|| GitError::Blocked {
                         message: "push is blocked because the planned branch has no commit"
                             .to_owned(),
@@ -414,7 +417,7 @@ impl App {
                 }),
                 Err(error) => error,
             },
-            PendingAction::PushSetUpstream {
+            PendingPayload::PushSetUpstream {
                 remote,
                 branch,
                 target,
@@ -423,7 +426,7 @@ impl App {
             } => {
                 match validate_push_plan(&branch, None, &target, &remote, &remote_urls) {
                     Ok(()) => {
-                        run_audited_git_operation_with_output("push", "push_set_upstream", || {
+                        run_audited_plan_operation_with_output(&plan, || {
                             let source_oid = target.oid.as_deref().ok_or_else(|| {
                                 GitError::Blocked {
                                     message:
@@ -442,7 +445,7 @@ impl App {
                     Err(error) => error,
                 }
             }
-            PendingAction::Pull {
+            PendingPayload::Pull {
                 local_branch,
                 target,
                 upstream,
@@ -450,7 +453,7 @@ impl App {
                 upstream_branch,
                 upstream_oid,
             } => match validate_pull_plan(false, &local_branch, &upstream, &target) {
-                Ok(()) => run_audited_git_operation_with_output("pull", "pull", || {
+                Ok(()) => run_audited_plan_operation_with_output(&plan, || {
                     Git::new(current_dir()).pull_ff_only_from(
                         &remote,
                         &upstream_branch,
@@ -460,7 +463,7 @@ impl App {
                 }),
                 Err(error) => error,
             },
-            PendingAction::PullRebase {
+            PendingPayload::PullRebase {
                 local_branch,
                 target,
                 upstream,
@@ -468,21 +471,17 @@ impl App {
                 upstream_branch,
                 upstream_oid,
             } => match validate_pull_plan(true, &local_branch, &upstream, &target) {
-                Ok(()) => run_audited_git_operation_with_output(
-                    "pull rebase",
-                    "pull_rebase",
-                    || {
-                        Git::new(current_dir()).pull_rebase_from(
-                            &remote,
-                            &upstream_branch,
-                            upstream_oid.as_deref(),
-                            &target,
-                        )
-                    },
-                ),
+                Ok(()) => run_audited_plan_operation_with_output(&plan, || {
+                    Git::new(current_dir()).pull_rebase_from(
+                        &remote,
+                        &upstream_branch,
+                        upstream_oid.as_deref(),
+                        &target,
+                    )
+                }),
                 Err(error) => error,
             },
-            PendingAction::Commit {
+            PendingPayload::Commit {
                 message,
                 staged_items,
                 staged_tree,
@@ -495,7 +494,7 @@ impl App {
                         (Ok(current_tree), Ok(current_target))
                             if current_tree == staged_tree && current_target == target =>
                         {
-                            run_audited_git_operation_with_output("commit", "commit", || {
+                            run_audited_plan_operation_with_output(&plan, || {
                                 Git::new(current_dir()).commit_staged_tree(
                                     &message,
                                     &staged_tree,
@@ -511,25 +510,25 @@ impl App {
                 Ok(_current_status) => "Commit blocked: staged changes changed since the plan was shown. Re-run the commit prompt.".to_owned(),
                 Err(error) => format!("Unable to validate commit plan: {error}"),
             },
-            PendingAction::Checkout { branch, target } => {
-                run_audited_git_operation_with_output("checkout", "checkout_branch", || {
+            PendingPayload::Checkout { branch, target } => {
+                run_audited_plan_operation_with_output(&plan, || {
                     Git::new(current_dir()).checkout_branch(&branch, &target)
                 })
             }
-            PendingAction::CreateBranch {
+            PendingPayload::CreateBranch {
                 branch,
                 base,
                 target,
-            } => run_audited_git_operation_with_output("create branch", "create_branch", || {
+            } => run_audited_plan_operation_with_output(&plan, || {
                 Git::new(current_dir()).create_branch(&branch, base.as_ref(), &target)
             }),
-            PendingAction::Merge { branch, target } => {
-                run_audited_git_operation_with_output("merge", "merge_ff_only", || {
+            PendingPayload::Merge { branch, target } => {
+                run_audited_plan_operation_with_output(&plan, || {
                     Git::new(current_dir()).merge_ff_only(&branch, &target)
                 })
             }
-            PendingAction::Rebase { base, target } => {
-                run_audited_git_operation_with_output("rebase", "rebase", || {
+            PendingPayload::Rebase { base, target } => {
+                run_audited_plan_operation_with_output(&plan, || {
                     Git::new(current_dir()).rebase_onto(&base, &target)
                 })
             }
@@ -539,26 +538,33 @@ impl App {
     }
 
     fn submit_prompt(&mut self) {
-        let command = match parse_prompt(&self.prompt) {
-            Ok(command) => command,
+        let request = match parse_prompt(&self.prompt) {
+            Ok(request) => request,
             Err(error) => {
                 self.details = error;
                 return;
             }
         };
-        match command {
-            PromptCommand::Commit(message) => self.prepare_commit(message),
-            PromptCommand::Fetch => self.run_fetch(),
-            PromptCommand::Push => self.prepare_push(),
-            PromptCommand::Pull => self.prepare_pull(false),
-            PromptCommand::PullRebase => self.prepare_pull(true),
-            PromptCommand::Branches => self.show_branches(),
-            PromptCommand::Checkout(branch) => self.prepare_checkout(branch),
-            PromptCommand::CreateBranch { branch, base } => {
+        match request {
+            OperationRequest::Commit { message } => self.prepare_commit(message),
+            OperationRequest::Fetch => self.run_fetch(),
+            OperationRequest::Push => self.prepare_push(),
+            OperationRequest::Pull { rebase } => self.prepare_pull(rebase),
+            OperationRequest::Branches => self.show_branches(),
+            OperationRequest::Checkout { branch } => self.prepare_checkout(branch),
+            OperationRequest::CreateBranch { branch, base } => {
                 self.prepare_create_branch(branch, base)
             }
-            PromptCommand::Merge(branch) => self.prepare_merge(branch),
-            PromptCommand::Rebase(base) => self.prepare_rebase(base),
+            OperationRequest::Merge { branch } => self.prepare_merge(branch),
+            OperationRequest::Rebase { base } => self.prepare_rebase(base),
+            OperationRequest::RefreshStatus
+            | OperationRequest::ViewDiff { .. }
+            | OperationRequest::StagePaths { .. }
+            | OperationRequest::UnstagePaths { .. }
+            | OperationRequest::StageAll
+            | OperationRequest::UnstageAll => {
+                self.details = UNSUPPORTED_PROMPT.to_owned();
+            }
         }
     }
 
@@ -591,22 +597,25 @@ impl App {
             }
         };
         let staged_count = staged_items.len();
+        let plan = commit_plan(&message, staged_count);
 
-        self.pending_confirmation = Some(PendingAction::Commit {
-            message: message.clone(),
-            staged_items,
-            staged_tree,
-            target,
-        });
+        self.pending_confirmation = Some(PendingAction::new(
+            plan.clone(),
+            PendingPayload::Commit {
+                message,
+                staged_items,
+                staged_tree,
+                target,
+            },
+        ));
         self.prompt.clear();
-        self.details = format!(
-            "Commit plan:\n- commit {staged_count} staged file(s)\n- message: {message}\nPress y to commit or n to cancel."
-        );
+        self.details = plan.preview_text();
     }
 
     fn run_fetch(&mut self) {
         self.prompt.clear();
-        let message = run_audited_git_operation_with_output("fetch", "fetch", || {
+        let plan = fetch_plan();
+        let message = run_audited_plan_operation_with_output(&plan, || {
             Git::new(current_dir()).fetch_default_remote()
         });
         self.refresh_status();
@@ -683,19 +692,20 @@ impl App {
                             return;
                         }
                     };
-                self.pending_confirmation = Some(PendingAction::Push {
-                    local_branch: branch.clone(),
-                    target: head_target.clone(),
-                    remote,
-                    upstream_branch,
-                    upstream: upstream.clone(),
-                    expected_remote_oid,
-                    remote_urls,
-                });
-                self.details = format!(
-                    "Push plan:\n- push {branch} to {upstream}\n- ahead: {} commit(s)\nPress y to push or n to cancel.",
-                    status.branch.ahead
-                );
+                let plan = push_plan(&branch, upstream, status.branch.ahead);
+                self.pending_confirmation = Some(PendingAction::new(
+                    plan.clone(),
+                    PendingPayload::Push {
+                        local_branch: branch.clone(),
+                        target: head_target.clone(),
+                        remote,
+                        upstream_branch,
+                        upstream: upstream.clone(),
+                        expected_remote_oid,
+                        remote_urls,
+                    },
+                ));
+                self.details = plan.preview_text();
             }
             None => {
                 let Some(remote) = default_remote_name() else {
@@ -724,16 +734,18 @@ impl App {
                             return;
                         }
                     };
-                self.pending_confirmation = Some(PendingAction::PushSetUpstream {
-                    remote: remote.clone(),
-                    branch: branch.clone(),
-                    target: head_target,
-                    expected_remote_oid,
-                    remote_urls,
-                });
-                self.details = format!(
-                    "Push plan:\n- push {branch} to {remote}\n- set upstream to {remote}/{branch}\nPress y to push or n to cancel."
-                );
+                let plan = push_set_upstream_plan(&branch, &remote);
+                self.pending_confirmation = Some(PendingAction::new(
+                    plan.clone(),
+                    PendingPayload::PushSetUpstream {
+                        remote: remote.clone(),
+                        branch: branch.clone(),
+                        target: head_target,
+                        expected_remote_oid,
+                        remote_urls,
+                    },
+                ));
+                self.details = plan.preview_text();
             }
         }
     }
@@ -819,37 +831,43 @@ impl App {
                 }
             };
         self.prompt.clear();
+        let plan = pull_plan(rebase, &upstream, status.branch.behind);
         if rebase {
-            self.pending_confirmation = Some(PendingAction::PullRebase {
-                local_branch,
-                target: head_target,
-                upstream: upstream.clone(),
-                remote,
-                upstream_branch,
-                upstream_oid,
-            });
-            self.details = format!(
-                "Pull rebase plan:\n- rebase current branch onto fetched {upstream}\n- block if the fetched upstream changes before confirmation\n- locally behind: {} commit(s)\nPress y to rebase or n to cancel.",
-                status.branch.behind
-            );
+            self.pending_confirmation = Some(PendingAction::new(
+                plan.clone(),
+                PendingPayload::PullRebase {
+                    local_branch,
+                    target: head_target,
+                    upstream: upstream.clone(),
+                    remote,
+                    upstream_branch,
+                    upstream_oid,
+                },
+            ));
+            self.details = plan.preview_text();
         } else {
-            self.pending_confirmation = Some(PendingAction::Pull {
-                local_branch,
-                target: head_target,
-                upstream: upstream.clone(),
-                remote,
-                upstream_branch,
-                upstream_oid,
-            });
-            self.details = format!(
-                "Pull plan:\n- fast-forward from fetched {upstream}\n- block if the fetched upstream changes before confirmation\n- locally behind: {} commit(s)\nPress y to pull or n to cancel.",
-                status.branch.behind
-            );
+            self.pending_confirmation = Some(PendingAction::new(
+                plan.clone(),
+                PendingPayload::Pull {
+                    local_branch,
+                    target: head_target,
+                    upstream: upstream.clone(),
+                    remote,
+                    upstream_branch,
+                    upstream_oid,
+                },
+            ));
+            self.details = plan.preview_text();
         }
     }
 
     fn show_branches(&mut self) {
         self.prompt.clear();
+        let plan = branches_plan();
+        let Some(_step) = plan.first_step() else {
+            self.details = "Branches blocked: operation plan has no steps.".to_owned();
+            return;
+        };
         match Git::new(current_dir()).branches() {
             Ok(branches) if branches.is_empty() => {
                 self.details = "No branches found.".to_owned();
@@ -908,15 +926,15 @@ impl App {
             return;
         }
         self.prompt.clear();
-        self.pending_confirmation = Some(PendingAction::Checkout {
-            branch: branch_target.clone(),
-            target,
-        });
-        self.details = format!(
-            "Checkout plan:\n- switch to {} at {}\n- block if the working tree or branch target changes\nPress y to checkout or n to cancel.",
-            branch_target.name,
-            short_oid(&branch_target.oid)
-        );
+        let plan = checkout_plan(&branch_target);
+        self.pending_confirmation = Some(PendingAction::new(
+            plan.clone(),
+            PendingPayload::Checkout {
+                branch: branch_target.clone(),
+                target,
+            },
+        ));
+        self.details = plan.preview_text();
     }
 
     fn prepare_create_branch(&mut self, branch: String, base: Option<String>) {
@@ -972,14 +990,16 @@ impl App {
             })
             .unwrap_or_else(|| "unborn HEAD".to_owned());
         self.prompt.clear();
-        self.pending_confirmation = Some(PendingAction::CreateBranch {
-            branch: branch.clone(),
-            base: base_target,
-            target,
-        });
-        self.details = format!(
-            "Create branch plan:\n- create and switch to {branch}\n- base: {base_label}\n- block if the working tree, current target, or base changes\nPress y to create branch or n to cancel."
-        );
+        let plan = create_branch_plan(&branch, base_target.as_ref(), &base_label);
+        self.pending_confirmation = Some(PendingAction::new(
+            plan.clone(),
+            PendingPayload::CreateBranch {
+                branch: branch.clone(),
+                base: base_target,
+                target,
+            },
+        ));
+        self.details = plan.preview_text();
     }
 
     fn prepare_merge(&mut self, branch: String) {
@@ -1013,15 +1033,15 @@ impl App {
             return;
         }
         self.prompt.clear();
-        self.pending_confirmation = Some(PendingAction::Merge {
-            branch: branch_target.clone(),
-            target,
-        });
-        self.details = format!(
-            "Merge plan:\n- fast-forward {current} to {} at {}\n- merge commits and conflicts are out of scope for this guarded action\nPress y to merge or n to cancel.",
-            branch_target.name,
-            short_oid(&branch_target.oid)
-        );
+        let plan = merge_plan(&current, &branch_target);
+        self.pending_confirmation = Some(PendingAction::new(
+            plan.clone(),
+            PendingPayload::Merge {
+                branch: branch_target.clone(),
+                target,
+            },
+        ));
+        self.details = plan.preview_text();
     }
 
     fn prepare_rebase(&mut self, base: String) {
@@ -1055,15 +1075,15 @@ impl App {
             return;
         }
         self.prompt.clear();
-        self.pending_confirmation = Some(PendingAction::Rebase {
-            base: base_target.clone(),
-            target,
-        });
-        self.details = format!(
-            "Rebase plan:\n- rebase {current} onto {} at {}\n- block if the working tree, current target, or base changes\n- Git may stop for conflicts that require manual resolution\nPress y to rebase or n to cancel.",
-            base_target.name,
-            short_oid(&base_target.oid)
-        );
+        let plan = rebase_plan(&current, &base_target);
+        self.pending_confirmation = Some(PendingAction::new(
+            plan.clone(),
+            PendingPayload::Rebase {
+                base: base_target.clone(),
+                target,
+            },
+        ));
+        self.details = plan.preview_text();
     }
 
     fn cancel_pending(&mut self) {
@@ -1092,7 +1112,19 @@ impl App {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PendingAction {
+struct PendingAction {
+    plan: OperationPlan,
+    payload: PendingPayload,
+}
+
+impl PendingAction {
+    fn new(plan: OperationPlan, payload: PendingPayload) -> Self {
+        Self { plan, payload }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingPayload {
     StageAll,
     UnstageAll,
     Push {
@@ -1150,57 +1182,6 @@ enum PendingAction {
         base: BranchTarget,
         target: HeadTarget,
     },
-}
-
-impl PendingAction {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::StageAll => "stage all",
-            Self::UnstageAll => "unstage all",
-            Self::Push { .. } => "push",
-            Self::PushSetUpstream { .. } => "push",
-            Self::Pull { .. } => "pull",
-            Self::PullRebase { .. } => "pull rebase",
-            Self::Commit { .. } => "commit",
-            Self::Checkout { .. } => "checkout",
-            Self::CreateBranch { .. } => "create branch",
-            Self::Merge { .. } => "merge",
-            Self::Rebase { .. } => "rebase",
-        }
-    }
-
-    fn operation(&self) -> &'static str {
-        match self {
-            Self::StageAll => "stage_all",
-            Self::UnstageAll => "unstage_all",
-            Self::Push { .. } => "push",
-            Self::PushSetUpstream { .. } => "push_set_upstream",
-            Self::Pull { .. } => "pull",
-            Self::PullRebase { .. } => "pull_rebase",
-            Self::Commit { .. } => "commit",
-            Self::Checkout { .. } => "checkout_branch",
-            Self::CreateBranch { .. } => "create_branch",
-            Self::Merge { .. } => "merge_ff_only",
-            Self::Rebase { .. } => "rebase",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PromptCommand {
-    Commit(String),
-    Fetch,
-    Push,
-    Pull,
-    PullRebase,
-    Branches,
-    Checkout(String),
-    CreateBranch {
-        branch: String,
-        base: Option<String>,
-    },
-    Merge(String),
-    Rebase(String),
 }
 
 fn prompt_accepts_modifiers(modifiers: KeyModifiers) -> bool {
@@ -1449,6 +1430,270 @@ fn staged_plan_items(entries: &[StatusEntry]) -> Vec<String> {
     items
 }
 
+fn file_path_labels(paths: &[std::path::PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn stage_paths_plan(paths: Vec<String>) -> OperationPlan {
+    let summary = match paths.as_slice() {
+        [path] => format!("stage {path}"),
+        _ => format!("stage {} path(s)", paths.len()),
+    };
+    OperationPlan::new(
+        OperationRequest::StagePaths { paths },
+        "Stage plan",
+        vec![OperationStep::new(
+            OperationKind::StagePaths,
+            RiskLevel::Low,
+            summary,
+        )],
+        "",
+    )
+}
+
+fn unstage_paths_plan(paths: Vec<String>) -> OperationPlan {
+    let summary = match paths.as_slice() {
+        [path] => format!("unstage {path}"),
+        _ => format!("unstage {} path(s)", paths.len()),
+    };
+    OperationPlan::new(
+        OperationRequest::UnstagePaths { paths },
+        "Unstage plan",
+        vec![OperationStep::new(
+            OperationKind::UnstagePaths,
+            RiskLevel::Low,
+            summary,
+        )],
+        "",
+    )
+}
+
+fn stage_all_plan() -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::StageAll,
+        "Stage all plan",
+        vec![OperationStep::new(
+            OperationKind::StageAll,
+            RiskLevel::Medium,
+            "stage all working tree changes",
+        )],
+        "Press y to stage all changes or n to cancel.",
+    )
+}
+
+fn unstage_all_plan() -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::UnstageAll,
+        "Unstage all plan",
+        vec![OperationStep::new(
+            OperationKind::UnstageAll,
+            RiskLevel::Medium,
+            "unstage all staged changes",
+        )],
+        "Press y to unstage all changes or n to cancel.",
+    )
+}
+
+fn fetch_plan() -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Fetch,
+        "Fetch plan",
+        vec![OperationStep::new(
+            OperationKind::Fetch,
+            RiskLevel::Low,
+            "fetch default remote",
+        )],
+        "",
+    )
+}
+
+fn branches_plan() -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Branches,
+        "Branches plan",
+        vec![OperationStep::new(
+            OperationKind::Branches,
+            RiskLevel::Low,
+            "list local and remote branches",
+        )],
+        "",
+    )
+}
+
+fn commit_plan(message: &str, staged_count: usize) -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Commit {
+            message: message.to_owned(),
+        },
+        "Commit plan",
+        vec![
+            OperationStep::new(
+                OperationKind::Commit,
+                RiskLevel::Medium,
+                format!("commit {staged_count} staged file(s)"),
+            )
+            .with_detail(format!("message: {message}")),
+        ],
+        "Press y to commit or n to cancel.",
+    )
+}
+
+fn push_plan(branch: &str, upstream: &str, ahead: u32) -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Push,
+        "Push plan",
+        vec![
+            OperationStep::new(
+                OperationKind::PushCurrentBranch,
+                RiskLevel::Medium,
+                format!("push {branch} to {upstream}"),
+            )
+            .with_detail(format!("ahead: {ahead} commit(s)")),
+        ],
+        "Press y to push or n to cancel.",
+    )
+}
+
+fn push_set_upstream_plan(branch: &str, remote: &str) -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Push,
+        "Push plan",
+        vec![
+            OperationStep::new(
+                OperationKind::PushSetUpstream,
+                RiskLevel::Medium,
+                format!("push {branch} to {remote}"),
+            )
+            .with_detail(format!("set upstream to {remote}/{branch}")),
+        ],
+        "Press y to push or n to cancel.",
+    )
+}
+
+fn pull_plan(rebase: bool, upstream: &str, behind: u32) -> OperationPlan {
+    if rebase {
+        OperationPlan::new(
+            OperationRequest::Pull { rebase: true },
+            "Pull rebase plan",
+            vec![
+                OperationStep::new(
+                    OperationKind::PullRebase,
+                    RiskLevel::High,
+                    format!("rebase current branch onto fetched {upstream}"),
+                )
+                .with_detail("block if the fetched upstream changes before confirmation")
+                .with_detail(format!("locally behind: {behind} commit(s)")),
+            ],
+            "Press y to rebase or n to cancel.",
+        )
+    } else {
+        OperationPlan::new(
+            OperationRequest::Pull { rebase: false },
+            "Pull plan",
+            vec![
+                OperationStep::new(
+                    OperationKind::PullFastForward,
+                    RiskLevel::Medium,
+                    format!("fast-forward from fetched {upstream}"),
+                )
+                .with_detail("block if the fetched upstream changes before confirmation")
+                .with_detail(format!("locally behind: {behind} commit(s)")),
+            ],
+            "Press y to pull or n to cancel.",
+        )
+    }
+}
+
+fn checkout_plan(branch: &BranchTarget) -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Checkout {
+            branch: branch.name.clone(),
+        },
+        "Checkout plan",
+        vec![
+            OperationStep::new(
+                OperationKind::CheckoutBranch,
+                RiskLevel::Medium,
+                format!("switch to {} at {}", branch.name, short_oid(&branch.oid)),
+            )
+            .with_detail("block if the working tree or branch target changes"),
+        ],
+        "Press y to checkout or n to cancel.",
+    )
+}
+
+fn create_branch_plan(
+    branch: &str,
+    base: Option<&BranchTarget>,
+    base_label: &str,
+) -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::CreateBranch {
+            branch: branch.to_owned(),
+            base: base.map(|base| base.name.clone()),
+        },
+        "Create branch plan",
+        vec![
+            OperationStep::new(
+                OperationKind::CreateBranch,
+                RiskLevel::Medium,
+                format!("create and switch to {branch}"),
+            )
+            .with_detail(format!("base: {base_label}"))
+            .with_detail("block if the working tree, current target, or base changes"),
+        ],
+        "Press y to create branch or n to cancel.",
+    )
+}
+
+fn merge_plan(current: &str, branch: &BranchTarget) -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Merge {
+            branch: branch.name.clone(),
+        },
+        "Merge plan",
+        vec![
+            OperationStep::new(
+                OperationKind::MergeFastForward,
+                RiskLevel::Medium,
+                format!(
+                    "fast-forward {current} to {} at {}",
+                    branch.name,
+                    short_oid(&branch.oid)
+                ),
+            )
+            .with_detail("merge commits and conflicts are out of scope for this guarded action"),
+        ],
+        "Press y to merge or n to cancel.",
+    )
+}
+
+fn rebase_plan(current: &str, base: &BranchTarget) -> OperationPlan {
+    OperationPlan::new(
+        OperationRequest::Rebase {
+            base: base.name.clone(),
+        },
+        "Rebase plan",
+        vec![
+            OperationStep::new(
+                OperationKind::Rebase,
+                RiskLevel::High,
+                format!(
+                    "rebase {current} onto {} at {}",
+                    base.name,
+                    short_oid(&base.oid)
+                ),
+            )
+            .with_detail("block if the working tree, current target, or base changes")
+            .with_detail("Git may stop for conflicts that require manual resolution"),
+        ],
+        "Press y to rebase or n to cancel.",
+    )
+}
+
 fn repo_list(app: &App) -> List<'_> {
     let items = app
         .repos
@@ -1628,31 +1873,28 @@ fn validate_pull_plan(
     Ok(())
 }
 
-fn parse_prompt(input: &str) -> Result<PromptCommand, String> {
+fn parse_prompt(input: &str) -> Result<OperationRequest, String> {
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
-        "branches" => Ok(PromptCommand::Branches),
-        "fetch" => Ok(PromptCommand::Fetch),
-        "push" => Ok(PromptCommand::Push),
-        "pull" => Ok(PromptCommand::Pull),
-        "pull --rebase" | "pull rebase" => Ok(PromptCommand::PullRebase),
+        "branches" => Ok(OperationRequest::Branches),
+        "fetch" => Ok(OperationRequest::Fetch),
+        "push" => Ok(OperationRequest::Push),
+        "pull" => Ok(OperationRequest::Pull { rebase: false }),
+        "pull --rebase" | "pull rebase" => Ok(OperationRequest::Pull { rebase: true }),
         _ if lower.starts_with("checkout ") => parse_one_arg_prompt(trimmed, "checkout")
-            .map(PromptCommand::Checkout),
+            .map(|branch| OperationRequest::Checkout { branch }),
         _ if lower.starts_with("merge ") => {
-            parse_one_arg_prompt(trimmed, "merge").map(PromptCommand::Merge)
+            parse_one_arg_prompt(trimmed, "merge").map(|branch| OperationRequest::Merge { branch })
         }
         _ if lower.starts_with("rebase ") => {
-            parse_one_arg_prompt(trimmed, "rebase").map(PromptCommand::Rebase)
+            parse_one_arg_prompt(trimmed, "rebase").map(|base| OperationRequest::Rebase { base })
         }
         _ if lower.starts_with("branch ") => parse_branch_prompt(trimmed),
         _ if lower == "commit" || lower.starts_with("commit ") => {
-            parse_commit_prompt(trimmed).map(PromptCommand::Commit)
+            parse_commit_prompt(trimmed).map(|message| OperationRequest::Commit { message })
         }
-        _ => Err(
-            "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, commit -m \"message\", fetch, push, pull, or pull --rebase"
-                .to_owned(),
-        ),
+        _ => Err(UNSUPPORTED_PROMPT.to_owned()),
     }
 }
 
@@ -1663,7 +1905,7 @@ fn parse_one_arg_prompt(input: &str, command: &str) -> Result<String, String> {
     parse_branch_arg(rest.trim(), &format!("Expected: {command} <branch>"))
 }
 
-fn parse_branch_prompt(input: &str) -> Result<PromptCommand, String> {
+fn parse_branch_prompt(input: &str) -> Result<OperationRequest, String> {
     let Some(rest) = input.get("branch".len()..) else {
         return Err("Expected: branch <name> or branch <name> from <base>".to_owned());
     };
@@ -1672,12 +1914,12 @@ fn parse_branch_prompt(input: &str) -> Result<PromptCommand, String> {
         [branch] if branch.eq_ignore_ascii_case("list") => {
             Err("Use `branches` to list branches.".to_owned())
         }
-        [branch] => Ok(PromptCommand::CreateBranch {
+        [branch] => Ok(OperationRequest::CreateBranch {
             branch: parse_branch_arg(branch, "Expected: branch <name>")?,
             base: None,
         }),
         [branch, keyword, base] if keyword.eq_ignore_ascii_case("from") => {
-            Ok(PromptCommand::CreateBranch {
+            Ok(OperationRequest::CreateBranch {
                 branch: parse_branch_arg(branch, "Expected: branch <name> from <base>")?,
                 base: Some(parse_branch_arg(
                     base,
@@ -1776,25 +2018,44 @@ fn operation_message(action: &str, result: Result<(), String>) -> String {
     }
 }
 
-fn run_audited_git_operation(
-    action: &str,
-    operation: &str,
+fn run_audited_plan_operation(
+    plan: &OperationPlan,
     run: impl FnOnce() -> Result<GitOutput, GitError>,
 ) -> String {
-    let audit = match begin_audit_operation(operation) {
-        Ok(audit) => audit,
-        Err(error) => return operation_message(action, Err(error)),
+    let Some(step) = plan.first_step() else {
+        return operation_message("operation", Err("operation plan has no steps".to_owned()));
     };
-    let result = run();
-    operation_message(action, audit.finish(&result))
+    run_audited_step(step, run)
 }
 
-fn run_audited_git_operation_with_output(
-    action: &str,
-    operation: &str,
+fn run_audited_plan_operation_with_output(
+    plan: &OperationPlan,
     run: impl FnOnce() -> Result<GitOutput, GitError>,
 ) -> String {
-    let audit = match begin_audit_operation(operation) {
+    let Some(step) = plan.first_step() else {
+        return operation_message("operation", Err("operation plan has no steps".to_owned()));
+    };
+    run_audited_step_with_output(step, run)
+}
+
+fn run_audited_step(
+    step: &OperationStep,
+    run: impl FnOnce() -> Result<GitOutput, GitError>,
+) -> String {
+    let audit = match begin_audit_operation(step.kind.audit_operation()) {
+        Ok(audit) => audit,
+        Err(error) => return operation_message(step.kind.action_label(), Err(error)),
+    };
+    let result = run();
+    operation_message(step.kind.action_label(), audit.finish(&result))
+}
+
+fn run_audited_step_with_output(
+    step: &OperationStep,
+    run: impl FnOnce() -> Result<GitOutput, GitError>,
+) -> String {
+    let action = step.kind.action_label();
+    let audit = match begin_audit_operation(step.kind.audit_operation()) {
         Ok(audit) => audit,
         Err(error) => return operation_message(action, Err(error)),
     };
@@ -2089,27 +2350,40 @@ mod tests {
 
     #[test]
     fn parses_sync_prompts() {
-        assert_eq!(parse_prompt("fetch"), Ok(PromptCommand::Fetch));
-        assert_eq!(parse_prompt("push"), Ok(PromptCommand::Push));
-        assert_eq!(parse_prompt("pull"), Ok(PromptCommand::Pull));
-        assert_eq!(parse_prompt("pull --rebase"), Ok(PromptCommand::PullRebase));
-        assert_eq!(parse_prompt("pull rebase"), Ok(PromptCommand::PullRebase));
+        assert_eq!(parse_prompt("fetch"), Ok(OperationRequest::Fetch));
+        assert_eq!(parse_prompt("push"), Ok(OperationRequest::Push));
+        assert_eq!(
+            parse_prompt("pull"),
+            Ok(OperationRequest::Pull { rebase: false })
+        );
+        assert_eq!(
+            parse_prompt("pull --rebase"),
+            Ok(OperationRequest::Pull { rebase: true })
+        );
+        assert_eq!(
+            parse_prompt("pull rebase"),
+            Ok(OperationRequest::Pull { rebase: true })
+        );
         assert_eq!(
             parse_prompt("commit -m \"sync docs\""),
-            Ok(PromptCommand::Commit("sync docs".to_owned()))
+            Ok(OperationRequest::Commit {
+                message: "sync docs".to_owned()
+            })
         );
     }
 
     #[test]
     fn parses_branch_prompts() {
-        assert_eq!(parse_prompt("branches"), Ok(PromptCommand::Branches));
+        assert_eq!(parse_prompt("branches"), Ok(OperationRequest::Branches));
         assert_eq!(
             parse_prompt("checkout feature/auth"),
-            Ok(PromptCommand::Checkout("feature/auth".to_owned()))
+            Ok(OperationRequest::Checkout {
+                branch: "feature/auth".to_owned()
+            })
         );
         assert_eq!(
             parse_prompt("branch feature/auth"),
-            Ok(PromptCommand::CreateBranch {
+            Ok(OperationRequest::CreateBranch {
                 branch: "feature/auth".to_owned(),
                 base: None,
             })
@@ -2117,18 +2391,22 @@ mod tests {
         assert!(parse_prompt("branch list").is_err());
         assert_eq!(
             parse_prompt("branch feature/auth from origin/main"),
-            Ok(PromptCommand::CreateBranch {
+            Ok(OperationRequest::CreateBranch {
                 branch: "feature/auth".to_owned(),
                 base: Some("origin/main".to_owned()),
             })
         );
         assert_eq!(
             parse_prompt("merge feature/auth"),
-            Ok(PromptCommand::Merge("feature/auth".to_owned()))
+            Ok(OperationRequest::Merge {
+                branch: "feature/auth".to_owned()
+            })
         );
         assert_eq!(
             parse_prompt("rebase origin/main"),
-            Ok(PromptCommand::Rebase("origin/main".to_owned()))
+            Ok(OperationRequest::Rebase {
+                base: "origin/main".to_owned()
+            })
         );
     }
 
@@ -2139,6 +2417,66 @@ mod tests {
         assert!(parse_prompt("pull --ff-only").is_err());
         assert!(parse_prompt("checkout --detach").is_err());
         assert!(parse_prompt("branch feature from").is_err());
+    }
+
+    #[test]
+    fn operation_plans_use_guardrail_risk_levels() {
+        let branch = BranchTarget {
+            name: "feature/auth".to_owned(),
+            reference: "refs/heads/feature/auth".to_owned(),
+            oid: "abcdef1234567890".to_owned(),
+            kind: BranchKind::Local,
+        };
+
+        assert_eq!(fetch_plan().confirmation.risk_level, RiskLevel::Low);
+        assert_eq!(
+            stage_paths_plan(vec!["file.txt".to_owned()])
+                .confirmation
+                .risk_level,
+            RiskLevel::Low
+        );
+        assert_eq!(
+            commit_plan("message", 1).confirmation.risk_level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            push_plan("feature/auth", "origin/feature/auth", 1)
+                .confirmation
+                .risk_level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            push_set_upstream_plan("feature/auth", "origin")
+                .confirmation
+                .risk_level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            pull_plan(false, "origin/main", 1).confirmation.risk_level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            checkout_plan(&branch).confirmation.risk_level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            create_branch_plan("feature/new", Some(&branch), "feature/auth at abcdef123456")
+                .confirmation
+                .risk_level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            merge_plan("main", &branch).confirmation.risk_level,
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            pull_plan(true, "origin/main", 1).confirmation.risk_level,
+            RiskLevel::High
+        );
+        assert_eq!(
+            rebase_plan("feature/new", &branch).confirmation.risk_level,
+            RiskLevel::High
+        );
     }
 
     #[test]
@@ -2345,8 +2683,13 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('a')));
 
-        assert_eq!(app.pending_confirmation, Some(PendingAction::StageAll));
-        assert!(app.details.contains("Stage all changes?"));
+        assert_eq!(
+            app.pending_confirmation
+                .as_ref()
+                .map(|action| &action.payload),
+            Some(&PendingPayload::StageAll)
+        );
+        assert!(app.details.contains("Stage all plan:"));
 
         app.handle_key(key(KeyCode::Char('n')));
 
