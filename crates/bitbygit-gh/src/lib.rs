@@ -14,6 +14,7 @@ pub const AUTHENTICATE_GH_GUIDANCE: &str =
 pub struct GitHub {
     cwd: PathBuf,
     executable: PathBuf,
+    repository: Option<String>,
 }
 
 impl GitHub {
@@ -25,6 +26,19 @@ impl GitHub {
         Self {
             cwd: cwd.into(),
             executable: executable.into(),
+            repository: None,
+        }
+    }
+
+    pub fn with_executable_and_repository(
+        cwd: impl Into<PathBuf>,
+        executable: impl Into<PathBuf>,
+        repository: impl Into<String>,
+    ) -> Self {
+        Self {
+            cwd: cwd.into(),
+            executable: executable.into(),
+            repository: Some(repository.into()),
         }
     }
 
@@ -50,12 +64,12 @@ impl GitHub {
 
     pub fn repository(&self) -> Result<Repository, GhError> {
         self.ensure_ready()?;
-        let output = self.run_output(vec![
+        let output = self.run_output(self.with_repository(vec![
             "repo".to_owned(),
             "view".to_owned(),
             "--json".to_owned(),
             "nameWithOwner,defaultBranchRef".to_owned(),
-        ])?;
+        ]))?;
         let repository: RepositoryResponse = parse_json(&output, "repository")?;
         let default_branch = repository
             .default_branch_ref
@@ -72,7 +86,7 @@ impl GitHub {
 
     pub fn existing_pull_requests(&self, head: &str) -> Result<Vec<PullRequest>, GhError> {
         self.ensure_ready()?;
-        let output = self.run_output(vec![
+        let output = self.run_output(self.with_repository(vec![
             "pr".to_owned(),
             "list".to_owned(),
             "--head".to_owned(),
@@ -83,7 +97,7 @@ impl GitHub {
             "0".to_owned(),
             "--json".to_owned(),
             "number,url,title,baseRefName,headRefName,headRepository".to_owned(),
-        ])?;
+        ]))?;
         parse_json(&output, "pull request query")
     }
 
@@ -93,7 +107,7 @@ impl GitHub {
     ) -> Result<CreatedPullRequest, GhError> {
         self.ensure_ready()?;
         request.validate()?;
-        let output = self.run_output(vec![
+        let output = self.run_output(self.with_repository(vec![
             "pr".to_owned(),
             "create".to_owned(),
             "--title".to_owned(),
@@ -104,7 +118,7 @@ impl GitHub {
             request.base.clone(),
             "--head".to_owned(),
             request.head.clone(),
-        ])?;
+        ]))?;
         let url = output
             .lines()
             .map(str::trim)
@@ -123,6 +137,14 @@ impl GitHub {
             GhSetupStatus::MissingCli => Err(GhError::MissingCli),
             GhSetupStatus::NotAuthenticated => Err(GhError::NotAuthenticated),
         }
+    }
+
+    fn with_repository(&self, mut args: Vec<String>) -> Vec<String> {
+        if let Some(repository) = &self.repository {
+            args.push("--repo".to_owned());
+            args.push(repository.clone());
+        }
+        args
     }
 
     fn run_status(&self, args: Vec<String>) -> Result<(), GhError> {

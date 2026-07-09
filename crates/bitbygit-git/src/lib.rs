@@ -279,13 +279,19 @@ impl Git {
     }
 
     pub fn remote_push_urls(&self, remote: &str) -> Result<Vec<String>, GitError> {
+        let push_urls = self.remote_config_urls(remote, "pushurl")?;
+        if push_urls.is_empty() {
+            self.remote_config_urls(remote, "url")
+        } else {
+            Ok(push_urls)
+        }
+    }
+
+    fn remote_config_urls(&self, remote: &str, name: &str) -> Result<Vec<String>, GitError> {
         match self.run_args(vec![
-            "remote".to_owned(),
-            "get-url".to_owned(),
-            "--push".to_owned(),
-            "--all".to_owned(),
-            "--".to_owned(),
-            remote.to_owned(),
+            "config".to_owned(),
+            "--get-all".to_owned(),
+            format!("remote.{remote}.{name}"),
         ]) {
             Ok(output) => Ok(output
                 .stdout
@@ -294,7 +300,7 @@ impl Git {
                 .filter(|line| !line.is_empty())
                 .map(ToOwned::to_owned)
                 .collect()),
-            Err(GitError::GitFailed { status, .. }) if status.code() == Some(2) => Ok(Vec::new()),
+            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(Vec::new()),
             Err(error) => Err(error),
         }
     }

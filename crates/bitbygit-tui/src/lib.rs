@@ -685,6 +685,7 @@ enum PendingPayload {
         base: String,
         title: String,
         repository: String,
+        github_repository: String,
         github_executable: Option<PathBuf>,
     },
 }
@@ -1940,7 +1941,12 @@ impl OperationPlanner {
         if remote_oid.as_deref() != Some(local_oid) {
             return Err("Open pull request blocked: current branch is not pushed to its upstream. Push it with `push` first.".to_owned());
         }
-        let github = self.github();
+        let github_repository = github_repository_from_push_url(push_url).ok_or_else(|| {
+            format!(
+                "Open pull request blocked: remote {remote} does not identify a GitHub repository."
+            )
+        })?;
+        let github = self.github(&github_repository);
         let repository = github.repository().map_err(open_pull_request_gh_error)?;
         let base = requested_base.unwrap_or(repository.default_branch);
         if base == branch {
@@ -1988,6 +1994,7 @@ impl OperationPlanner {
                 base,
                 title,
                 repository: repository.name_with_owner,
+                github_repository,
                 github_executable: self.github_executable.clone(),
             }),
         ))
@@ -2020,10 +2027,12 @@ impl OperationPlanner {
         Git::new(self.repo_root.clone())
     }
 
-    fn github(&self) -> GitHub {
+    fn github(&self, repository: &str) -> GitHub {
         match &self.github_executable {
-            Some(executable) => GitHub::with_executable(&self.repo_root, executable),
-            None => GitHub::new(&self.repo_root),
+            Some(executable) => {
+                GitHub::with_executable_and_repository(&self.repo_root, executable, repository)
+            }
+            None => GitHub::with_executable_and_repository(&self.repo_root, "gh", repository),
         }
     }
 }
@@ -2054,6 +2063,42 @@ fn single_pull_request_push_url<'a>(remote: &str, urls: &'a [String]) -> Result<
             "Open pull request blocked: remote {remote} has multiple push URLs."
         )),
     }
+}
+
+fn github_repository_from_push_url(url: &str) -> Option<String> {
+    let (host, path) = if let Some((_, rest)) = url.split_once("://") {
+        let (authority, path) = rest.split_once('/')?;
+        (
+            authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host),
+            path,
+        )
+    } else {
+        let (authority, path) = url.split_once(':')?;
+        if authority.contains('/') {
+            return None;
+        }
+        (
+            authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host),
+            path,
+        )
+    };
+    let mut components = path.trim_end_matches('/').split('/');
+    let owner = components.next()?;
+    let repository = components.next()?.strip_suffix(".git").unwrap_or_default();
+    if host.is_empty()
+        || owner.is_empty()
+        || repository.is_empty()
+        || components.next().is_some()
+        || owner.contains(['?', '#'])
+        || repository.contains(['?', '#'])
+    {
+        return None;
+    }
+    Some(format!("{host}/{owner}/{repository}"))
 }
 
 fn validate_push_plan(
@@ -2766,6 +2811,7 @@ impl PlanExecutor {
             base,
             title,
             repository,
+            github_repository,
             github_executable,
         } = typed_payload(context, OperationKind::OpenPullRequest)?
         else {
@@ -2779,8 +2825,14 @@ impl PlanExecutor {
         validate_open_pull_request_plan(git, branch, upstream, remote, remote_urls, target)
             .map_err(StepExecutionError::Blocked)?;
         let github = match github_executable {
-            Some(executable) => GitHub::with_executable(&self.repo_root, executable),
-            None => GitHub::new(&self.repo_root),
+            Some(executable) => GitHub::with_executable_and_repository(
+                &self.repo_root,
+                executable,
+                github_repository,
+            ),
+            None => {
+                GitHub::with_executable_and_repository(&self.repo_root, "gh", github_repository)
+            }
         };
         let current_repository = github.repository().map_err(StepExecutionError::GitHub)?;
         if current_repository.name_with_owner != *repository {
@@ -4110,6 +4162,48 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_gh_commands_follow_the_tracked_fork_remote() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-tracked-fork")?;
+        git_stdout(&repo, &["remote", "rename", "origin", "fork"])?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/upstream/repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh("open-pr-tracked-fork", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+        assert!(operation.plan.preview_text().contains("remote: fork"));
+        let execution = PlanExecutor::with_audit_paths(
+            &repo,
+            isolated_store_paths("open-pr-tracked-fork-audit")?,
+        )
+        .execute(&operation.plan, operation.context);
+
+        assert!(execution.succeeded(), "{}", execution.message());
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        for invocation in invocations.lines().filter(|line| {
+            line.starts_with("repo:view")
+                || line.starts_with("pr:list")
+                || line.starts_with("pr:create")
+        }) {
+            assert!(invocation.contains("--repo github.com/octo/repo"));
+            assert!(!invocation.contains("upstream/repo"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn open_pull_request_plan_encodes_compare_ref_names() {
         let plan = open_pull_request_plan(
             OperationRequest::OpenPullRequest {
@@ -4147,8 +4241,7 @@ mod tests {
         let branch = git_stdout(&repo, &["branch", "--show-current"])?
             .trim()
             .to_owned();
-        let remote_arg = remote.to_string_lossy().to_string();
-        git_stdout(&repo, &["remote", "add", "origin", remote_arg.as_str()])?;
+        add_github_remote(&repo, "origin", &remote)?;
         git_stdout(&repo, &["push", "-u", "origin", branch.as_str()])?;
         let fake_gh = fake_gh("open-pr-invalid-state", false)?;
         let planner = OperationPlanner {
@@ -4945,10 +5038,21 @@ mod tests {
         std::fs::write(repo.join("file.txt"), "feature\n")?;
         git_stdout(&repo, &["add", "file.txt"])?;
         git_stdout(&repo, &["commit", "-m", "feature"])?;
-        let remote_arg = remote.to_string_lossy().to_string();
-        git_stdout(&repo, &["remote", "add", "origin", remote_arg.as_str()])?;
+        add_github_remote(&repo, "origin", &remote)?;
         git_stdout(&repo, &["push", "-u", "origin", "feature/open-pr"])?;
         Ok(repo)
+    }
+
+    fn add_github_remote(
+        repo: &std::path::Path,
+        name: &str,
+        bare_remote: &std::path::Path,
+    ) -> Result<(), Box<dyn Error>> {
+        let remote_url = "https://github.com/octo/repo.git";
+        let rewrite_key = format!("url.{}.insteadOf", bare_remote.display());
+        git_stdout(repo, &["config", "--add", rewrite_key.as_str(), remote_url])?;
+        git_stdout(repo, &["remote", "add", name, remote_url])?;
+        Ok(())
     }
 
     fn fake_gh(name: &str, existing: bool) -> Result<PathBuf, Box<dyn Error>> {
