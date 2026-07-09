@@ -4175,7 +4175,7 @@ mod tests {
         let repo = pushed_branch_repo("open-pr-other-base")?;
         let fake_gh = fake_gh_with_pull_requests(
             "open-pr-other-base",
-            "[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\"}]",
+            "[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature/open-pr\",\"repo\":{\"full_name\":\"octo/repo\"}}}]",
             false,
         )?;
         let planner = OperationPlanner {
@@ -4214,7 +4214,7 @@ mod tests {
         let repo = pushed_branch_repo("open-pr-fork-collision")?;
         let fake_gh = fake_gh_with_pull_requests(
             "open-pr-fork-collision",
-            "[{\"number\":42,\"url\":\"https://github.com/bob/repo/pull/42\",\"title\":\"Other fork PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\",\"headRepository\":{\"nameWithOwner\":\"bob/repo\"}}]",
+            "[{\"number\":42,\"html_url\":\"https://github.com/bob/repo/pull/42\",\"title\":\"Other fork PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature/open-pr\",\"repo\":{\"full_name\":\"bob/repo\"}}}]",
             true,
         )?;
         let planner = OperationPlanner {
@@ -5201,7 +5201,7 @@ mod tests {
 
     fn fake_gh(name: &str, existing: bool) -> Result<PathBuf, Box<dyn Error>> {
         let pull_requests = if existing {
-            "[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature/open-pr\",\"headRepository\":{\"nameWithOwner\":\"octo/repo\"}}]"
+            "[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature/open-pr\",\"repo\":{\"full_name\":\"octo/repo\"}}}]"
         } else {
             "[]"
         };

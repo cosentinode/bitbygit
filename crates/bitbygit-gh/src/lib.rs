@@ -99,8 +99,8 @@ impl GitHub {
             "-f".to_owned(),
             "per_page=100".to_owned(),
         ])?;
-        let pages: Vec<Vec<PullRequest>> = parse_json(&output, "pull request query")?;
-        Ok(pages.into_iter().flatten().collect())
+        let pages: Vec<Vec<RestPullRequest>> = parse_json(&output, "pull request query")?;
+        Ok(pages.into_iter().flatten().map(PullRequest::from).collect())
     }
 
     fn repository_after_ready(&self) -> Result<Repository, GhError> {
@@ -241,23 +241,58 @@ pub struct Repository {
     pub default_branch: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
     pub title: String,
-    #[serde(rename = "baseRefName")]
     pub base_ref_name: String,
-    #[serde(rename = "headRefName")]
     pub head_ref_name: String,
-    #[serde(rename = "headRepository")]
     pub head_repository: Option<PullRequestRepository>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestRepository {
-    #[serde(rename = "nameWithOwner")]
     pub name_with_owner: String,
+}
+
+#[derive(Deserialize)]
+struct RestPullRequest {
+    number: u64,
+    html_url: String,
+    title: String,
+    base: RestPullRequestBranch,
+    head: RestPullRequestBranch,
+}
+
+#[derive(Deserialize)]
+struct RestPullRequestBranch {
+    #[serde(rename = "ref")]
+    reference: String,
+    repo: Option<RestPullRequestRepository>,
+}
+
+#[derive(Deserialize)]
+struct RestPullRequestRepository {
+    full_name: String,
+}
+
+impl From<RestPullRequest> for PullRequest {
+    fn from(pull_request: RestPullRequest) -> Self {
+        Self {
+            number: pull_request.number,
+            url: pull_request.html_url,
+            title: pull_request.title,
+            base_ref_name: pull_request.base.reference,
+            head_ref_name: pull_request.head.reference,
+            head_repository: pull_request
+                .head
+                .repo
+                .map(|repository| PullRequestRepository {
+                    name_with_owner: repository.full_name,
+                }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,9 +472,9 @@ mod tests {
     }
 
     #[test]
-    fn queries_repository_and_all_existing_pull_requests() -> Result<(), Box<dyn Error>> {
+    fn decodes_rest_existing_pull_request_responses() -> Result<(), Box<dyn Error>> {
         let fake = FakeGh::new(
-            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRepository\":{\"nameWithOwner\":\"octo/repo\"}}]]' ;;\n*) exit 1 ;;\nesac",
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature\",\"repo\":{\"full_name\":\"octo/repo\"}}}]]' ;;\n*) exit 1 ;;\nesac",
         )?;
         let github = GitHub::with_executable_and_repository(
             &fake.path,
@@ -455,6 +490,8 @@ mod tests {
         assert_eq!(pull_requests.len(), 1);
         assert_eq!(pull_requests[0].number, 42);
         assert_eq!(pull_requests[0].url, "https://github.com/octo/repo/pull/42");
+        assert_eq!(pull_requests[0].base_ref_name, "main");
+        assert_eq!(pull_requests[0].head_ref_name, "feature");
         assert_eq!(
             pull_requests[0]
                 .head_repository
