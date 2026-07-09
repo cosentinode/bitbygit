@@ -651,9 +651,14 @@ fn parse_audit_entries(contents: &str) -> Result<Vec<AuditEntry>, StoreError> {
         if line.is_empty() {
             continue;
         }
+        let is_final_unterminated = index + 1 == line_count && !contents.ends_with('\n');
+        // A 4-field unterminated tail can be a current-format row torn after result.
+        if is_final_unterminated && line.split('\t').count() == 4 {
+            break;
+        }
         match parse_audit_entry(line, index + 1) {
             Ok(entry) => entries.push(entry),
-            Err(_) if index + 1 == line_count && !contents.ends_with('\n') => break,
+            Err(_) if is_final_unterminated => break,
             Err(error) => return Err(error),
         }
     }
@@ -977,6 +982,27 @@ mod tests {
         store.append_audit(entry.clone())?;
         let mut contents = fs::read_to_string(&store.paths().audit_file)?;
         contents.push_str("truncated\tline");
+        fs::write(&store.paths().audit_file, contents)?;
+
+        assert_eq!(store.list_audit_entries()?, vec![entry]);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_reader_ignores_torn_current_format_tail_that_looks_legacy()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        let entry = AuditEntry::new(None, "refresh", "ok", "ready")?;
+        store.append_audit(entry.clone())?;
+        let repo_id = RepoId::parse(encode_string("repo"))?;
+        let mut contents = fs::read_to_string(&store.paths().audit_file)?;
+        contents.push_str("456\t");
+        contents.push_str(repo_id.as_str());
+        contents.push('\t');
+        contents.push_str(&encode_string("refresh"));
+        contents.push('\t');
+        contents.push_str(&encode_string("ok"));
         fs::write(&store.paths().audit_file, contents)?;
 
         assert_eq!(store.list_audit_entries()?, vec![entry]);
