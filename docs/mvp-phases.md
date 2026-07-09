@@ -148,7 +148,7 @@ Success condition:
 
 Status:
 
-- in progress
+- merged
 
 Must have:
 
@@ -164,6 +164,10 @@ Success condition:
 - everyday branch movement works without surprising destructive behavior
 
 ## Phase 9: Operation planner, preview, queue, execution, and audit
+
+Status:
+
+- merged
 
 Must have:
 
