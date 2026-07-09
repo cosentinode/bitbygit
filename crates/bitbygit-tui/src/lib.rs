@@ -5048,11 +5048,52 @@ mod tests {
         name: &str,
         bare_remote: &std::path::Path,
     ) -> Result<(), Box<dyn Error>> {
-        let remote_url = "https://github.com/octo/repo.git";
-        let rewrite_key = format!("url.{}.insteadOf", bare_remote.display());
-        git_stdout(repo, &["config", "--add", rewrite_key.as_str(), remote_url])?;
+        let remote_url = "ssh://git@github.com/octo/repo.git";
+        let test_bare_key = format!("remote.{name}.testbare");
         git_stdout(repo, &["remote", "add", name, remote_url])?;
+        git_stdout(
+            repo,
+            &[
+                "config",
+                test_bare_key.as_str(),
+                &bare_remote.display().to_string(),
+            ],
+        )?;
+        git_stdout(
+            repo,
+            &[
+                "config",
+                "core.sshCommand",
+                &test_ssh_command()?.display().to_string(),
+            ],
+        )?;
         Ok(())
+    }
+
+    fn test_ssh_command() -> Result<PathBuf, Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::OnceLock;
+
+        static COMMAND: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+        match COMMAND.get_or_init(|| {
+            (|| -> Result<PathBuf, Box<dyn Error>> {
+                let root = isolated_temp_root("fake-ssh")?;
+                std::fs::create_dir_all(&root)?;
+                let executable = root.join("ssh");
+                std::fs::write(
+                    &executable,
+                    "#!/bin/sh\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\ncase \"$*\" in\n*git-receive-pack*) exec git-receive-pack \"$target\" ;;\n*) exec git-upload-pack \"$target\" ;;\nesac\n",
+                )?;
+                let mut permissions = std::fs::metadata(&executable)?.permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&executable, permissions)?;
+                Ok(executable)
+            })()
+            .map_err(|error| error.to_string())
+        }) {
+            Ok(command) => Ok(command.clone()),
+            Err(error) => Err(std::io::Error::other(error.clone()).into()),
+        }
     }
 
     fn fake_gh(name: &str, existing: bool) -> Result<PathBuf, Box<dyn Error>> {

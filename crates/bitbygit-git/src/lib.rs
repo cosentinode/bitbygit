@@ -279,30 +279,20 @@ impl Git {
     }
 
     pub fn remote_push_urls(&self, remote: &str) -> Result<Vec<String>, GitError> {
-        let push_urls = self.remote_config_urls(remote, "pushurl")?;
-        if push_urls.is_empty() {
-            self.remote_config_urls(remote, "url")
-        } else {
-            Ok(push_urls)
-        }
-    }
-
-    fn remote_config_urls(&self, remote: &str, name: &str) -> Result<Vec<String>, GitError> {
-        match self.run_args(vec![
-            "config".to_owned(),
-            "--get-all".to_owned(),
-            format!("remote.{remote}.{name}"),
-        ]) {
-            Ok(output) => Ok(output
-                .stdout
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()),
-            Err(GitError::GitFailed { status, .. }) if status.code() == Some(1) => Ok(Vec::new()),
-            Err(error) => Err(error),
-        }
+        let output = self.run_args(vec![
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            "--push".to_owned(),
+            "--all".to_owned(),
+            remote.to_owned(),
+        ])?;
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
     }
 
     pub fn pull(&self) -> Result<GitOutput, GitError> {
@@ -835,7 +825,10 @@ impl Git {
         if env::var_os("GIT_SSH_COMMAND").is_none() {
             command.env(
                 "GIT_SSH_COMMAND",
-                "ssh -oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes",
+                format!(
+                    "{} -oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes",
+                    self.configured_ssh_command().unwrap_or_else(|| "ssh".to_owned())
+                ),
             );
         }
         let output = command
@@ -871,6 +864,20 @@ impl Git {
             stdout,
             stderr,
         })
+    }
+
+    fn configured_ssh_command(&self) -> Option<String> {
+        let output = Command::new("git")
+            .current_dir(&self.cwd)
+            .args(["config", "--get", "core.sshCommand"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let command = String::from_utf8(output.stdout).ok()?;
+        let command = command.trim();
+        (!command.is_empty()).then(|| command.to_owned())
     }
 
     fn run_path_args<const N: usize>(
@@ -2549,6 +2556,29 @@ mod tests {
         repo.run(["init", "-b", "main"])?;
 
         assert_eq!(Git::new(repo.path()).upstream()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_push_urls_applies_push_instead_of_rewrites() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        repo.run([
+            "config",
+            "--add",
+            "url.https://github.com/fork/repo.git.pushInsteadOf",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        assert_eq!(
+            Git::new(repo.path()).remote_push_urls("origin")?,
+            vec!["https://github.com/fork/repo.git"]
+        );
         Ok(())
     }
 
