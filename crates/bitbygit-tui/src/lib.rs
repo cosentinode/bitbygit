@@ -119,7 +119,7 @@ pub struct App {
     selected_file: usize,
     file_scroll: usize,
     details: String,
-    pending_confirmation: Option<PendingAction>,
+    operation_queue: OperationQueue,
     should_quit: bool,
     last_viewport: Viewport,
 }
@@ -140,7 +140,7 @@ impl App {
             selected_file: 0,
             file_scroll: 0,
             details: "No repository status loaded yet.".to_owned(),
-            pending_confirmation: None,
+            operation_queue: OperationQueue::default(),
             should_quit: false,
             last_viewport: Viewport::default(),
         }
@@ -156,9 +156,9 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if let Some(requirement) = self
-            .pending_confirmation
-            .as_ref()
-            .map(|action| action.plan.confirmation.requirement)
+            .operation_queue
+            .pending()
+            .map(|operation| operation.plan.confirmation.requirement)
         {
             match key.code {
                 KeyCode::Char('Y')
@@ -194,15 +194,17 @@ impl App {
             KeyCode::Down => self.move_selection_down(),
             KeyCode::Char('a') if self.focus == Focus::Status => {
                 let plan = stage_all_plan();
-                self.details = plan.preview_text();
-                self.pending_confirmation =
-                    Some(PendingAction::new(plan, PendingPayload::StageAll));
+                self.submit_operation(
+                    plan,
+                    ExecutionContext::from_payload(PendingPayload::StageAll),
+                );
             }
             KeyCode::Char('A') if self.focus == Focus::Status => {
                 let plan = unstage_all_plan();
-                self.details = plan.preview_text();
-                self.pending_confirmation =
-                    Some(PendingAction::new(plan, PendingPayload::UnstageAll));
+                self.submit_operation(
+                    plan,
+                    ExecutionContext::from_payload(PendingPayload::UnstageAll),
+                );
             }
             KeyCode::Char('s') if self.focus == Focus::Status => self.stage_selected_file(),
             KeyCode::Char('u') if self.focus == Focus::Status => self.unstage_selected_file(),
@@ -229,7 +231,7 @@ impl App {
                 self.handle_key(key);
             }
             Event::Mouse(mouse)
-                if self.pending_confirmation.is_some()
+                if self.operation_queue.has_pending()
                     && mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
             {
                 self.cancel_pending();
@@ -376,12 +378,10 @@ impl App {
         }
         let pathspecs = file.pathspecs.clone();
         let plan = stage_paths_plan(file_path_labels(&pathspecs));
-        let message = execute_typed_plan(
-            &plan,
+        self.submit_operation(
+            plan,
             ExecutionContext::from_payload(PendingPayload::StagePaths { paths: pathspecs }),
         );
-        self.refresh_status();
-        self.details = message;
     }
 
     fn unstage_selected_file(&mut self) {
@@ -394,22 +394,39 @@ impl App {
         }
         let pathspecs = file.pathspecs.clone();
         let plan = unstage_paths_plan(file_path_labels(&pathspecs));
-        let message = execute_typed_plan(
-            &plan,
+        self.submit_operation(
+            plan,
             ExecutionContext::from_payload(PendingPayload::UnstagePaths { paths: pathspecs }),
         );
-        self.refresh_status();
+    }
+
+    fn submit_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
+        if plan.confirmation.requirement == ConfirmationRequirement::NormalSelection {
+            self.execute_operation(plan, context);
+        } else {
+            self.queue_operation(plan, context);
+        }
+    }
+
+    fn queue_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
+        self.details = plan.preview_text();
+        self.operation_queue
+            .enqueue(QueuedOperation::new(plan, context));
+    }
+
+    fn execute_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
+        let message = execute_typed_plan(&plan, context);
+        if should_refresh_status_after(&plan) {
+            self.refresh_status();
+        }
         self.details = message;
     }
 
     fn confirm_pending(&mut self) {
-        let Some(action) = self.pending_confirmation.take() else {
+        let Some(operation) = self.operation_queue.take_pending() else {
             return;
         };
-        let PendingAction { plan, payload } = action;
-        let message = execute_typed_plan(&plan, ExecutionContext::from_payload(payload));
-        self.refresh_status();
-        self.details = message;
+        self.execute_operation(operation.plan, operation.context);
     }
 
     fn submit_prompt(&mut self) {
@@ -474,24 +491,21 @@ impl App {
         let staged_count = staged_items.len();
         let plan = commit_plan(&message, staged_count);
 
-        self.pending_confirmation = Some(PendingAction::new(
+        self.submit_operation(
             plan.clone(),
-            PendingPayload::Commit {
+            ExecutionContext::from_payload(PendingPayload::Commit {
                 staged_items,
                 staged_tree,
                 target,
-            },
-        ));
+            }),
+        );
         self.prompt.clear();
-        self.details = plan.preview_text();
     }
 
     fn run_fetch(&mut self) {
         self.prompt.clear();
         let plan = fetch_plan();
-        let message = execute_typed_plan(&plan, ExecutionContext::default());
-        self.refresh_status();
-        self.details = message;
+        self.submit_operation(plan, ExecutionContext::default());
     }
 
     fn prepare_push(&mut self) {
@@ -565,9 +579,9 @@ impl App {
                         }
                     };
                 let plan = push_plan(&branch, upstream, status.branch.ahead);
-                self.pending_confirmation = Some(PendingAction::new(
+                self.submit_operation(
                     plan.clone(),
-                    PendingPayload::Push {
+                    ExecutionContext::from_payload(PendingPayload::Push {
                         local_branch: branch.clone(),
                         target: head_target.clone(),
                         remote,
@@ -575,9 +589,8 @@ impl App {
                         upstream: upstream.clone(),
                         expected_remote_oid,
                         remote_urls,
-                    },
-                ));
-                self.details = plan.preview_text();
+                    }),
+                );
             }
             None => {
                 let Some(remote) = default_remote_name() else {
@@ -607,17 +620,16 @@ impl App {
                         }
                     };
                 let plan = push_set_upstream_plan(&branch, &remote);
-                self.pending_confirmation = Some(PendingAction::new(
+                self.submit_operation(
                     plan.clone(),
-                    PendingPayload::PushSetUpstream {
+                    ExecutionContext::from_payload(PendingPayload::PushSetUpstream {
                         remote: remote.clone(),
                         branch: branch.clone(),
                         target: head_target,
                         expected_remote_oid,
                         remote_urls,
-                    },
-                ));
-                self.details = plan.preview_text();
+                    }),
+                );
             }
         }
     }
@@ -705,38 +717,36 @@ impl App {
         self.prompt.clear();
         let plan = pull_plan(rebase, &upstream, status.branch.behind);
         if rebase {
-            self.pending_confirmation = Some(PendingAction::new(
+            self.submit_operation(
                 plan.clone(),
-                PendingPayload::PullRebase {
+                ExecutionContext::from_payload(PendingPayload::PullRebase {
                     local_branch,
                     target: head_target,
                     upstream: upstream.clone(),
                     remote,
                     upstream_branch,
                     upstream_oid,
-                },
-            ));
-            self.details = plan.preview_text();
+                }),
+            );
         } else {
-            self.pending_confirmation = Some(PendingAction::new(
+            self.submit_operation(
                 plan.clone(),
-                PendingPayload::Pull {
+                ExecutionContext::from_payload(PendingPayload::Pull {
                     local_branch,
                     target: head_target,
                     upstream: upstream.clone(),
                     remote,
                     upstream_branch,
                     upstream_oid,
-                },
-            ));
-            self.details = plan.preview_text();
+                }),
+            );
         }
     }
 
     fn show_branches(&mut self) {
         self.prompt.clear();
         let plan = branches_plan();
-        self.details = execute_typed_plan(&plan, ExecutionContext::default());
+        self.submit_operation(plan, ExecutionContext::default());
     }
 
     fn prepare_checkout(&mut self, branch: String) {
@@ -770,14 +780,13 @@ impl App {
         }
         self.prompt.clear();
         let plan = checkout_plan(&branch_target);
-        self.pending_confirmation = Some(PendingAction::new(
+        self.submit_operation(
             plan.clone(),
-            PendingPayload::Checkout {
+            ExecutionContext::from_payload(PendingPayload::Checkout {
                 branch: branch_target.clone(),
                 target,
-            },
-        ));
-        self.details = plan.preview_text();
+            }),
+        );
     }
 
     fn prepare_create_branch(&mut self, branch: String, base: Option<String>) {
@@ -834,15 +843,14 @@ impl App {
             .unwrap_or_else(|| "unborn HEAD".to_owned());
         self.prompt.clear();
         let plan = create_branch_plan(&branch, base_target.as_ref(), &base_label);
-        self.pending_confirmation = Some(PendingAction::new(
+        self.submit_operation(
             plan.clone(),
-            PendingPayload::CreateBranch {
+            ExecutionContext::from_payload(PendingPayload::CreateBranch {
                 branch: branch.clone(),
                 base: base_target,
                 target,
-            },
-        ));
-        self.details = plan.preview_text();
+            }),
+        );
     }
 
     fn prepare_merge(&mut self, branch: String) {
@@ -877,14 +885,13 @@ impl App {
         }
         self.prompt.clear();
         let plan = merge_plan(&current, &branch_target);
-        self.pending_confirmation = Some(PendingAction::new(
+        self.submit_operation(
             plan.clone(),
-            PendingPayload::Merge {
+            ExecutionContext::from_payload(PendingPayload::Merge {
                 branch: branch_target.clone(),
                 target,
-            },
-        ));
-        self.details = plan.preview_text();
+            }),
+        );
     }
 
     fn prepare_rebase(&mut self, base: String) {
@@ -919,18 +926,17 @@ impl App {
         }
         self.prompt.clear();
         let plan = rebase_plan(&current, &base_target);
-        self.pending_confirmation = Some(PendingAction::new(
+        self.submit_operation(
             plan.clone(),
-            PendingPayload::Rebase {
+            ExecutionContext::from_payload(PendingPayload::Rebase {
                 base: base_target.clone(),
                 target,
-            },
-        ));
-        self.details = plan.preview_text();
+            }),
+        );
     }
 
     fn cancel_pending(&mut self) {
-        self.pending_confirmation = None;
+        self.operation_queue.clear();
         self.details = "Operation cancelled.".to_owned();
     }
 
@@ -954,15 +960,47 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingAction {
-    plan: OperationPlan,
-    payload: PendingPayload,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OperationQueue {
+    pending: Option<QueuedOperation>,
 }
 
-impl PendingAction {
-    fn new(plan: OperationPlan, payload: PendingPayload) -> Self {
-        Self { plan, payload }
+impl OperationQueue {
+    fn pending(&self) -> Option<&QueuedOperation> {
+        self.pending.as_ref()
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn enqueue(&mut self, operation: QueuedOperation) {
+        self.pending = Some(operation);
+    }
+
+    fn take_pending(&mut self) -> Option<QueuedOperation> {
+        self.pending.take()
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedOperation {
+    plan: OperationPlan,
+    context: ExecutionContext,
+}
+
+impl QueuedOperation {
+    fn new(plan: OperationPlan, context: ExecutionContext) -> Self {
+        Self { plan, context }
+    }
+
+    #[cfg(test)]
+    fn with_payload(plan: OperationPlan, payload: PendingPayload) -> Self {
+        Self::new(plan, ExecutionContext::from_payload(payload))
     }
 }
 
@@ -1807,13 +1845,71 @@ fn details_panel(app: &App) -> Paragraph<'_> {
 }
 
 fn queue_panel(app: &App) -> Paragraph<'_> {
-    let text = vec![
-        Line::from("No queued operations."),
-        Line::from("Tab cycles focus. q exits."),
-    ];
+    let text = queue_panel_text(app.operation_queue.pending())
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     Paragraph::new(text)
         .block(panel_block("Queue", app.focus == Focus::Queue))
         .wrap(Wrap { trim: true })
+}
+
+fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
+    let Some(operation) = pending else {
+        return vec![
+            "No queued operations.".to_owned(),
+            "Plans that need confirmation will appear here.".to_owned(),
+        ];
+    };
+    let plan = &operation.plan;
+    vec![
+        format!(
+            "Pending: {} | Risk: {}",
+            plan.title,
+            risk_label(plan.confirmation.risk_level)
+        ),
+        format!("Steps: {}", plan_steps_summary(plan)),
+        format!("Confirm: {}", confirmation_copy(plan)),
+    ]
+}
+
+fn plan_steps_summary(plan: &OperationPlan) -> String {
+    plan.steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let details = if step.details.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", step.details.join("; "))
+            };
+            format!("{}. {}{}", index + 1, step.summary, details)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn confirmation_copy(plan: &OperationPlan) -> String {
+    if !plan.confirmation.prompt.is_empty() {
+        return plan.confirmation.prompt.clone();
+    }
+    match plan.confirmation.requirement {
+        ConfirmationRequirement::NormalSelection => "Runs after normal selection.".to_owned(),
+        ConfirmationRequirement::VisiblePlan => "Press y to confirm or n to cancel.".to_owned(),
+        ConfirmationRequirement::ExplicitConfirmation => {
+            "Press uppercase Y to confirm or n to cancel.".to_owned()
+        }
+        ConfirmationRequirement::Blocked => "Blocked by policy.".to_owned(),
+    }
+}
+
+fn risk_label(risk: RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::Low => "low",
+        RiskLevel::Medium => "medium",
+        RiskLevel::High => "high",
+        RiskLevel::BlockedByDefault => "blocked by default",
+    }
 }
 
 fn prompt_panel(app: &App) -> Paragraph<'_> {
@@ -1872,7 +1968,11 @@ fn execute_typed_plan(plan: &OperationPlan, context: ExecutionContext) -> String
     PlanExecutor::current().execute(plan, context).message()
 }
 
-#[derive(Debug, Clone, Default)]
+fn should_refresh_status_after(plan: &OperationPlan) -> bool {
+    !matches!(plan.request, OperationRequest::Branches)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ExecutionContext {
     payload: Option<PendingPayload>,
 }
@@ -3224,17 +3324,31 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a')));
 
         assert_eq!(
-            app.pending_confirmation
-                .as_ref()
-                .map(|action| &action.payload),
+            app.operation_queue
+                .pending()
+                .and_then(|operation| operation.context.payload.as_ref()),
             Some(&PendingPayload::StageAll)
         );
         assert!(app.details.contains("Stage all plan:"));
+        let queue_text = queue_panel_text(app.operation_queue.pending());
+        assert!(queue_text[0].contains("Stage all plan"));
+        assert!(queue_text[0].contains("Risk: medium"));
+        assert!(queue_text[1].contains("stage all working tree changes"));
+        assert!(queue_text[2].contains("Press y to stage all changes"));
 
         app.handle_key(key(KeyCode::Char('n')));
 
-        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.operation_queue.pending(), None);
         assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn queue_panel_shows_empty_placeholder_only_without_pending_plan() {
+        let app = App::new();
+
+        let queue_text = queue_panel_text(app.operation_queue.pending());
+
+        assert_eq!(queue_text[0], "No queued operations.");
     }
 
     #[test]
@@ -3245,7 +3359,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Down));
 
-        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.operation_queue.pending(), None);
         assert_eq!(app.details, "Operation cancelled.");
     }
 
@@ -3263,7 +3377,7 @@ mod tests {
         };
 
         let actions = [
-            PendingAction::new(
+            QueuedOperation::with_payload(
                 pull_plan(true, "origin/main", 1),
                 PendingPayload::PullRebase {
                     local_branch: "feature/new".to_owned(),
@@ -3274,7 +3388,7 @@ mod tests {
                     upstream_oid: Some("abcdef1234567890".to_owned()),
                 },
             ),
-            PendingAction::new(
+            QueuedOperation::with_payload(
                 rebase_plan("feature/new", &branch),
                 PendingPayload::Rebase {
                     base: branch,
@@ -3285,16 +3399,16 @@ mod tests {
 
         for action in actions {
             let mut app = App::new();
-            let payload = action.payload.clone();
-            app.pending_confirmation = Some(action);
+            let payload = action.context.payload.clone();
+            app.operation_queue.enqueue(action);
 
             app.handle_key(key(KeyCode::Char('y')));
 
             assert_eq!(
-                app.pending_confirmation
-                    .as_ref()
-                    .map(|action| &action.payload),
-                Some(&payload)
+                app.operation_queue
+                    .pending()
+                    .and_then(|operation| operation.context.payload.as_ref()),
+                payload.as_ref()
             );
             assert_eq!(
                 app.details,
@@ -3316,7 +3430,7 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         }));
 
-        assert_eq!(app.pending_confirmation, None);
+        assert_eq!(app.operation_queue.pending(), None);
         assert_eq!(app.details, "Operation cancelled.");
     }
 
