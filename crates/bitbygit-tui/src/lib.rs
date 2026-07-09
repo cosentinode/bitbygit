@@ -4282,16 +4282,26 @@ mod tests {
 
         assert!(execution.succeeded(), "{}", execution.message());
         let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
-        for invocation in invocations.lines().filter(|line| {
-            line.starts_with("repo:view")
-                || line.starts_with("pr:list")
-                || line.starts_with("pr:create")
-        }) {
+        for invocation in invocations
+            .lines()
+            .filter(|line| line.starts_with("repo:view"))
+        {
+            assert!(invocation.contains("view github.com/upstream/repo"));
+            assert!(!invocation.contains("--repo"));
+        }
+        for invocation in invocations
+            .lines()
+            .filter(|line| line.starts_with("api:--method"))
+        {
+            assert!(invocation.contains("repos/upstream/repo/pulls"));
+            assert!(invocation.contains("head=octo:feature/open-pr"));
+        }
+        for invocation in invocations
+            .lines()
+            .filter(|line| line.starts_with("pr:create"))
+        {
             assert!(invocation.contains("--repo github.com/upstream/repo"));
-            assert!(!invocation.contains("--repo github.com/octo/repo"));
-            if invocation.starts_with("pr:list") || invocation.starts_with("pr:create") {
-                assert!(invocation.contains("octo:feature/open-pr"));
-            }
+            assert!(invocation.contains("octo:feature/open-pr"));
         }
         Ok(())
     }
@@ -5217,7 +5227,7 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\npr:list) printf '%s\\n' '{}' ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
+                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) case \"$*\" in *--repo*) exit 1 ;; esac; printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\napi:--method) case \"$*\" in *--head*|*'--limit 0'*) exit 1 ;; esac; printf '%s\\n' '[{}]' ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
                 invocations.display(),
                 pull_requests,
                 create_response

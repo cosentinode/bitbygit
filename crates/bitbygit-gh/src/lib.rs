@@ -64,12 +64,55 @@ impl GitHub {
 
     pub fn repository(&self) -> Result<Repository, GhError> {
         self.ensure_ready()?;
-        let output = self.run_output(self.with_repository(vec![
-            "repo".to_owned(),
-            "view".to_owned(),
+        self.repository_after_ready()
+    }
+
+    pub fn existing_pull_requests(&self, head: &str) -> Result<Vec<PullRequest>, GhError> {
+        self.ensure_ready()?;
+        let repository = self.repository_after_ready()?;
+        let (owner, branch) = match head.split_once(':') {
+            Some((owner, branch)) => (owner, branch),
+            None => (
+                repository
+                    .name_with_owner
+                    .split_once('/')
+                    .map_or("", |(owner, _)| owner),
+                head,
+            ),
+        };
+        if owner.is_empty() || branch.is_empty() {
+            return Err(GhError::InvalidInput {
+                name: "pull request head",
+            });
+        }
+        let output = self.run_output(vec![
+            "api".to_owned(),
+            "--method".to_owned(),
+            "GET".to_owned(),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+            format!("repos/{}/pulls", repository.name_with_owner),
+            "-f".to_owned(),
+            "state=open".to_owned(),
+            "-f".to_owned(),
+            format!("head={owner}:{branch}"),
+            "-f".to_owned(),
+            "per_page=100".to_owned(),
+        ])?;
+        let pages: Vec<Vec<PullRequest>> = parse_json(&output, "pull request query")?;
+        Ok(pages.into_iter().flatten().collect())
+    }
+
+    fn repository_after_ready(&self) -> Result<Repository, GhError> {
+        let mut args = vec!["repo".to_owned(), "view".to_owned()];
+        if let Some(repository) = &self.repository {
+            args.push(repository.clone());
+        }
+        args.extend([
             "--json".to_owned(),
             "nameWithOwner,defaultBranchRef".to_owned(),
-        ]))?;
+        ]);
+        let output = self.run_output(args)?;
         let repository: RepositoryResponse = parse_json(&output, "repository")?;
         let default_branch = repository
             .default_branch_ref
@@ -82,23 +125,6 @@ impl GitHub {
             name_with_owner: repository.name_with_owner,
             default_branch,
         })
-    }
-
-    pub fn existing_pull_requests(&self, head: &str) -> Result<Vec<PullRequest>, GhError> {
-        self.ensure_ready()?;
-        let output = self.run_output(self.with_repository(vec![
-            "pr".to_owned(),
-            "list".to_owned(),
-            "--head".to_owned(),
-            head.to_owned(),
-            "--state".to_owned(),
-            "open".to_owned(),
-            "--limit".to_owned(),
-            "0".to_owned(),
-            "--json".to_owned(),
-            "number,url,title,baseRefName,headRefName,headRepository".to_owned(),
-        ]))?;
-        parse_json(&output, "pull request query")
     }
 
     pub fn create_pull_request(
@@ -413,9 +439,13 @@ mod tests {
     #[test]
     fn queries_repository_and_all_existing_pull_requests() -> Result<(), Box<dyn Error>> {
         let fake = FakeGh::new(
-            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\npr:list) printf '%s\\n' '[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRepository\":{\"nameWithOwner\":\"octo/repo\"}}]' ;;\nesac",
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRepository\":{\"nameWithOwner\":\"octo/repo\"}}]]' ;;\n*) exit 1 ;;\nesac",
         )?;
-        let github = fake.github();
+        let github = GitHub::with_executable_and_repository(
+            &fake.path,
+            &fake.executable,
+            "github.com/octo/repo",
+        );
 
         let repository = github.repository()?;
         let pull_requests = github.existing_pull_requests("feature")?;
@@ -433,9 +463,12 @@ mod tests {
             Some("octo/repo")
         );
         assert!(fake.invocations()?.contains(
-            "pr\u{1f}list\u{1f}--head\u{1f}feature\u{1f}--state\u{1f}open\u{1f}--limit\u{1f}0\u{1f}--json\u{1f}number,url,title,baseRefName,headRefName,headRepository\u{1f}\n"
+            "repo\u{1f}view\u{1f}github.com/octo/repo\u{1f}--json\u{1f}nameWithOwner,defaultBranchRef\u{1f}\n"
         ));
-        assert_eq!(fake.prompt_values()?, "1\n1\n1\n1\n1\n1\n");
+        assert!(fake.invocations()?.contains(
+            "api\u{1f}--method\u{1f}GET\u{1f}--paginate\u{1f}--slurp\u{1f}repos/octo/repo/pulls\u{1f}-f\u{1f}state=open\u{1f}-f\u{1f}head=octo:feature\u{1f}-f\u{1f}per_page=100\u{1f}\n"
+        ));
+        assert_eq!(fake.prompt_values()?, "1\n1\n1\n1\n1\n1\n1\n");
         Ok(())
     }
 
