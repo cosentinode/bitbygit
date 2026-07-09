@@ -39,6 +39,9 @@ pub enum OperationRequest {
     Rebase {
         base: String,
     },
+    PromptSequence {
+        requests: Vec<OperationRequest>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

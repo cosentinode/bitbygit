@@ -437,30 +437,52 @@ impl App {
         let Some(operation) = self.operation_queue.take_pending() else {
             return;
         };
-        self.execute_operation(operation.plan, operation.context);
+        if let Some(sequence) = operation.sequence {
+            self.execute_prompt_sequence(sequence);
+        } else {
+            self.execute_operation(operation.plan, operation.context);
+        }
+    }
+
+    fn execute_prompt_sequence(&mut self, sequence: QueuedPromptSequence) {
+        let result = PromptSequenceExecutor::current().execute(sequence);
+        if result.should_refresh_status() {
+            self.refresh_status();
+        }
+        self.details = result.message();
     }
 
     fn submit_prompt(&mut self) {
-        let request = match parse_prompt(&self.prompt) {
-            Ok(ParsedPrompt::Single(request)) => request,
-            Ok(ParsedPrompt::Sequence(requests)) => {
-                self.details = format!(
-                    "Prompt sequences are parsed but not executable yet ({} steps). Run one prompt at a time for now.",
-                    requests.len()
-                );
-                return;
-            }
+        let parsed = match parse_prompt(&self.prompt) {
+            Ok(parsed) => parsed,
             Err(error) => {
                 self.details = error.to_string();
                 return;
             }
         };
-        match OperationPlanner::current().plan_request(request) {
-            Ok(operation) => {
-                self.prompt.clear();
-                self.submit_prepared_operation(operation);
+        match parsed {
+            ParsedPrompt::Single(request) => {
+                match OperationPlanner::current().plan_request(request) {
+                    Ok(operation) => {
+                        self.prompt.clear();
+                        self.submit_prepared_operation(operation);
+                    }
+                    Err(error) => self.details = error,
+                }
             }
-            Err(error) => self.details = error,
+            ParsedPrompt::Sequence(requests) => {
+                match OperationPlanner::current().plan_prompt_sequence(requests) {
+                    Ok(sequence) => {
+                        self.prompt.clear();
+                        self.details = sequence.plan.preview_text();
+                        self.operation_queue.enqueue(QueuedOperation::new_sequence(
+                            sequence.plan,
+                            sequence.sequence,
+                        ));
+                    }
+                    Err(error) => self.details = error,
+                }
+            }
         }
     }
 
@@ -520,11 +542,24 @@ impl OperationQueue {
 struct QueuedOperation {
     plan: OperationPlan,
     context: ExecutionContext,
+    sequence: Option<QueuedPromptSequence>,
 }
 
 impl QueuedOperation {
     fn new(plan: OperationPlan, context: ExecutionContext) -> Self {
-        Self { plan, context }
+        Self {
+            plan,
+            context,
+            sequence: None,
+        }
+    }
+
+    fn new_sequence(plan: OperationPlan, sequence: QueuedPromptSequence) -> Self {
+        Self {
+            plan,
+            context: ExecutionContext::default(),
+            sequence: Some(sequence),
+        }
     }
 
     #[cfg(test)]
@@ -542,6 +577,37 @@ struct PreparedOperation {
 impl PreparedOperation {
     fn new(plan: OperationPlan, context: ExecutionContext) -> Self {
         Self { plan, context }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedPromptSequence {
+    plan: OperationPlan,
+    sequence: QueuedPromptSequence,
+}
+
+impl PreparedPromptSequence {
+    fn new(plan: OperationPlan, sequence: QueuedPromptSequence) -> Self {
+        Self { plan, sequence }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedPromptSequence {
+    first: PreparedOperation,
+    remaining_requests: Vec<OperationRequest>,
+}
+
+impl QueuedPromptSequence {
+    fn new(first: PreparedOperation, remaining_requests: Vec<OperationRequest>) -> Self {
+        Self {
+            first,
+            remaining_requests,
+        }
+    }
+
+    fn total_steps(&self) -> usize {
+        1 + self.remaining_requests.len()
     }
 }
 
@@ -1121,6 +1187,175 @@ fn rebase_plan(current: &str, base: &BranchTarget) -> OperationPlan {
     )
 }
 
+fn prompt_sequence_plan(
+    requests: &[OperationRequest],
+    first: &PreparedOperation,
+) -> Result<OperationPlan, String> {
+    let Some(first_step) = first.plan.first_step() else {
+        return Err("Prompt sequence blocked: first step produced no visible plan.".to_owned());
+    };
+    let mut steps = vec![prompt_sequence_first_step(1, first_step)];
+    for (index, request) in requests.iter().enumerate().skip(1) {
+        steps.push(prompt_sequence_deferred_step(index + 1, request)?);
+    }
+    let confirmation_prompt = prompt_sequence_confirmation_prompt(&steps, requests.len());
+    Ok(OperationPlan::new(
+        OperationRequest::PromptSequence {
+            requests: requests.to_vec(),
+        },
+        "Prompt sequence plan",
+        steps,
+        confirmation_prompt,
+    ))
+}
+
+fn prompt_sequence_first_step(index: usize, step: &OperationStep) -> OperationStep {
+    let mut preview = OperationStep::new(
+        step.kind,
+        sequence_step_risk(step.risk_level),
+        format!("{index}. {}", step.summary),
+    );
+    for detail in &step.details {
+        preview = preview.with_detail(detail.clone());
+    }
+    preview
+}
+
+fn prompt_sequence_deferred_step(
+    index: usize,
+    request: &OperationRequest,
+) -> Result<OperationStep, String> {
+    let preview = prompt_sequence_request_preview(request)?;
+    let mut step = OperationStep::new(
+        preview.kind,
+        sequence_step_risk(preview.risk_level),
+        format!("{index}. {}", preview.summary),
+    );
+    for detail in preview.details {
+        step = step.with_detail(detail);
+    }
+    Ok(step.with_detail(format!(
+        "planned after step {} succeeds",
+        index.saturating_sub(1)
+    )))
+}
+
+fn prompt_sequence_confirmation_prompt(steps: &[OperationStep], step_count: usize) -> String {
+    let risk_level = steps
+        .iter()
+        .map(|step| step.risk_level)
+        .max()
+        .unwrap_or(RiskLevel::Medium);
+    if risk_level >= RiskLevel::High {
+        format!(
+            "Explicit confirmation required: press uppercase Y to run {step_count} prompt steps or n to cancel."
+        )
+    } else {
+        format!("Press y to run {step_count} prompt steps or n to cancel.")
+    }
+}
+
+fn sequence_step_risk(risk_level: RiskLevel) -> RiskLevel {
+    risk_level.max(RiskLevel::Medium)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptSequenceStepPreview {
+    kind: OperationKind,
+    risk_level: RiskLevel,
+    summary: String,
+    details: Vec<String>,
+}
+
+impl PromptSequenceStepPreview {
+    fn new(kind: OperationKind, risk_level: RiskLevel, summary: impl Into<String>) -> Self {
+        Self {
+            kind,
+            risk_level,
+            summary: summary.into(),
+            details: Vec::new(),
+        }
+    }
+
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.details.push(detail.into());
+        self
+    }
+}
+
+fn prompt_sequence_request_preview(
+    request: &OperationRequest,
+) -> Result<PromptSequenceStepPreview, String> {
+    match request {
+        OperationRequest::Fetch => Ok(PromptSequenceStepPreview::new(
+            OperationKind::Fetch,
+            RiskLevel::Low,
+            "fetch default remote",
+        )),
+        OperationRequest::Branches => Ok(PromptSequenceStepPreview::new(
+            OperationKind::Branches,
+            RiskLevel::Low,
+            "list local and remote branches",
+        )),
+        OperationRequest::Commit { message } => Ok(PromptSequenceStepPreview::new(
+            OperationKind::Commit,
+            RiskLevel::Medium,
+            "commit staged changes",
+        )
+        .with_detail(format!("message: {message}"))),
+        OperationRequest::Push => Ok(PromptSequenceStepPreview::new(
+            OperationKind::PushCurrentBranch,
+            RiskLevel::Medium,
+            "push current branch",
+        )),
+        OperationRequest::Pull { rebase: true } => Ok(PromptSequenceStepPreview::new(
+            OperationKind::PullRebase,
+            RiskLevel::High,
+            "rebase current branch onto upstream",
+        )),
+        OperationRequest::Pull { rebase: false } => Ok(PromptSequenceStepPreview::new(
+            OperationKind::PullFastForward,
+            RiskLevel::Medium,
+            "fast-forward from upstream",
+        )),
+        OperationRequest::Checkout { branch } => Ok(PromptSequenceStepPreview::new(
+            OperationKind::CheckoutBranch,
+            RiskLevel::Medium,
+            format!("checkout {branch}"),
+        )),
+        OperationRequest::CreateBranch { branch, base } => {
+            let preview = PromptSequenceStepPreview::new(
+                OperationKind::CreateBranch,
+                RiskLevel::Medium,
+                format!("create and switch to {branch}"),
+            );
+            Ok(match base {
+                Some(base) => preview.with_detail(format!("base: {base}")),
+                None => preview,
+            })
+        }
+        OperationRequest::Merge { branch } => Ok(PromptSequenceStepPreview::new(
+            OperationKind::MergeFastForward,
+            RiskLevel::Medium,
+            format!("fast-forward current branch to {branch}"),
+        )),
+        OperationRequest::Rebase { base } => Ok(PromptSequenceStepPreview::new(
+            OperationKind::Rebase,
+            RiskLevel::High,
+            format!("rebase current branch onto {base}"),
+        )),
+        OperationRequest::RefreshStatus
+        | OperationRequest::ViewDiff { .. }
+        | OperationRequest::StagePaths { .. }
+        | OperationRequest::UnstagePaths { .. }
+        | OperationRequest::StageAll
+        | OperationRequest::UnstageAll
+        | OperationRequest::PromptSequence { .. } => {
+            Err("unsupported request in prompt sequence".to_owned())
+        }
+    }
+}
+
 fn repo_list(app: &App) -> List<'_> {
     let items = app
         .repos
@@ -1255,7 +1490,35 @@ impl OperationPlanner {
             }
             OperationRequest::Merge { branch } => self.plan_merge(branch),
             OperationRequest::Rebase { base } => self.plan_rebase(base),
+            OperationRequest::PromptSequence { .. } => {
+                Err("Prompt sequences are handled by prompt submission.".to_owned())
+            }
         }
+    }
+
+    fn plan_prompt_sequence(
+        &self,
+        requests: Vec<OperationRequest>,
+    ) -> Result<PreparedPromptSequence, String> {
+        if requests.len() < 2 {
+            return Err("Prompt sequence requires at least two steps.".to_owned());
+        }
+        for (index, request) in requests.iter().enumerate() {
+            prompt_sequence_request_preview(request).map_err(|error| {
+                format!("Prompt sequence step {} is blocked: {error}", index + 1)
+            })?;
+        }
+        let first_request = requests
+            .first()
+            .cloned()
+            .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
+        let first = self.plan_request(first_request)?;
+        let plan = prompt_sequence_plan(&requests, &first)?;
+        let remaining_requests = requests.into_iter().skip(1).collect();
+        Ok(PreparedPromptSequence::new(
+            plan,
+            QueuedPromptSequence::new(first, remaining_requests),
+        ))
     }
 
     fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
@@ -2208,6 +2471,178 @@ impl PlanExecutor {
 }
 
 #[derive(Debug, Clone)]
+struct PromptSequenceExecutor {
+    repo_root: PathBuf,
+    audit: AuditDestination,
+}
+
+impl PromptSequenceExecutor {
+    fn current() -> Self {
+        Self {
+            repo_root: current_dir(),
+            audit: AuditDestination::Environment,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_audit_paths(repo_root: impl Into<PathBuf>, paths: StorePaths) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+            audit: AuditDestination::Paths(paths),
+        }
+    }
+
+    fn execute(&self, sequence: QueuedPromptSequence) -> PromptSequenceExecutionResult {
+        let total_steps = sequence.total_steps();
+        let planner = OperationPlanner {
+            repo_root: self.repo_root.clone(),
+        };
+        let executor = PlanExecutor {
+            repo_root: self.repo_root.clone(),
+            audit: self.audit.clone(),
+        };
+        let mut step_results = Vec::with_capacity(total_steps);
+
+        let first = Self::execute_prepared_step(&executor, 1, sequence.first);
+        let first_succeeded = first.succeeded;
+        step_results.push(first);
+        if !first_succeeded {
+            return PromptSequenceExecutionResult::new(total_steps, step_results);
+        }
+
+        for (index, request) in sequence.remaining_requests.into_iter().enumerate() {
+            let step_number = index + 2;
+            let operation = match planner.plan_request(request.clone()) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    step_results.push(PromptSequenceStepResult::planning_failed(
+                        step_number,
+                        prompt_sequence_request_title(&request),
+                        error,
+                    ));
+                    return PromptSequenceExecutionResult::new(total_steps, step_results);
+                }
+            };
+            let step = Self::execute_prepared_step(&executor, step_number, operation);
+            let succeeded = step.succeeded;
+            step_results.push(step);
+            if !succeeded {
+                return PromptSequenceExecutionResult::new(total_steps, step_results);
+            }
+        }
+
+        PromptSequenceExecutionResult::new(total_steps, step_results)
+    }
+
+    fn execute_prepared_step(
+        executor: &PlanExecutor,
+        step_number: usize,
+        operation: PreparedOperation,
+    ) -> PromptSequenceStepResult {
+        let title = operation.plan.title.clone();
+        let refresh_status = should_refresh_status_after(&operation.plan);
+        let execution = executor.execute(&operation.plan, operation.context);
+        PromptSequenceStepResult::executed(
+            step_number,
+            title,
+            execution.message(),
+            execution.succeeded(),
+            refresh_status,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct PromptSequenceExecutionResult {
+    total_steps: usize,
+    step_results: Vec<PromptSequenceStepResult>,
+}
+
+impl PromptSequenceExecutionResult {
+    fn new(total_steps: usize, step_results: Vec<PromptSequenceStepResult>) -> Self {
+        Self {
+            total_steps,
+            step_results,
+        }
+    }
+
+    fn should_refresh_status(&self) -> bool {
+        self.step_results.iter().any(|result| result.refresh_status)
+    }
+
+    fn message(&self) -> String {
+        let failed_step = self.step_results.iter().find(|result| !result.succeeded);
+        let mut lines = match failed_step {
+            Some(result) if result.planned => vec![format!(
+                "Prompt sequence stopped after step {} of {}.",
+                result.step_number, self.total_steps
+            )],
+            Some(result) => vec![format!(
+                "Prompt sequence stopped before step {} of {}.",
+                result.step_number, self.total_steps
+            )],
+            None => vec![format!(
+                "Prompt sequence completed {} step(s).",
+                self.total_steps
+            )],
+        };
+        lines.extend(self.step_results.iter().map(|result| {
+            format!(
+                "Step {} ({}): {}",
+                result.step_number, result.title, result.message
+            )
+        }));
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug)]
+struct PromptSequenceStepResult {
+    step_number: usize,
+    title: String,
+    message: String,
+    succeeded: bool,
+    refresh_status: bool,
+    planned: bool,
+}
+
+impl PromptSequenceStepResult {
+    fn executed(
+        step_number: usize,
+        title: String,
+        message: String,
+        succeeded: bool,
+        refresh_status: bool,
+    ) -> Self {
+        Self {
+            step_number,
+            title,
+            message,
+            succeeded,
+            refresh_status,
+            planned: true,
+        }
+    }
+
+    fn planning_failed(step_number: usize, title: String, error: String) -> Self {
+        Self {
+            step_number,
+            title,
+            message: format!("planning failed: {error}"),
+            succeeded: false,
+            refresh_status: false,
+            planned: false,
+        }
+    }
+}
+
+fn prompt_sequence_request_title(request: &OperationRequest) -> String {
+    prompt_sequence_request_preview(request)
+        .map(|preview| preview.summary)
+        .unwrap_or_else(|_error| "prompt step".to_owned())
+}
+
+#[derive(Debug, Clone)]
 enum AuditDestination {
     Environment,
     #[cfg(test)]
@@ -2234,6 +2669,12 @@ struct PlanExecutionResult {
 }
 
 impl PlanExecutionResult {
+    fn succeeded(&self) -> bool {
+        self.plan_error.is_none()
+            && self.step_results.len() == self.planned_step_count
+            && self.step_results.iter().all(StepExecutionResult::succeeded)
+    }
+
     fn message(&self) -> String {
         if let Some(error) = &self.plan_error {
             return operation_message("operation", Err(error.clone()));
@@ -2820,17 +3261,39 @@ mod tests {
     }
 
     #[test]
-    fn prompt_sequences_are_not_executed_yet() {
+    fn prompt_sequences_queue_visible_ordered_plan() -> Result<(), Box<dyn Error>> {
         let mut app = App::new();
         app.focus = Focus::Prompt;
-        app.prompt = "fetch and push".to_owned();
+        app.prompt = "fetch && branches".to_owned();
 
         app.submit_prompt();
 
-        assert!(
-            app.details
-                .contains("Prompt sequences are parsed but not executable yet")
+        assert!(app.prompt.is_empty());
+        assert!(app.details.contains("Prompt sequence plan:"));
+        assert!(app.details.contains("1. fetch default remote"));
+        assert!(app.details.contains("2. list local and remote branches"));
+        assert!(app.details.contains("Press y to run 2 prompt steps"));
+        let pending = app
+            .operation_queue
+            .pending()
+            .ok_or_else(|| std::io::Error::other("missing queued prompt sequence"))?;
+        assert!(pending.sequence.is_some());
+        assert_eq!(
+            pending.plan.confirmation.requirement,
+            ConfirmationRequirement::VisiblePlan
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_mixed_prompt_sequence_rejects_without_queue() {
+        let mut app = App::new();
+        app.focus = Focus::Prompt;
+        app.prompt = "fetch and git push".to_owned();
+
+        app.submit_prompt();
+
+        assert!(app.details.contains("Raw Git commands are not supported"));
         assert_eq!(app.operation_queue.pending(), None);
     }
 
@@ -2883,6 +3346,156 @@ mod tests {
             ConfirmationRequirement::VisiblePlan
         );
         assert!(!prompt_operation.plan.preview_text().contains("commit -m"));
+        Ok(())
+    }
+
+    #[test]
+    fn commit_push_sequence_previews_ordered_plan_without_planning_push()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-preview")?;
+        std::fs::write(repo.join("file.txt"), "hello\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        let requests = vec![
+            OperationRequest::Commit {
+                message: "ship staged".to_owned(),
+            },
+            OperationRequest::Push,
+        ];
+        let planner = OperationPlanner::new(repo);
+
+        let sequence = planner
+            .plan_prompt_sequence(requests)
+            .map_err(std::io::Error::other)?;
+        let manual_commit = planner
+            .plan_request(OperationRequest::Commit {
+                message: "ship staged".to_owned(),
+            })
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(sequence.sequence.first, manual_commit);
+        assert_eq!(
+            sequence.sequence.remaining_requests,
+            vec![OperationRequest::Push]
+        );
+        let preview = sequence.plan.preview_text();
+        assert!(preview.contains("Prompt sequence plan:"));
+        assert!(preview.contains("1. commit 1 staged file(s)"));
+        assert!(preview.contains("message: ship staged"));
+        assert!(preview.contains("2. push current branch"));
+        assert!(preview.contains("planned after step 1 succeeds"));
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::VisiblePlan
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_sequence_preparation_failure_does_not_queue_push() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-no-staged")?;
+        let planner = OperationPlanner::new(repo);
+
+        let error = match planner.plan_prompt_sequence(vec![
+            OperationRequest::Commit {
+                message: "ship staged".to_owned(),
+            },
+            OperationRequest::Push,
+        ]) {
+            Ok(_sequence) => {
+                return Err(std::io::Error::other(
+                    "commit preparation should fail before push is planned",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains("there are no staged changes"));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_sequence_stops_before_push_when_commit_execution_fails() -> Result<(), Box<dyn Error>>
+    {
+        let repo = isolated_git_repo("prompt-sequence-commit-fails")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "hello\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![
+                OperationRequest::Commit {
+                    message: "ship staged".to_owned(),
+                },
+                OperationRequest::Push,
+            ])
+            .map_err(std::io::Error::other)?;
+        std::fs::write(repo.join("file.txt"), "changed after preview\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        let paths = isolated_store_paths("prompt-sequence-commit-fails-audit")?;
+
+        let result = PromptSequenceExecutor::with_audit_paths(&repo, paths.clone())
+            .execute(sequence.sequence);
+
+        assert!(
+            result
+                .message()
+                .contains("Prompt sequence stopped after step 1 of 2.")
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        let operations = entries
+            .iter()
+            .map(|entry| entry.operation.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(operations, vec!["commit", "commit"]);
+        assert_eq!(entries[1].result, "error");
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_sequence_replans_push_after_commit() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-replan-push")?;
+        let remote = isolated_bare_git_repo("prompt-sequence-replan-push-remote")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        let remote_arg = remote.to_string_lossy().to_string();
+        git_stdout(&repo, &["remote", "add", "origin", remote_arg.as_str()])?;
+        git_stdout(&repo, &["push", "-u", "origin", branch.as_str()])?;
+        std::fs::write(repo.join("file.txt"), "changed\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![
+                OperationRequest::Commit {
+                    message: "ship staged".to_owned(),
+                },
+                OperationRequest::Push,
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("prompt-sequence-replan-push-audit")?;
+
+        let result = PromptSequenceExecutor::with_audit_paths(&repo, paths.clone())
+            .execute(sequence.sequence);
+
+        assert!(
+            result
+                .message()
+                .contains("Prompt sequence completed 2 step(s).")
+        );
+        let local_head = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let remote_ref = format!("refs/heads/{branch}");
+        let remote_head = git_stdout(&repo, &["ls-remote", "origin", remote_ref.as_str()])?;
+        assert!(remote_head.starts_with(local_head.trim()));
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        let operations = entries
+            .iter()
+            .map(|entry| entry.operation.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(operations, vec!["commit", "commit", "push", "push"]);
+        assert!(entries.iter().all(|entry| entry.result != "error"));
         Ok(())
     }
 
@@ -3690,6 +4303,23 @@ mod tests {
         if !output.status.success() {
             return Err(std::io::Error::other(format!(
                 "git init failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(root)
+    }
+
+    fn isolated_bare_git_repo(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let root = isolated_temp_root(name)?;
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&root)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "git init --bare failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             ))
             .into());

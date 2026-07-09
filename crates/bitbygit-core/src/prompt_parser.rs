@@ -81,9 +81,6 @@ fn split_prompt_sequence(input: &str) -> Result<Vec<&str>, PromptParseError> {
         }
 
         if !in_quote {
-            if is_shell_metacharacter(character) {
-                return Err(parse_error(SHELL_SYNTAX_MESSAGE));
-            }
             if let Some(connector_len) = connector_len_at(input, index) {
                 let segment = input[segment_start..index].trim();
                 if segment.is_empty() {
@@ -93,6 +90,9 @@ fn split_prompt_sequence(input: &str) -> Result<Vec<&str>, PromptParseError> {
                 index += connector_len;
                 segment_start = index;
                 continue;
+            }
+            if is_shell_metacharacter(character) {
+                return Err(parse_error(SHELL_SYNTAX_MESSAGE));
             }
         }
 
@@ -114,6 +114,9 @@ fn split_prompt_sequence(input: &str) -> Result<Vec<&str>, PromptParseError> {
 }
 
 fn connector_len_at(input: &str, index: usize) -> Option<usize> {
+    if input[index..].starts_with("&&") {
+        return Some(2);
+    }
     ["and", "then"].into_iter().find_map(|connector| {
         if ascii_word_at(input, index, connector) {
             Some(connector.len())
@@ -373,6 +376,13 @@ mod tests {
                 OperationRequest::Pull { rebase: true },
             ]))
         );
+        assert_eq!(
+            parse_prompt("fetch && push"),
+            Ok(ParsedPrompt::Sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Push,
+            ]))
+        );
     }
 
     #[test]
@@ -381,6 +391,12 @@ mod tests {
             parse_prompt("commit -m \"fix auth and routing then cleanup\""),
             Ok(ParsedPrompt::Single(OperationRequest::Commit {
                 message: "fix auth and routing then cleanup".to_owned(),
+            }))
+        );
+        assert_eq!(
+            parse_prompt("commit -m \"fix auth && routing\""),
+            Ok(ParsedPrompt::Single(OperationRequest::Commit {
+                message: "fix auth && routing".to_owned(),
             }))
         );
     }
@@ -400,7 +416,6 @@ mod tests {
             ),
             ("push --force", UNSUPPORTED_PROMPT_MESSAGE.to_owned()),
             ("pull --ff-only", UNSUPPORTED_PROMPT_MESSAGE.to_owned()),
-            ("fetch && push", SHELL_SYNTAX_MESSAGE.to_owned()),
             ("git push", RAW_GIT_MESSAGE.to_owned()),
             ("git commit -m \"message\"", RAW_GIT_MESSAGE.to_owned()),
             (
@@ -452,7 +467,7 @@ mod tests {
     #[test]
     fn shell_like_prompts_reject_the_whole_prompt() {
         for input in [
-            "fetch && push",
+            "fetch & push",
             "fetch; push",
             "push | cat",
             "pull > out.txt",
