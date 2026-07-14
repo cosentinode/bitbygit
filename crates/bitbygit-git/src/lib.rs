@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
@@ -13,6 +12,7 @@ use std::os::unix::ffi::OsStringExt;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const SSH_OPTIONS: &str = "-oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes";
 const COMMIT_HOOKS: &[&str] = &[
     "pre-commit",
     "prepare-commit-msg",
@@ -23,11 +23,25 @@ const COMMIT_HOOKS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct Git {
     cwd: PathBuf,
+    ssh_executable: Option<PathBuf>,
 }
 
 impl Git {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: cwd.into() }
+        Self {
+            cwd: cwd.into(),
+            ssh_executable: None,
+        }
+    }
+
+    pub fn with_ssh_executable(
+        cwd: impl Into<PathBuf>,
+        ssh_executable: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            cwd: cwd.into(),
+            ssh_executable: Some(ssh_executable.into()),
+        }
     }
 
     pub fn repository(&self) -> Result<Repository, GitError> {
@@ -822,15 +836,12 @@ impl Git {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never");
-        if env::var_os("GIT_SSH_COMMAND").is_none() {
-            command.env(
-                "GIT_SSH_COMMAND",
-                format!(
-                    "{} -oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes",
-                    self.configured_ssh_command().unwrap_or_else(|| "ssh".to_owned())
-                ),
-            );
-        }
+        let ssh_executable = self
+            .ssh_executable
+            .as_ref()
+            .map(|path| shell_quote(&path.to_string_lossy()))
+            .unwrap_or_else(|| "ssh".to_owned());
+        command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
         let output = command
             .args(&args)
             .output()
@@ -864,20 +875,6 @@ impl Git {
             stdout,
             stderr,
         })
-    }
-
-    fn configured_ssh_command(&self) -> Option<String> {
-        let output = Command::new("git")
-            .current_dir(&self.cwd)
-            .args(["config", "--get", "core.sshCommand"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let command = String::from_utf8(output.stdout).ok()?;
-        let command = command.trim();
-        (!command.is_empty()).then(|| command.to_owned())
     }
 
     fn run_path_args<const N: usize>(
@@ -1608,6 +1605,10 @@ fn splitn_bytes(value: &[u8], delimiter: u8, count: usize) -> Vec<&[u8]> {
 fn split_once_byte(value: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
     let index = value.iter().position(|byte| *byte == delimiter)?;
     Some((&value[..index], &value[index + 1..]))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(unix)]
@@ -2579,6 +2580,36 @@ mod tests {
             Git::new(repo.path()).remote_push_urls("origin")?,
             vec!["https://github.com/fork/repo.git"]
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_url_head_oid_ignores_configured_ssh_command() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        let marker = repo.path().join("configured-ssh-ran");
+        let configured_ssh = repo.path().join("configured-ssh");
+        fs::write(
+            &configured_ssh,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )?;
+        let mut permissions = fs::metadata(&configured_ssh)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&configured_ssh, permissions)?;
+        repo.run_args(&[
+            "config",
+            "core.sshCommand",
+            &configured_ssh.display().to_string(),
+        ])?;
+
+        let result =
+            Git::new(repo.path()).remote_url_head_oid("ssh://git@127.0.0.1:1/repo.git", "main");
+
+        assert!(result.is_err());
+        assert!(!marker.exists());
         Ok(())
     }
 

@@ -1514,6 +1514,8 @@ fn short_oid(oid: &str) -> String {
 struct OperationPlanner {
     repo_root: PathBuf,
     github_executable: Option<PathBuf>,
+    #[cfg(test)]
+    ssh_executable: Option<PathBuf>,
 }
 
 impl OperationPlanner {
@@ -1521,6 +1523,8 @@ impl OperationPlanner {
         Self {
             repo_root: current_dir(),
             github_executable: None,
+            #[cfg(test)]
+            ssh_executable: None,
         }
     }
 
@@ -1529,6 +1533,7 @@ impl OperationPlanner {
         Self {
             repo_root: repo_root.into(),
             github_executable: None,
+            ssh_executable: None,
         }
     }
 
@@ -2037,6 +2042,10 @@ impl OperationPlanner {
     }
 
     fn git(&self) -> Git {
+        #[cfg(test)]
+        if let Some(executable) = &self.ssh_executable {
+            return Git::with_ssh_executable(self.repo_root.clone(), executable);
+        }
         Git::new(self.repo_root.clone())
     }
 
@@ -2477,6 +2486,8 @@ impl ExecutionContext {
 struct PlanExecutor {
     repo_root: PathBuf,
     audit: AuditDestination,
+    #[cfg(test)]
+    ssh_executable: Option<PathBuf>,
 }
 
 impl PlanExecutor {
@@ -2484,6 +2495,8 @@ impl PlanExecutor {
         Self {
             repo_root: current_dir(),
             audit: AuditDestination::Environment,
+            #[cfg(test)]
+            ssh_executable: None,
         }
     }
 
@@ -2492,6 +2505,20 @@ impl PlanExecutor {
         Self {
             repo_root: repo_root.into(),
             audit: AuditDestination::Paths(paths),
+            ssh_executable: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_audit_paths_and_ssh(
+        repo_root: impl Into<PathBuf>,
+        paths: StorePaths,
+        ssh_executable: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+            audit: AuditDestination::Paths(paths),
+            ssh_executable: Some(ssh_executable.into()),
         }
     }
 
@@ -2594,6 +2621,10 @@ impl PlanExecutor {
     }
 
     fn git(&self) -> Git {
+        #[cfg(test)]
+        if let Some(executable) = &self.ssh_executable {
+            return Git::with_ssh_executable(self.repo_root.clone(), executable);
+        }
         Git::new(self.repo_root.clone())
     }
 
@@ -3004,10 +3035,14 @@ impl PromptSequenceExecutor {
         let planner = OperationPlanner {
             repo_root: self.repo_root.clone(),
             github_executable: None,
+            #[cfg(test)]
+            ssh_executable: None,
         };
         let executor = PlanExecutor {
             repo_root: self.repo_root.clone(),
             audit: self.audit.clone(),
+            #[cfg(test)]
+            ssh_executable: None,
         };
         let mut step_results = Vec::with_capacity(total_steps);
 
@@ -4100,6 +4135,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
         };
 
         let operation = planner
@@ -4118,8 +4154,9 @@ mod tests {
             ConfirmationRequirement::VisiblePlan
         );
         let paths = isolated_store_paths("open-pr-create-audit")?;
-        let execution = PlanExecutor::with_audit_paths(&repo, paths.clone())
-            .execute(&operation.plan, operation.context);
+        let execution =
+            PlanExecutor::with_audit_paths_and_ssh(&repo, paths.clone(), test_ssh_command()?)
+                .execute(&operation.plan, operation.context);
 
         assert!(execution.succeeded(), "{}", execution.message());
         assert_eq!(
@@ -4143,6 +4180,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
             .plan_request(OperationRequest::OpenPullRequest { base: None })
@@ -4154,9 +4192,12 @@ mod tests {
                 .preview_text()
                 .contains("target: https://github.com/octo/repo/pull/42")
         );
-        let execution =
-            PlanExecutor::with_audit_paths(&repo, isolated_store_paths("open-pr-existing-audit")?)
-                .execute(&operation.plan, operation.context);
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-existing-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&operation.plan, operation.context);
 
         assert!(execution.succeeded(), "{}", execution.message());
         assert_eq!(
@@ -4181,6 +4222,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
             .plan_request(OperationRequest::OpenPullRequest {
@@ -4194,9 +4236,10 @@ mod tests {
                 .preview_text()
                 .contains("https://github.com/octo/repo/compare/release...feature/open-pr")
         );
-        let execution = PlanExecutor::with_audit_paths(
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
             &repo,
             isolated_store_paths("open-pr-other-base-audit")?,
+            test_ssh_command()?,
         )
         .execute(&operation.plan, operation.context);
 
@@ -4220,15 +4263,17 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
             .plan_request(OperationRequest::OpenPullRequest { base: None })
             .map_err(std::io::Error::other)?;
 
         assert!(!operation.plan.preview_text().contains("pull/42"));
-        let execution = PlanExecutor::with_audit_paths(
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
             &repo,
             isolated_store_paths("open-pr-fork-collision-audit")?,
+            test_ssh_command()?,
         )
         .execute(&operation.plan, operation.context);
 
@@ -4260,6 +4305,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
         };
 
         let operation = planner
@@ -4274,9 +4320,10 @@ mod tests {
             "{}",
             operation.plan.preview_text()
         );
-        let execution = PlanExecutor::with_audit_paths(
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
             &repo,
             isolated_store_paths("open-pr-tracked-fork-audit")?,
+            test_ssh_command()?,
         )
         .execute(&operation.plan, operation.context);
 
@@ -4345,11 +4392,16 @@ mod tests {
             .trim()
             .to_owned();
         add_github_remote(&repo, "origin", &remote)?;
-        git_stdout(&repo, &["push", "-u", "origin", branch.as_str()])?;
+        git_stdout_with_ssh(
+            &repo,
+            &["push", "-u", "origin", branch.as_str()],
+            &test_ssh_command()?,
+        )?;
         let fake_gh = fake_gh("open-pr-invalid-state", false)?;
         let planner = OperationPlanner {
             repo_root: repo,
             github_executable: Some(fake_gh),
+            ssh_executable: Some(test_ssh_command()?),
         };
         let error =
             match planner.plan_request(OperationRequest::OpenPullRequest { base: Some(branch) }) {
@@ -5142,7 +5194,11 @@ mod tests {
         git_stdout(&repo, &["add", "file.txt"])?;
         git_stdout(&repo, &["commit", "-m", "feature"])?;
         add_github_remote(&repo, "origin", &remote)?;
-        git_stdout(&repo, &["push", "-u", "origin", "feature/open-pr"])?;
+        git_stdout_with_ssh(
+            &repo,
+            &["push", "-u", "origin", "feature/open-pr"],
+            &test_ssh_command()?,
+        )?;
         Ok(repo)
     }
 
@@ -5162,15 +5218,27 @@ mod tests {
                 &bare_remote.display().to_string(),
             ],
         )?;
-        git_stdout(
-            repo,
-            &[
-                "config",
-                "core.sshCommand",
-                &test_ssh_command()?.display().to_string(),
-            ],
-        )?;
         Ok(())
+    }
+
+    fn git_stdout_with_ssh(
+        repo: &std::path::Path,
+        args: &[&str],
+        ssh_executable: &std::path::Path,
+    ) -> Result<String, Box<dyn Error>> {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .env("GIT_SSH_COMMAND", ssh_executable)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "git command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?)
     }
 
     fn test_ssh_command() -> Result<PathBuf, Box<dyn Error>> {
