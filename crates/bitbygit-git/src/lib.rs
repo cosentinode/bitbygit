@@ -972,7 +972,7 @@ impl Git {
                 source,
             })?;
 
-        let stdout = if disable_editor && output.status.success() {
+        let stdout = if disable_editor {
             String::from_utf8_lossy(&output.stdout).into_owned()
         } else {
             String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
@@ -981,7 +981,7 @@ impl Git {
                 source,
             })?
         };
-        let stderr = if disable_editor && output.status.success() {
+        let stderr = if disable_editor {
             String::from_utf8_lossy(&output.stderr).into_owned()
         } else {
             String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
@@ -2430,7 +2430,10 @@ mod tests {
         let hooks = repo.path().join("hooks");
         fs::create_dir(&hooks)?;
         let commit_msg_hook = hooks.join("commit-msg");
-        fs::write(&commit_msg_hook, "#!/bin/sh\ntouch hook-ran\n")?;
+        fs::write(
+            &commit_msg_hook,
+            "#!/bin/sh\ntouch hook-ran\nprintf '\\377'\n",
+        )?;
         let mut permissions = fs::metadata(&commit_msg_hook)?.permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&commit_msg_hook, permissions)?;
@@ -2450,10 +2453,17 @@ mod tests {
         let Err(error) = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue) else {
             return Err("expected configured signing failure".into());
         };
-        let GitError::GitFailed { args, .. } = error else {
+        let GitError::GitFailed {
+            args,
+            stdout,
+            stderr,
+            ..
+        } = error
+        else {
             return Err("expected standard git merge failure".into());
         };
         assert_eq!(args, ["merge".to_owned(), "--continue".to_owned()]);
+        assert!(format!("{stdout}{stderr}").contains('\u{fffd}'));
         assert!(repo.path().join("hook-ran").exists());
         assert!(repo.path().join("signing-ran").exists());
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
