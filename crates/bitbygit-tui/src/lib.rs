@@ -1965,7 +1965,7 @@ impl OperationPlanner {
             .to_owned();
         let head = pull_request_head(&head_github_repository, &github_repository, &branch)?;
         let base = requested_base.unwrap_or(repository.default_branch);
-        if base == branch {
+        if head_github_repository.eq_ignore_ascii_case(&github_repository) && base == branch {
             return Err(
                 "Open pull request blocked: base branch must differ from the current branch."
                     .to_owned(),
@@ -2115,7 +2115,8 @@ fn github_repository_from_push_url(url: &str) -> Option<String> {
     }
     let mut components = path.trim_end_matches('/').split('/');
     let owner = components.next()?;
-    let repository = components.next()?.strip_suffix(".git").unwrap_or_default();
+    let repository = components.next()?;
+    let repository = repository.strip_suffix(".git").unwrap_or(repository);
     if host.is_empty()
         || owner.is_empty()
         || repository.is_empty()
@@ -2288,70 +2289,66 @@ fn validate_open_pull_request_plan(
     remote: &str,
     remote_urls: &[String],
     target: &HeadTarget,
-) -> Result<(), String> {
-    if git
-        .head_target()
-        .map_err(|error| format!("Unable to revalidate pull request target: {error}"))?
-        != *target
-    {
-        return Err(
+) -> Result<(), StepExecutionError> {
+    if git.head_target().map_err(StepExecutionError::Git)? != *target {
+        return Err(StepExecutionError::Blocked(
             "Open pull request blocked: branch target changed since the plan was shown.".to_owned(),
-        );
+        ));
     }
-    let status = git
-        .status()
-        .map_err(|error| format!("Unable to revalidate pull request plan: {error}"))?;
-    if branch_name(&status.branch)? != branch {
-        return Err(
+    let status = git.status().map_err(StepExecutionError::Git)?;
+    if branch_name(&status.branch).map_err(StepExecutionError::Blocked)? != branch {
+        return Err(StepExecutionError::Blocked(
             "Open pull request blocked: current branch changed since the plan was shown."
                 .to_owned(),
-        );
+        ));
     }
     if status.branch.upstream.as_deref() != Some(expected_upstream) {
-        return Err(
+        return Err(StepExecutionError::Blocked(
             "Open pull request blocked: upstream changed since the plan was shown.".to_owned(),
-        );
+        ));
     }
     if status.branch.ahead > 0 || status.branch.behind > 0 {
-        return Err(
+        return Err(StepExecutionError::Blocked(
             "Open pull request blocked: current branch is no longer fully pushed and up to date."
                 .to_owned(),
-        );
+        ));
     }
     let current_target = git
         .upstream_push_target(branch)
-        .map_err(|error| format!("Unable to revalidate pull request upstream: {error}"))?;
+        .map_err(StepExecutionError::Git)?;
     if current_target
         .as_ref()
         .map(|(name, branch)| format!("{name}/{branch}"))
         != Some(expected_upstream.to_owned())
     {
-        return Err(
+        return Err(StepExecutionError::Blocked(
             "Open pull request blocked: upstream target changed since the plan was shown."
                 .to_owned(),
-        );
+        ));
     }
     let current_remote_urls = git
         .remote_push_urls(remote)
-        .map_err(|error| format!("Unable to revalidate pull request remote: {error}"))?;
+        .map_err(StepExecutionError::Git)?;
     if current_remote_urls != remote_urls {
-        return Err(
+        return Err(StepExecutionError::Blocked(
             "Open pull request blocked: remote URLs changed since the plan was shown.".to_owned(),
-        );
+        ));
     }
-    let push_url = single_pull_request_push_url(remote, &current_remote_urls)?;
-    let local_oid = target
-        .oid
-        .as_deref()
-        .ok_or_else(|| "Open pull request blocked: planned branch has no commit.".to_owned())?;
+    let push_url = single_pull_request_push_url(remote, &current_remote_urls)
+        .map_err(StepExecutionError::Blocked)?;
+    let local_oid = target.oid.as_deref().ok_or_else(|| {
+        StepExecutionError::Blocked(
+            "Open pull request blocked: planned branch has no commit.".to_owned(),
+        )
+    })?;
     let remote_oid = git
         .github_remote_url_head_oid(push_url, branch)
-        .map_err(|error| format!("Unable to revalidate pushed branch: {error}"))?;
+        .map_err(StepExecutionError::Git)?;
     if remote_oid.as_deref() != Some(local_oid) {
-        return Err(
+        return Err(StepExecutionError::Blocked(
             "Open pull request blocked: current branch is no longer pushed to its upstream."
                 .to_owned(),
-        );
+        ));
     }
     Ok(())
 }
@@ -2953,8 +2950,7 @@ impl PlanExecutor {
                 "open pull request request does not match its typed execution context".to_owned(),
             ));
         }
-        validate_open_pull_request_plan(git, branch, upstream, remote, remote_urls, target)
-            .map_err(StepExecutionError::Blocked)?;
+        validate_open_pull_request_plan(git, branch, upstream, remote, remote_urls, target)?;
         if !github_base_repository(git, head_github_repository)
             .map_err(StepExecutionError::Blocked)?
             .eq_ignore_ascii_case(github_repository)
@@ -4190,6 +4186,50 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_transport_failure_does_not_persist_remote_credentials()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-credential-audit")?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://abc123@github.com/octo/repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh("open-pr-credential-audit", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+        let remote = PathBuf::from(
+            git_stdout(&repo, &["config", "remote.origin.testbare"])?
+                .trim()
+                .to_owned(),
+        );
+        std::fs::remove_dir_all(remote)?;
+        let paths = isolated_store_paths("open-pr-credential-audit")?;
+
+        let execution =
+            PlanExecutor::with_audit_paths_and_ssh(&repo, paths.clone(), test_ssh_command()?)
+                .execute(&operation.plan, operation.context);
+
+        assert!(!execution.succeeded());
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].result, "error");
+        assert!(entries[1].message.contains("git failed with status"));
+        assert!(!entries[1].message.contains("abc123"));
+        assert!(!entries[1].message.contains("github.com/octo/repo"));
+        Ok(())
+    }
+
+    #[test]
     fn existing_pull_request_is_surfaced_without_creation() -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("open-pr-existing")?;
         let fake_gh = fake_gh("open-pr-existing", true)?;
@@ -4479,6 +4519,82 @@ mod tests {
             assert!(invocation.contains("--repo github.com/upstream/repo"));
             assert!(invocation.contains("octo:feature/open-pr"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_accepts_suffixless_head_and_upstream_remotes() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-suffixless-remotes")?;
+        git_stdout(&repo, &["remote", "rename", "origin", "fork"])?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "fork",
+                "ssh://git@github.com/octo/repo",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &["remote", "add", "upstream", "git@github.com:upstream/repo"],
+        )?;
+        let fake_gh = fake_gh("open-pr-suffixless-remotes", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        assert!(
+            operation
+                .plan
+                .preview_text()
+                .contains("https://github.com/upstream/repo/compare/main...octo%3Afeature/open-pr")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_allows_matching_branch_names_across_fork_and_upstream()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-matching-fork-branch")?;
+        git_stdout(&repo, &["branch", "-m", "main"])?;
+        git_stdout_with_ssh(
+            &repo,
+            &["push", "-u", "origin", "main"],
+            &test_ssh_command()?,
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/upstream/repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh("open-pr-matching-fork-branch", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        assert!(
+            operation
+                .plan
+                .preview_text()
+                .contains("https://github.com/upstream/repo/compare/main...octo%3Amain")
+        );
         Ok(())
     }
 
