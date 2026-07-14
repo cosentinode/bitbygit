@@ -716,8 +716,9 @@ impl Git {
     }
 
     pub fn recovery_state(&self) -> Result<RecoveryState, GitError> {
+        let operation = self.repository_operation()?;
         Ok(RecoveryState {
-            operation: self.repository_operation()?,
+            operation,
             head: self.head_target()?,
             status: self
                 .run_raw(["status", "--porcelain=v2", "--branch", "-z"])?
@@ -727,6 +728,7 @@ impl Git {
                 .run_raw(["diff", "--binary", "--no-ext-diff", "--"])?
                 .stdout,
             metadata: self.recovery_metadata()?,
+            refs: self.recovery_refs(operation)?,
         })
     }
 
@@ -740,6 +742,32 @@ impl Git {
             )?;
         }
         Ok(entries)
+    }
+
+    fn recovery_refs(&self, operation: Option<RepositoryOperation>) -> Result<Vec<u8>, GitError> {
+        if operation != Some(RepositoryOperation::Rebase) {
+            return Ok(Vec::new());
+        }
+
+        let mut args = vec![
+            OsString::from("for-each-ref"),
+            OsString::from("--format=%(refname)%00%(objectname)%00%(symref)"),
+            OsString::from("refs/rewritten"),
+        ];
+        for relative in ["rebase-merge/head-name", "rebase-apply/head-name"] {
+            match fs::read(self.git_path(relative)?) {
+                Ok(reference) => {
+                    let reference = strip_byte_line_ending(&reference);
+                    if reference.starts_with(b"refs/") {
+                        args.push(path_from_bytes(reference).into_os_string());
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(recovery_metadata_io_error(Path::new(relative), source)),
+            }
+        }
+
+        Ok(self.run_os_args(args, None, false)?.stdout)
     }
 
     pub fn stage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
@@ -1468,6 +1496,7 @@ pub struct RecoveryState {
     index: Vec<u8>,
     worktree_diff: Vec<u8>,
     metadata: Vec<RecoveryMetadataEntry>,
+    refs: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2616,6 +2645,57 @@ mod tests {
 
         assert!(error.to_string().contains("state changed after preview"));
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_rebase_abort_preserves_branch_changed_after_preview() -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let newer_head = repo.git_stdout(["rev-parse", "main"])?.trim().to_owned();
+        assert_ne!(newer_head, original_head);
+        repo.run(["update-ref", "refs/heads/topic", &newer_head])?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected changed rebase branch to block abort".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "refs/heads/topic"])?.trim(),
+            newer_head
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_rebase_rejects_changed_rewritten_ref() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let newer_head = repo.git_stdout(["rev-parse", "main"])?.trim().to_owned();
+        repo.run(["update-ref", "refs/rewritten/concurrent", &newer_head])?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected changed rewritten ref to block recovery".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "refs/rewritten/concurrent"])?
+                .trim(),
+            newer_head
+        );
         Ok(())
     }
 
