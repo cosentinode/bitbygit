@@ -5062,8 +5062,8 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_recovery_executes_and_records_stable_audit_entries() -> Result<(), Box<dyn Error>>
-    {
+    fn confirmed_recovery_fails_closed_and_records_stable_audit_entries()
+    -> Result<(), Box<dyn Error>> {
         let repo = merge_conflict_repo("recovery-audit")?;
         let operation = OperationPlanner::new(&repo)
             .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
@@ -5073,13 +5073,21 @@ mod tests {
         let execution = PlanExecutor::with_audit_paths(&repo, paths.clone())
             .execute(&operation.plan, operation.context);
 
-        assert!(execution.succeeded(), "{}", execution.message());
-        assert_eq!(Git::new(&repo).status()?.operation, None);
+        assert!(!execution.succeeded());
+        assert!(
+            execution
+                .message()
+                .contains("cannot atomically fence recovery")
+        );
+        assert_eq!(
+            Git::new(&repo).status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.operation == "merge_abort"));
         assert_eq!(entries[0].message, "pending");
-        assert_eq!(entries[1].message, "completed");
+        assert_eq!(entries[1].result, "error");
         Ok(())
     }
 

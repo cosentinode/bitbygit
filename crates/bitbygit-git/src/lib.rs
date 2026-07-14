@@ -230,7 +230,8 @@ impl Git {
         self.run_args(vec!["rebase".to_owned(), base.oid.clone()])
     }
 
-    pub fn recover(
+    #[cfg(test)]
+    fn recover(
         &self,
         operation: RepositoryOperation,
         action: RecoveryAction,
@@ -306,7 +307,14 @@ impl Git {
                 ),
             });
         }
-        self.recover(operation, action)
+        run_recovery_execution_hook(&self.cwd);
+        Err(GitError::Blocked {
+            message: format!(
+                "{} {} is blocked because Git cannot atomically fence recovery refs, metadata, index, and worktree state",
+                operation.label(),
+                action.label()
+            ),
+        })
     }
 
     pub fn push_current_branch(
@@ -1249,6 +1257,7 @@ impl Git {
         self.run_args_with_editor(args, false)
     }
 
+    #[cfg(test)]
     fn run_recovery_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
         self.run_args_with_editor(args, true)
     }
@@ -1824,6 +1833,23 @@ fn run_recovery_capture_hook(cwd: &Path) {
 
 #[cfg(not(test))]
 fn run_recovery_capture_hook(_cwd: &Path) {}
+
+#[cfg(test)]
+static RECOVERY_EXECUTION_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_execution_hook(cwd: &Path) {
+    if let Ok(mut hooks) = RECOVERY_EXECUTION_HOOKS.lock() {
+        if let Some(index) = hooks.iter().position(|(target, _)| target == cwd) {
+            let (_, hook) = hooks.swap_remove(index);
+            hook();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_execution_hook(_cwd: &Path) {}
 
 #[cfg(test)]
 static RECOVERY_FILE_OPEN_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
@@ -3555,7 +3581,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_recovery_ignores_unrelated_untracked_tree() -> Result<(), Box<dyn Error>> {
+    fn exact_recovery_fails_closed_without_touching_unrelated_untracked_tree()
+    -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
         fs::create_dir(repo.path().join("ignored"))?;
         fs::write(repo.path().join(".git/info/exclude"), "ignored/\n")?;
@@ -3567,9 +3594,18 @@ mod tests {
         let expected = git.recovery_state()?;
         repo.write("notes.txt", "changed after preview\n")?;
 
-        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected exact recovery to fail closed".into());
+        };
 
-        assert_eq!(git.status()?.operation, None);
+        assert!(
+            error
+                .to_string()
+                .contains("cannot atomically fence recovery")
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         assert_eq!(
             fs::read_to_string(repo.path().join("notes.txt"))?,
             "changed after preview\n"
@@ -3727,6 +3763,62 @@ mod tests {
         assert_eq!(
             fs::read_to_string(repo.path().join("conflict.txt"))?,
             "concurrent edit\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_rebase_abort_fails_closed_on_branch_move_after_final_validation()
+    -> Result<(), Box<dyn Error>> {
+        use std::sync::mpsc;
+
+        let (repo, original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let newer_head = repo.git_stdout(["rev-parse", "main"])?.trim().to_owned();
+        assert_ne!(newer_head, original_head);
+
+        let (validated_tx, validated_rx) = mpsc::channel();
+        let (moved_tx, moved_rx) = mpsc::channel();
+        let repo_path = repo.path();
+        let moved_head = newer_head.clone();
+        let mover = std::thread::spawn(move || {
+            let _ = validated_rx.recv();
+            let output = Command::new("git")
+                .current_dir(repo_path)
+                .args(["update-ref", "refs/heads/topic", &moved_head])
+                .output();
+            let _ = moved_tx.send(());
+            output
+        });
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _ = validated_tx.send(());
+            let _ = moved_rx.recv();
+        });
+        RECOVERY_EXECUTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery execution hook lock poisoned")?
+            .push((repo.path(), hook));
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected exact rebase abort to fail closed".into());
+        };
+        let output = mover.join().map_err(|_| "branch mover thread panicked")??;
+
+        assert!(output.status.success());
+        assert!(
+            error
+                .to_string()
+                .contains("cannot atomically fence recovery")
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "refs/heads/topic"])?.trim(),
+            newer_head
         );
         Ok(())
     }
