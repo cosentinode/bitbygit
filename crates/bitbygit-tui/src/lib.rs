@@ -24,7 +24,7 @@ use bitbygit_core::{
 use bitbygit_gh::{CreatePullRequest, GhError, GitHub};
 use bitbygit_git::{
     BranchInfo, BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head,
-    HeadTarget, StatusEntry, StatusEntryType,
+    HeadTarget, RepositoryOperation, StatusEntry, StatusEntryType,
 };
 use bitbygit_store::{AuditEntry, LocalStore, RepoId, StorePaths};
 
@@ -131,6 +131,7 @@ pub struct App {
     selected_repo: usize,
     files: Vec<FileRow>,
     branch: Option<BranchState>,
+    repository_operation: Option<RepositoryOperation>,
     selected_file: usize,
     file_scroll: usize,
     details: String,
@@ -152,6 +153,7 @@ impl App {
             selected_repo: 0,
             files: Vec::new(),
             branch: None,
+            repository_operation: None,
             selected_file: 0,
             file_scroll: 0,
             details: "No repository status loaded yet.".to_owned(),
@@ -335,6 +337,7 @@ impl App {
                     .flat_map(FileRow::from_entry)
                     .collect();
                 self.branch = Some(status.branch);
+                self.repository_operation = status.operation;
                 self.files.sort_by(|left, right| {
                     left.section
                         .cmp(&right.section)
@@ -349,6 +352,7 @@ impl App {
             Err(error) => {
                 self.files.clear();
                 self.branch = None;
+                self.repository_operation = None;
                 self.selected_file = 0;
                 self.details = format!("Unable to read repository status: {error}");
             }
@@ -497,7 +501,7 @@ impl App {
     }
 
     fn clamp_file_scroll_for(&mut self, area: Rect) {
-        let visible_len = status_file_visible_len(area);
+        let visible_len = status_file_visible_len(area, self.repository_operation.is_some());
         if visible_len == 0 {
             self.file_scroll = self.selected_file;
             return;
@@ -1490,8 +1494,17 @@ fn repo_list(app: &App) -> List<'_> {
 }
 
 fn status_panel(app: &App, area: Rect) -> Paragraph<'_> {
-    let visible_len = status_file_visible_len(area);
+    let visible_len = status_file_visible_len(area, app.repository_operation.is_some());
     let mut lines = vec![Line::from(branch_summary(app.branch.as_ref()))];
+    if let Some(operation) = app.repository_operation {
+        lines.push(
+            Line::from(format!("{} IN PROGRESS", operation_label(operation))).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
     if app.files.is_empty() {
         lines.push(Line::from("working tree clean or unavailable"));
     } else {
@@ -1531,6 +1544,13 @@ fn branch_summary(branch: Option<&BranchState>) -> String {
         "{head} -> {upstream} | ahead {} behind {}",
         branch.ahead, branch.behind
     )
+}
+
+fn operation_label(operation: RepositoryOperation) -> &'static str {
+    match operation {
+        RepositoryOperation::Merge => "MERGE",
+        RepositoryOperation::Rebase => "REBASE",
+    }
 }
 
 fn branch_name(branch: &BranchState) -> Result<String, String> {
@@ -2432,8 +2452,8 @@ fn validate_open_pull_request_plan(
     Ok(())
 }
 
-fn status_file_visible_len(area: Rect) -> usize {
-    status_visible_len(area).saturating_sub(1)
+fn status_file_visible_len(area: Rect, has_operation_banner: bool) -> usize {
+    status_visible_len(area).saturating_sub(1 + usize::from(has_operation_banner))
 }
 
 fn details_panel(app: &App) -> Paragraph<'_> {
@@ -5509,6 +5529,12 @@ mod tests {
     }
 
     #[test]
+    fn operation_labels_are_explicit() {
+        assert_eq!(operation_label(RepositoryOperation::Merge), "MERGE");
+        assert_eq!(operation_label(RepositoryOperation::Rebase), "REBASE");
+    }
+
+    #[test]
     fn viewport_uses_desktop_panels_when_roomy() {
         let viewport = Viewport::split(Rect::new(0, 0, 120, 40));
 
@@ -5630,7 +5656,7 @@ mod tests {
         let mut app = App::new();
         app.focus = Focus::Status;
         app.last_viewport.status = Rect::new(0, 0, 30, 5);
-        let visible_len = status_file_visible_len(app.last_viewport.status);
+        let visible_len = status_file_visible_len(app.last_viewport.status, false);
         app.files = (0..visible_len + 5)
             .map(|index| FileRow {
                 path: std::path::PathBuf::from(format!("file-{index}.txt")),
