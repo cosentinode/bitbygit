@@ -98,6 +98,8 @@ impl GitHub {
             format!("head={owner}:{branch}"),
             "-f".to_owned(),
             "per_page=100".to_owned(),
+            "--hostname".to_owned(),
+            "github.com".to_owned(),
         ])?;
         let pages: Vec<Vec<RestPullRequest>> = parse_json(&output, "pull request query")?;
         Ok(pages.into_iter().flatten().map(PullRequest::from).collect())
@@ -122,6 +124,8 @@ impl GitHub {
                 repository.name_with_owner,
                 url_path_component(branch)
             ),
+            "--hostname".to_owned(),
+            "github.com".to_owned(),
         ])?;
         let pages: Vec<Vec<RestReference>> = parse_json(&output, "branch query")?;
         let expected = format!("refs/heads/{branch}");
@@ -527,7 +531,7 @@ mod tests {
     #[test]
     fn decodes_rest_existing_pull_request_responses() -> Result<(), Box<dyn Error>> {
         let fake = FakeGh::new(
-            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature\",\"repo\":{\"full_name\":\"octo/repo\"}}}]]' ;;\n*) exit 1 ;;\nesac",
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] && [ \"${13}\" = --hostname ] && [ \"${14}\" = github.com ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature\",\"repo\":{\"full_name\":\"octo/repo\"}}}]]' ;;\n*) exit 1 ;;\nesac",
         )?;
         let github = GitHub::with_executable_and_repository(
             &fake.path,
@@ -556,7 +560,7 @@ mod tests {
             "repo\u{1f}view\u{1f}github.com/octo/repo\u{1f}--json\u{1f}nameWithOwner,defaultBranchRef\u{1f}\n"
         ));
         assert!(fake.invocations()?.contains(
-            "api\u{1f}--method\u{1f}GET\u{1f}--paginate\u{1f}--slurp\u{1f}repos/octo/repo/pulls\u{1f}-f\u{1f}state=open\u{1f}-f\u{1f}head=octo:feature\u{1f}-f\u{1f}per_page=100\u{1f}\n"
+            "api\u{1f}--method\u{1f}GET\u{1f}--paginate\u{1f}--slurp\u{1f}repos/octo/repo/pulls\u{1f}-f\u{1f}state=open\u{1f}-f\u{1f}head=octo:feature\u{1f}-f\u{1f}per_page=100\u{1f}--hostname\u{1f}github.com\u{1f}\n"
         ));
         assert_eq!(fake.prompt_values()?, "1\n1\n1\n1\n1\n1\n1\n");
         Ok(())
@@ -569,6 +573,17 @@ mod tests {
         )?;
 
         assert!(fake.github().branch_exists("release/next")?);
+        Ok(())
+    }
+
+    #[test]
+    fn rest_queries_pin_github_com_when_gh_host_conflicts() -> Result<(), Box<dyn Error>> {
+        let fake = FakeGh::new(
+            "GH_HOST=example.com\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) case \"$6\" in\n*/pulls) [ \"${13}\" = --hostname ] && [ \"${14}\" = github.com ] || exit 1; printf '%s\\n' '[[]]' ;;\n*/git/matching-refs/heads/*) [ \"$7\" = --hostname ] && [ \"$8\" = github.com ] || exit 1; printf '%s\\n' '[[]]' ;;\n*) exit 1 ;;\nesac ;;\n*) exit 1 ;;\nesac",
+        )?;
+
+        assert!(fake.github().existing_pull_requests("feature")?.is_empty());
+        assert!(!fake.github().branch_exists("main")?);
         Ok(())
     }
 
@@ -608,8 +623,13 @@ mod tests {
     impl FakeGh {
         fn new(body: &str) -> Result<Self, Box<dyn Error>> {
             let id = NEXT_FAKE_ID.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("bitbygit-fake-gh-{}-{id}", std::process::id()));
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "bitbygit-fake-gh-{}-{id}-{nonce}",
+                std::process::id()
+            ));
             if path.exists() {
                 fs::remove_dir_all(&path)?;
             }

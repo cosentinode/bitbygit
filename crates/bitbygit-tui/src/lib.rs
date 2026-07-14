@@ -1918,21 +1918,13 @@ impl OperationPlanner {
         let Some(upstream) = status.branch.upstream.clone() else {
             return Err("Open pull request blocked: current branch has no upstream. Push it with `push` first.".to_owned());
         };
-        if status.branch.ahead > 0 || status.branch.behind > 0 {
-            return Err("Open pull request blocked: current branch is not fully pushed and up to date. Push or pull it first.".to_owned());
-        }
         let (remote, upstream_branch) = git
-            .upstream_push_target(&branch)
+            .push_target(&branch)
             .map_err(|error| format!("Unable to prepare pull request target: {error}"))?
             .ok_or_else(|| {
-                format!("Open pull request blocked: unable to resolve upstream {upstream}.")
+                "Open pull request blocked: unable to resolve the current branch push target."
+                    .to_owned()
             })?;
-        if upstream != format!("{remote}/{upstream_branch}") {
-            return Err(
-                "Open pull request blocked: current branch upstream does not match its configured push target."
-                    .to_owned(),
-            );
-        }
         let remote_urls = git
             .remote_push_urls(&remote)
             .map_err(|error| format!("Unable to prepare pull request remote: {error}"))?;
@@ -1958,19 +1950,24 @@ impl OperationPlanner {
         let github_repository = github_base_repository(&git, &head_github_repository)?;
         let github = self.github(&github_repository);
         let repository = github.repository().map_err(open_pull_request_gh_error)?;
-        let head_repository = github_repository_name(&head_github_repository)
-            .ok_or_else(|| {
-                "Open pull request blocked: source remote does not identify a GitHub repository."
-                    .to_owned()
-            })?
-            .to_owned();
+        let canonical_head_repository =
+            if head_github_repository.eq_ignore_ascii_case(&github_repository) {
+                repository.clone()
+            } else {
+                self.github(&head_github_repository)
+                    .repository()
+                    .map_err(open_pull_request_gh_error)?
+            };
+        let head_repository = canonical_head_repository.name_with_owner;
+        let canonical_head_github_repository = format!("github.com/{head_repository}");
+        let canonical_github_repository = format!("github.com/{}", repository.name_with_owner);
         let head = pull_request_head(
-            &head_github_repository,
-            &github_repository,
+            &canonical_head_github_repository,
+            &canonical_github_repository,
             &upstream_branch,
         )?;
         let base = requested_base.unwrap_or(repository.default_branch);
-        if head_github_repository.eq_ignore_ascii_case(&github_repository)
+        if canonical_head_github_repository.eq_ignore_ascii_case(&canonical_github_repository)
             && base == upstream_branch
         {
             return Err(
@@ -2161,15 +2158,6 @@ fn github_base_repository(git: &Git, head_repository: &str) -> Result<String, St
     })
 }
 
-fn github_repository_name(repository: &str) -> Option<&str> {
-    let (_, name) = repository.split_once('/')?;
-    if name.split('/').count() == 2 {
-        Some(name)
-    } else {
-        None
-    }
-}
-
 fn pull_request_head(
     head_repository: &str,
     base_repository: &str,
@@ -2317,23 +2305,14 @@ fn validate_open_pull_request_plan(
             "Open pull request blocked: upstream changed since the plan was shown.".to_owned(),
         ));
     }
-    if status.branch.ahead > 0 || status.branch.behind > 0 {
-        return Err(StepExecutionError::Blocked(
-            "Open pull request blocked: current branch is no longer fully pushed and up to date."
-                .to_owned(),
-        ));
-    }
-    let current_target = git
-        .upstream_push_target(branch)
-        .map_err(StepExecutionError::Git)?;
+    let current_target = git.push_target(branch).map_err(StepExecutionError::Git)?;
     if current_target
         .as_ref()
         .map(|(name, branch)| (name.as_str(), branch.as_str()))
         != Some((remote, upstream_branch))
     {
         return Err(StepExecutionError::Blocked(
-            "Open pull request blocked: upstream target changed since the plan was shown."
-                .to_owned(),
+            "Open pull request blocked: push target changed since the plan was shown.".to_owned(),
         ));
     }
     let current_remote_urls = git
@@ -2996,6 +2975,47 @@ impl PlanExecutor {
         {
             return Err(StepExecutionError::Blocked(
                 "Open pull request blocked: GitHub repository changed since the plan was shown."
+                    .to_owned(),
+            ));
+        }
+        let current_head_repository =
+            if head_github_repository.eq_ignore_ascii_case(github_repository) {
+                current_repository.clone()
+            } else {
+                let head_github = match github_executable {
+                    Some(executable) => GitHub::with_executable_and_repository(
+                        &self.repo_root,
+                        executable,
+                        head_github_repository,
+                    ),
+                    None => GitHub::with_executable_and_repository(
+                        &self.repo_root,
+                        "gh",
+                        head_github_repository,
+                    ),
+                };
+                head_github
+                    .repository()
+                    .map_err(StepExecutionError::GitHub)?
+            };
+        if !current_head_repository
+            .name_with_owner
+            .eq_ignore_ascii_case(head_repository)
+        {
+            return Err(StepExecutionError::Blocked(
+                "Open pull request blocked: GitHub head repository changed since the plan was shown."
+                    .to_owned(),
+            ));
+        }
+        let current_head = pull_request_head(
+            &format!("github.com/{}", current_head_repository.name_with_owner),
+            &format!("github.com/{}", current_repository.name_with_owner),
+            upstream_branch,
+        )
+        .map_err(StepExecutionError::Blocked)?;
+        if current_head != *head {
+            return Err(StepExecutionError::Blocked(
+                "Open pull request blocked: GitHub head changed since the plan was shown."
                     .to_owned(),
             ));
         }
@@ -4384,6 +4404,44 @@ mod tests {
     }
 
     #[test]
+    fn renamed_head_repository_surfaces_existing_pull_request() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-renamed-head")?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@github.com/octo/old-repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh("open-pr-renamed-head", true)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        assert!(operation.plan.preview_text().contains("pull/42"));
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-renamed-head-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&operation.plan, operation.context);
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert!(execution.message().contains("already open"));
+        assert!(
+            !std::fs::read_to_string(fake_gh.with_file_name("invocations"))?.contains("pr:create")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn open_pull_request_plan_rejects_missing_base_branch() -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("open-pr-missing-base")?;
         let fake_gh = fake_gh("open-pr-missing-base", false)?;
@@ -4577,13 +4635,25 @@ mod tests {
 
         assert!(execution.succeeded(), "{}", execution.message());
         let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
-        for invocation in invocations
+        let repo_views = invocations
             .lines()
             .filter(|line| line.starts_with("repo:view"))
-        {
-            assert!(invocation.contains("view github.com/upstream/repo"));
-            assert!(!invocation.contains("--repo"));
-        }
+            .collect::<Vec<_>>();
+        assert!(
+            repo_views
+                .iter()
+                .any(|invocation| invocation.contains("view github.com/upstream/repo"))
+        );
+        assert!(
+            repo_views
+                .iter()
+                .any(|invocation| invocation.contains("view github.com/octo/repo"))
+        );
+        assert!(
+            repo_views
+                .iter()
+                .all(|invocation| !invocation.contains("--repo"))
+        );
         for invocation in invocations
             .lines()
             .filter(|line| line.starts_with("api:--method") && line.contains("/pulls"))
@@ -4598,6 +4668,64 @@ mod tests {
             assert!(invocation.contains("--repo github.com/upstream/repo"));
             assert!(invocation.contains("octo:feature/open-pr"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_uses_push_remote_in_triangular_workflow() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-triangular-fork")?;
+        git_stdout(&repo, &["remote", "rename", "origin", "fork"])?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/upstream/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/main", "HEAD^"],
+        )?;
+        git_stdout(
+            &repo,
+            &["config", "branch.feature/open-pr.remote", "upstream"],
+        )?;
+        git_stdout(
+            &repo,
+            &["config", "branch.feature/open-pr.merge", "refs/heads/main"],
+        )?;
+        git_stdout(
+            &repo,
+            &["config", "branch.feature/open-pr.pushRemote", "fork"],
+        )?;
+        git_stdout(&repo, &["config", "push.default", "current"])?;
+        let fake_gh = fake_gh("open-pr-triangular-fork", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        let preview = operation.plan.preview_text();
+        assert!(preview.contains("remote: fork"));
+        assert!(preview.contains("head: octo:feature/open-pr"));
+        assert!(preview.contains("https://github.com/upstream/repo/compare/main"));
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-triangular-fork-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&operation.plan, operation.context);
+        assert!(execution.succeeded(), "{}", execution.message());
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("head=octo:feature/open-pr"));
+        assert!(invocations.contains("pr:create"));
         Ok(())
     }
 
@@ -5620,7 +5748,7 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) case \"$*\" in *--repo*) exit 1 ;; esac; printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\napi:--method)\n  case \"$6\" in\n    */git/matching-refs/heads/*)\n      if [ -f '{}' ]; then printf '%s\\n' '[[]]'; else printf '%s\\n' '[[{{\"ref\":\"refs/heads/main\"}},{{\"ref\":\"refs/heads/release\"}}]]'; fi ;;\n    */pulls) case \"$*\" in *--head*|*'--limit 0'*) exit 1 ;; esac; printf '%s\\n' '[{}]' ;;\n    *) exit 1 ;;\n  esac ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
+                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\nif [ \"$repository\" = octo/old-repo ]; then repository=octo/repo; fi\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) case \"$*\" in *--repo*) exit 1 ;; esac; printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\napi:--method)\n  case \"$6\" in\n    */git/matching-refs/heads/*)\n      if [ -f '{}' ]; then printf '%s\\n' '[[]]'; else printf '%s\\n' '[[{{\"ref\":\"refs/heads/main\"}},{{\"ref\":\"refs/heads/release\"}}]]'; fi ;;\n    */pulls) case \"$*\" in *--head*|*'--limit 0'*) exit 1 ;; esac; printf '%s\\n' '[{}]' ;;\n    *) exit 1 ;;\n  esac ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
                 invocations.display(),
                 base_missing.display(),
                 pull_requests,

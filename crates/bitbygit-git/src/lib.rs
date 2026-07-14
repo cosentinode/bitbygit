@@ -290,16 +290,18 @@ impl Git {
         branch: &str,
         allowed_protocols: Option<&str>,
     ) -> Result<Option<String>, GitError> {
-        let output = self.run_args_with_allowed_protocols(
-            vec![
-                "ls-remote".to_owned(),
-                "--heads".to_owned(),
-                "--".to_owned(),
-                target.to_owned(),
-                format!("refs/heads/{branch}"),
-            ],
-            allowed_protocols,
-        )?;
+        let mut args = Vec::new();
+        if allowed_protocols.is_some() {
+            args.extend(["-c".to_owned(), "credential.helper=".to_owned()]);
+        }
+        args.extend([
+            "ls-remote".to_owned(),
+            "--heads".to_owned(),
+            "--".to_owned(),
+            target.to_owned(),
+            format!("refs/heads/{branch}"),
+        ]);
+        let output = self.run_args_with_allowed_protocols(args, allowed_protocols)?;
         Ok(output
             .stdout
             .lines()
@@ -384,6 +386,26 @@ impl Git {
             .unwrap_or(merge.as_str())
             .to_owned();
         Ok(Some((remote, branch)))
+    }
+
+    pub fn push_target(&self, branch: &str) -> Result<Option<(String, String)>, GitError> {
+        let output = self.run_args(vec![
+            "for-each-ref".to_owned(),
+            "--format=%(push:remotename)%00%(push:short)".to_owned(),
+            "--count=1".to_owned(),
+            "--".to_owned(),
+            format!("refs/heads/{branch}"),
+        ])?;
+        let Some((remote, target)) = output.stdout.trim().split_once('\0') else {
+            return self.upstream_push_target(branch);
+        };
+        let Some(push_branch) = target.strip_prefix(&format!("{remote}/")) else {
+            return self.upstream_push_target(branch);
+        };
+        if remote.is_empty() || push_branch.is_empty() {
+            return self.upstream_push_target(branch);
+        }
+        Ok(Some((remote.to_owned(), push_branch.to_owned())))
     }
 
     pub fn remote_tracking_oid(
@@ -2630,6 +2652,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn push_target_uses_branch_push_remote_in_triangular_workflow() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "feature"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.run(["commit", "--allow-empty", "-m", "initial"])?;
+        repo.run([
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        repo.run(["remote", "add", "fork", "https://github.com/fork/repo.git"])?;
+        repo.run(["update-ref", "refs/remotes/upstream/main", "HEAD"])?;
+        repo.run(["update-ref", "refs/remotes/fork/feature", "HEAD"])?;
+        repo.run(["config", "branch.feature.remote", "upstream"])?;
+        repo.run(["config", "branch.feature.merge", "refs/heads/main"])?;
+        repo.run(["config", "branch.feature.pushRemote", "fork"])?;
+        repo.run(["config", "push.default", "current"])?;
+
+        assert_eq!(
+            Git::new(repo.path()).push_target("feature")?,
+            Some(("fork".to_owned(), "feature".to_owned()))
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn remote_url_head_oid_ignores_configured_ssh_command() -> Result<(), Box<dyn Error>> {
@@ -2671,6 +2721,37 @@ mod tests {
 
         let result = Git::new(repo.path())
             .github_remote_url_head_oid(&format!("ext::touch {}", marker.display()), "main");
+
+        assert!(result.is_err());
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_remote_url_head_oid_ignores_configured_credential_helper()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        let marker = repo.path().join("credential-helper-ran");
+        let helper = repo.path().join("credential-helper");
+        fs::write(
+            &helper,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )?;
+        let mut permissions = fs::metadata(&helper)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper, permissions)?;
+        repo.run_args(&[
+            "config",
+            "credential.helper",
+            &format!("!{}", helper.display()),
+        ])?;
+
+        let result = Git::new(repo.path())
+            .github_remote_url_head_oid("https://bitbygit@127.0.0.1:1/octo/repo.git", "main");
 
         assert!(result.is_err());
         assert!(!marker.exists());
