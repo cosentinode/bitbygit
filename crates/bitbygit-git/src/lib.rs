@@ -485,6 +485,7 @@ impl Git {
             return Ok(Some(operation.label()));
         }
         for (operation, marker) in [
+            ("am", "rebase-apply/applying"),
             ("cherry-pick", "CHERRY_PICK_HEAD"),
             ("revert", "REVERT_HEAD"),
         ] {
@@ -499,7 +500,10 @@ impl Git {
         if self.git_path("MERGE_HEAD")?.exists() {
             return Ok(Some(RepositoryOperation::Merge));
         }
-        if self.git_path("rebase-merge")?.exists() || self.git_path("rebase-apply")?.exists() {
+        let rebase_apply = self.git_path("rebase-apply")?;
+        if self.git_path("rebase-merge")?.exists()
+            || (rebase_apply.exists() && !rebase_apply.join("applying").exists())
+        {
             return Ok(Some(RepositoryOperation::Rebase));
         }
         Ok(None)
@@ -2138,6 +2142,31 @@ mod tests {
             assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
             fs::remove_dir(path)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn paused_am_is_not_reported_as_rebase_and_remains_blocking() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["commit", "--allow-empty", "-m", "empty"])?;
+        let patch = repo.git_stdout(["format-patch", "-1", "--stdout"])?;
+        repo.run(["reset", "--hard", "HEAD~"])?;
+        repo.write("empty.patch", &patch)?;
+        repo.run_allow_failure(["am", "empty.patch"])?;
+        let git = Git::new(repo.path());
+
+        assert!(git.git_path("rebase-apply/applying")?.exists());
+        assert_eq!(git.status()?.operation, None);
+        let Err(error) = git.ensure_clean_worktree("checkout") else {
+            return Err("expected paused am guardrail".into());
+        };
+        assert!(error.to_string().contains("am operation is in progress"));
         Ok(())
     }
 
