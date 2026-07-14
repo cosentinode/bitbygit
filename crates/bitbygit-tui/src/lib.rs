@@ -5062,8 +5062,8 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_recovery_fails_closed_and_records_stable_audit_entries()
-    -> Result<(), Box<dyn Error>> {
+    fn confirmed_recovery_succeeds_and_records_stable_audit_entries() -> Result<(), Box<dyn Error>>
+    {
         let repo = merge_conflict_repo("recovery-audit")?;
         let operation = OperationPlanner::new(&repo)
             .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
@@ -5073,21 +5073,49 @@ mod tests {
         let execution = PlanExecutor::with_audit_paths(&repo, paths.clone())
             .execute(&operation.plan, operation.context);
 
-        assert!(!execution.succeeded());
-        assert!(
-            execution
-                .message()
-                .contains("cannot atomically fence recovery")
-        );
-        assert_eq!(
-            Git::new(&repo).status()?.operation,
-            Some(RepositoryOperation::Merge)
-        );
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert_eq!(Git::new(&repo).status()?.operation, None);
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.operation == "merge_abort"));
         assert_eq!(entries[0].message, "pending");
-        assert_eq!(entries[1].result, "error");
+        assert_eq!(entries[1].result, "ok");
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_recovery_executes_all_supported_requests() -> Result<(), Box<dyn Error>> {
+        let merge_continue = merge_conflict_repo("recovery-merge-continue")?;
+        std::fs::write(merge_continue.join("conflict.txt"), "resolved\n")?;
+        git_stdout(&merge_continue, &["add", "conflict.txt"])?;
+        let merge_abort = merge_conflict_repo("recovery-merge-abort")?;
+
+        let rebase_continue = rebase_conflict_repo("recovery-rebase-continue")?;
+        std::fs::write(rebase_continue.join("conflict.txt"), "resolved\n")?;
+        git_stdout(&rebase_continue, &["add", "conflict.txt"])?;
+        let rebase_abort = rebase_conflict_repo("recovery-rebase-abort")?;
+        let rebase_skip = rebase_conflict_repo("recovery-rebase-skip")?;
+
+        for (repo, request) in [
+            (merge_continue, RecoveryRequest::MergeContinue),
+            (merge_abort, RecoveryRequest::MergeAbort),
+            (rebase_continue, RecoveryRequest::RebaseContinue),
+            (rebase_abort, RecoveryRequest::RebaseAbort),
+            (rebase_skip, RecoveryRequest::RebaseSkip),
+        ] {
+            let operation = OperationPlanner::new(&repo)
+                .plan_request(OperationRequest::Recover(request))
+                .map_err(std::io::Error::other)?;
+            let paths = isolated_store_paths(&format!("recovery-{request:?}"))?;
+            let execution = PlanExecutor::with_audit_paths(&repo, paths)
+                .execute(&operation.plan, operation.context);
+            assert!(
+                execution.succeeded(),
+                "{request:?}: {}",
+                execution.message()
+            );
+            assert_eq!(Git::new(repo).status()?.operation, None);
+        }
         Ok(())
     }
 
@@ -6772,6 +6800,36 @@ mod tests {
         assert_eq!(
             Git::new(&repo).status()?.operation,
             Some(RepositoryOperation::Merge)
+        );
+        Ok(repo)
+    }
+
+    fn rebase_conflict_repo(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let repo = isolated_git_repo(name)?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("conflict.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "conflict.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "base"])?;
+        let base = git_stdout(&repo, &["branch", "--show-current"])?;
+        git_stdout(&repo, &["checkout", "-b", "topic"])?;
+        std::fs::write(repo.join("conflict.txt"), "topic\n")?;
+        git_stdout(&repo, &["commit", "-am", "topic"])?;
+        git_stdout(&repo, &["checkout", base.trim()])?;
+        std::fs::write(repo.join("conflict.txt"), "upstream\n")?;
+        git_stdout(&repo, &["commit", "-am", "upstream"])?;
+        git_stdout(&repo, &["checkout", "topic"])?;
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rebase", base.trim()])
+            .output()?;
+        if output.status.success() {
+            return Err(std::io::Error::other("expected rebase conflict").into());
+        }
+        assert_eq!(
+            Git::new(&repo).status()?.operation,
+            Some(RepositoryOperation::Rebase)
         );
         Ok(repo)
     }

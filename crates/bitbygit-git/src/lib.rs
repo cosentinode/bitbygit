@@ -8,6 +8,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::string::FromUtf8Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -42,6 +43,7 @@ const MAX_RECOVERY_PATH_BYTES: usize = 256 * 1024;
 const MAX_RECOVERY_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_METADATA_ENTRIES: usize = 4_096;
 const MAX_RECOVERY_SUBPROCESSES: usize = 12;
+static NEXT_RECOVERY_HOOK_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -308,13 +310,24 @@ impl Git {
             });
         }
         run_recovery_execution_hook(&self.cwd);
-        Err(GitError::Blocked {
-            message: format!(
-                "{} {} is blocked because Git cannot atomically fence recovery refs, metadata, index, and worktree state",
-                operation.label(),
-                action.label()
-            ),
-        })
+        let execution_state = self.recovery_state()?;
+        if execution_state != final_state {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{} {} is blocked because repository state changed after final validation",
+                    operation.label(),
+                    action.label()
+                ),
+            });
+        }
+        let hooks = RecoveryHooks::install(self, &execution_state)?;
+        self.run_recovery_args_with_hooks(
+            vec![
+                operation.label().to_owned(),
+                format!("--{}", action.label()),
+            ],
+            &hooks.path,
+        )
     }
 
     pub fn push_current_branch(
@@ -1262,6 +1275,39 @@ impl Git {
         self.run_args_with_editor(args, true)
     }
 
+    fn run_recovery_args_with_hooks(
+        &self,
+        mut args: Vec<String>,
+        hooks_path: &Path,
+    ) -> Result<GitOutput, GitError> {
+        let display_args = args.clone();
+        let hooks_path = hooks_path.to_str().ok_or_else(|| GitError::Blocked {
+            message: "recovery is blocked because its ref fence path is not valid UTF-8".to_owned(),
+        })?;
+        args.splice(
+            0..0,
+            ["-c".to_owned(), format!("core.hooksPath={hooks_path}")],
+        );
+        match self.run_args_with_editor(args, true) {
+            Err(GitError::GitFailed {
+                status,
+                stdout,
+                stderr,
+                ..
+            }) => Err(GitError::GitFailed {
+                args: display_args,
+                status,
+                stdout,
+                stderr,
+            }),
+            Err(GitError::Io { source, .. }) => Err(GitError::Io {
+                args: display_args,
+                source,
+            }),
+            result => result,
+        }
+    }
+
     fn run_args_with_editor(
         &self,
         args: Vec<String>,
@@ -1468,6 +1514,143 @@ impl Git {
             stdout: output.stdout,
         })
     }
+}
+
+struct RecoveryHooks {
+    path: PathBuf,
+}
+
+impl RecoveryHooks {
+    fn install(git: &Git, state: &RecoveryState) -> Result<Self, GitError> {
+        let git_dir = git.git_path("")?;
+        let id = NEXT_RECOVERY_HOOK_ID.fetch_add(1, Ordering::Relaxed);
+        let path = git_dir.join(format!(
+            "bitbygit-recovery-hooks-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).map_err(|source| recovery_hook_io_error("create", source))?;
+        let hooks = Self { path };
+
+        let configured_hook = git.hook_path("reference-transaction")?;
+        if let Some(configured_dir) = configured_hook.parent() {
+            match fs::read_dir(configured_dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry =
+                            entry.map_err(|source| recovery_hook_io_error("read", source))?;
+                        if entry.file_name() == "reference-transaction" {
+                            continue;
+                        }
+                        link_recovery_hook(&entry.path(), &hooks.path.join(entry.file_name()))?;
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(recovery_hook_io_error("read", source)),
+            }
+        }
+
+        let expected_path = hooks.path.join("expected-refs");
+        let mut expected = Vec::new();
+        for (reference, oid) in recovery_ref_values(state)? {
+            expected.extend_from_slice(oid.as_bytes());
+            expected.push(b'\t');
+            expected.extend_from_slice(reference.as_bytes());
+            expected.push(b'\n');
+        }
+        fs::write(&expected_path, expected)
+            .map_err(|source| recovery_hook_io_error("write", source))?;
+
+        let transaction_input = hooks.path.join("transaction-input");
+        let user_hook = hook_is_enabled(&configured_hook).then_some(configured_hook);
+        let user_hook_command = user_hook
+            .as_ref()
+            .map(|hook| {
+                format!(
+                    "{} \"$1\" < {} || exit $?\n",
+                    shell_quote(&hook.to_string_lossy()),
+                    shell_quote(&transaction_input.to_string_lossy())
+                )
+            })
+            .unwrap_or_default();
+        let script = format!(
+            "#!/bin/sh\ninput={}\ncat > \"$input\" || exit 1\n{}[ \"$1\" = prepared ] || exit 0\nwhile read -r old new ref\ndo\n    while IFS='\t' read -r expected protected\n    do\n        if [ \"$ref\" = \"$protected\" ] && [ \"$old\" != \"$expected\" ]; then\n            current=$(git rev-parse --verify --quiet \"$ref\") || current={}\n            if [ \"$current\" != \"$expected\" ]; then\n                printf '%s\\n' \"bitbygit recovery blocked: $ref changed after final validation\" >&2\n                exit 1\n            fi\n        fi\n    done < {}\ndone < \"$input\"\n",
+            shell_quote(&transaction_input.to_string_lossy()),
+            user_hook_command,
+            ZERO_OID,
+            shell_quote(&expected_path.to_string_lossy())
+        );
+        let transaction_hook = hooks.path.join("reference-transaction");
+        fs::write(&transaction_hook, script)
+            .map_err(|source| recovery_hook_io_error("write", source))?;
+        make_recovery_hook_executable(&transaction_hook)?;
+        Ok(hooks)
+    }
+}
+
+impl Drop for RecoveryHooks {
+    fn drop(&mut self) {
+        let _result = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn recovery_ref_values(state: &RecoveryState) -> Result<BTreeMap<String, String>, GitError> {
+    let mut refs = BTreeMap::new();
+    if let (Some(reference), Some(oid)) = (&state.head.reference, &state.head.oid) {
+        refs.insert(reference.clone(), oid.clone());
+    }
+    for line in state.refs.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let fields = line.split(|byte| *byte == 0).collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(parse_error("recovery ref output has unexpected fields"));
+        }
+        let reference = parse_utf8(fields[0], "recovery ref name")?;
+        let oid = parse_utf8(fields[1], "recovery ref oid")?;
+        refs.insert(reference.to_owned(), oid.to_owned());
+    }
+    Ok(refs)
+}
+
+fn recovery_hook_io_error(action: &str, source: std::io::Error) -> GitError {
+    GitError::Blocked {
+        message: format!("recovery is blocked because its ref fence could not {action}: {source}"),
+    }
+}
+
+#[cfg(unix)]
+fn link_recovery_hook(source: &Path, destination: &Path) -> Result<(), GitError> {
+    std::os::unix::fs::symlink(source, destination)
+        .map_err(|error| recovery_hook_io_error("preserve configured hooks", error))
+}
+
+#[cfg(not(unix))]
+fn link_recovery_hook(source: &Path, destination: &Path) -> Result<(), GitError> {
+    if source.is_file() {
+        fs::copy(source, destination)
+            .map(|_| ())
+            .map_err(|error| recovery_hook_io_error("preserve configured hooks", error))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn make_recovery_hook_executable(path: &Path) -> Result<(), GitError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| recovery_hook_io_error("read its ref fence", error))?
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| recovery_hook_io_error("enable its ref fence", error))
+}
+
+#[cfg(not(unix))]
+fn make_recovery_hook_executable(_path: &Path) -> Result<(), GitError> {
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3331,6 +3514,56 @@ mod tests {
     }
 
     #[test]
+    fn exact_recovery_executes_every_supported_action() -> Result<(), Box<dyn Error>> {
+        let (merge_continue_repo, _original_head) = prepare_merge_conflict()?;
+        merge_continue_repo.write("conflict.txt", "resolved\n")?;
+        merge_continue_repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(merge_continue_repo.path());
+        let state = git.recovery_state()?;
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Continue, &state)?;
+        assert_eq!(git.status()?.operation, None);
+
+        let (merge_abort_repo, original_head) = prepare_merge_conflict()?;
+        let git = Git::new(merge_abort_repo.path());
+        let state = git.recovery_state()?;
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &state)?;
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            merge_abort_repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+
+        let (rebase_continue_repo, _original_head) = prepare_rebase_conflict()?;
+        rebase_continue_repo.write("conflict.txt", "resolved\n")?;
+        rebase_continue_repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(rebase_continue_repo.path());
+        let state = git.recovery_state()?;
+        git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Continue,
+            &state,
+        )?;
+        assert_eq!(git.status()?.operation, None);
+
+        let (rebase_abort_repo, original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(rebase_abort_repo.path());
+        let state = git.recovery_state()?;
+        git.recover_exact(RepositoryOperation::Rebase, RecoveryAction::Abort, &state)?;
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            rebase_abort_repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+
+        let (rebase_skip_repo, _original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(rebase_skip_repo.path());
+        let state = git.recovery_state()?;
+        git.recover_exact(RepositoryOperation::Rebase, RecoveryAction::Skip, &state)?;
+        assert_eq!(git.status()?.operation, None);
+        Ok(())
+    }
+
+    #[test]
     fn exact_recovery_rejects_state_changed_after_preview() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
         let git = Git::new(repo.path());
@@ -3581,8 +3814,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_recovery_fails_closed_without_touching_unrelated_untracked_tree()
-    -> Result<(), Box<dyn Error>> {
+    fn exact_recovery_ignores_and_preserves_unrelated_untracked_tree() -> Result<(), Box<dyn Error>>
+    {
         let (repo, _original_head) = prepare_merge_conflict()?;
         fs::create_dir(repo.path().join("ignored"))?;
         fs::write(repo.path().join(".git/info/exclude"), "ignored/\n")?;
@@ -3594,18 +3827,9 @@ mod tests {
         let expected = git.recovery_state()?;
         repo.write("notes.txt", "changed after preview\n")?;
 
-        let Err(error) =
-            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
-        else {
-            return Err("expected exact recovery to fail closed".into());
-        };
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
 
-        assert!(
-            error
-                .to_string()
-                .contains("cannot atomically fence recovery")
-        );
-        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(git.status()?.operation, None);
         assert_eq!(
             fs::read_to_string(repo.path().join("notes.txt"))?,
             "changed after preview\n"
@@ -3768,13 +3992,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_rebase_abort_fails_closed_on_branch_move_after_final_validation()
+    fn exact_rebase_abort_preserves_branch_move_after_final_validation()
     -> Result<(), Box<dyn Error>> {
         use std::sync::mpsc;
 
         let (repo, original_head) = prepare_rebase_conflict()?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
+        let preview_head = repo.git_stdout(["rev-parse", "HEAD"])?;
+        let preview_conflict = fs::read(repo.path().join("conflict.txt"))?;
         let newer_head = repo.git_stdout(["rev-parse", "main"])?.trim().to_owned();
         assert_ne!(newer_head, original_head);
 
@@ -3811,11 +4037,15 @@ mod tests {
 
         assert!(output.status.success());
         assert!(
-            error
-                .to_string()
-                .contains("cannot atomically fence recovery")
+            error.to_string().contains("changed after final validation"),
+            "{error}"
         );
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(repo.git_stdout(["rev-parse", "HEAD"])?, preview_head);
+        assert_eq!(
+            fs::read(repo.path().join("conflict.txt"))?,
+            preview_conflict
+        );
         assert_eq!(
             repo.git_stdout(["rev-parse", "refs/heads/topic"])?.trim(),
             newer_head
@@ -3877,7 +4107,10 @@ mod tests {
         repo.run(["add", "conflict.txt"])?;
         let git = Git::new(repo.path());
 
-        let Err(error) = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue) else {
+        let state = git.recovery_state()?;
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Continue, &state)
+        else {
             return Err("expected configured signing failure".into());
         };
         let GitError::GitFailed {
@@ -3889,7 +4122,7 @@ mod tests {
         else {
             return Err("expected standard git merge failure".into());
         };
-        assert_eq!(args, ["merge".to_owned(), "--continue".to_owned()]);
+        assert!(args.ends_with(&["merge".to_owned(), "--continue".to_owned()]));
         assert!(format!("{stdout}{stderr}").contains('\u{fffd}'));
         assert!(repo.path().join("hook-ran").exists());
         assert!(repo.path().join("signing-ran").exists());
