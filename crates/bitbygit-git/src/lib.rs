@@ -481,16 +481,30 @@ impl Git {
     }
 
     fn in_progress_operation(&self) -> Result<Option<&'static str>, GitError> {
+        if let Some(operation) = self.repository_operation()? {
+            return Ok(Some(operation.label()));
+        }
         for (operation, marker) in [
-            ("merge", "MERGE_HEAD"),
-            ("rebase", "rebase-merge"),
-            ("rebase", "rebase-apply"),
+            ("am", "rebase-apply/applying"),
             ("cherry-pick", "CHERRY_PICK_HEAD"),
             ("revert", "REVERT_HEAD"),
         ] {
             if self.git_path(marker)?.exists() {
                 return Ok(Some(operation));
             }
+        }
+        Ok(None)
+    }
+
+    fn repository_operation(&self) -> Result<Option<RepositoryOperation>, GitError> {
+        if self.git_path("MERGE_HEAD")?.exists() {
+            return Ok(Some(RepositoryOperation::Merge));
+        }
+        let rebase_apply = self.git_path("rebase-apply")?;
+        if self.git_path("rebase-merge")?.exists()
+            || (rebase_apply.exists() && !rebase_apply.join("applying").exists())
+        {
+            return Ok(Some(RepositoryOperation::Rebase));
         }
         Ok(None)
     }
@@ -617,7 +631,9 @@ impl Git {
 
     pub fn status(&self) -> Result<WorktreeStatus, GitError> {
         let output = self.run_raw(["status", "--porcelain=v2", "--branch", "-z"])?;
-        parse_status_bytes(&output.stdout)
+        let mut status = parse_status_bytes(&output.stdout)?;
+        status.operation = self.repository_operation()?;
+        Ok(status)
     }
 
     pub fn stage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
@@ -1233,6 +1249,21 @@ pub enum Head {
     Unborn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryOperation {
+    Merge,
+    Rebase,
+}
+
+impl RepositoryOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
     pub name: String,
@@ -1244,6 +1275,7 @@ pub struct Remote {
 pub struct WorktreeStatus {
     pub branch: BranchState,
     pub entries: Vec<StatusEntry>,
+    pub operation: Option<RepositoryOperation>,
 }
 
 impl WorktreeStatus {
@@ -1438,7 +1470,11 @@ fn parse_status_bytes(input: &[u8]) -> Result<WorktreeStatus, GitError> {
         }
     }
 
-    Ok(WorktreeStatus { branch, entries })
+    Ok(WorktreeStatus {
+        branch,
+        entries,
+        operation: None,
+    })
 }
 
 fn parse_ahead_behind(value: &str) -> Result<(u32, u32), GitError> {
@@ -1735,6 +1771,7 @@ mod tests {
         assert_eq!(status.branch.upstream, Some("origin/main".to_owned()));
         assert_eq!(status.branch.ahead, 0);
         assert_eq!(status.branch.behind, 0);
+        assert_eq!(status.operation, None);
         Ok(())
     }
 
@@ -2042,6 +2079,8 @@ mod tests {
         repo.run_allow_failure(["rebase", "--exec", "false", "main"])?;
         let git = Git::new(repo.path());
 
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+
         let result = git.create_branch("new-topic", None, &git.head_target()?);
 
         let Err(error) = result else {
@@ -2074,11 +2113,84 @@ mod tests {
 
         let status = Git::new(repo.path()).status()?;
 
+        assert_eq!(status.operation, Some(RepositoryOperation::Merge));
         assert_eq!(status.conflicted_files().len(), 1);
         assert_eq!(
             status.conflicted_files()[0].path,
             PathBuf::from("conflict.txt")
         );
+
+        repo.run(["add", "conflict.txt"])?;
+        let status = Git::new(repo.path()).status()?;
+
+        assert_eq!(status.operation, Some(RepositoryOperation::Merge));
+        assert!(status.conflicted_files().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn detects_both_rebase_backends_and_no_operation_in_clean_repo() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        let git = Git::new(repo.path());
+
+        assert_eq!(git.status()?.operation, None);
+
+        for marker in ["rebase-merge", "rebase-apply"] {
+            let path = git.git_path(marker)?;
+            fs::create_dir(&path)?;
+            assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+            fs::remove_dir(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn paused_am_is_not_reported_as_rebase_and_remains_blocking() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        repo.run(["commit", "--allow-empty", "-m", "empty"])?;
+        let patch = repo.git_stdout(["format-patch", "-1", "--stdout"])?;
+        repo.run(["reset", "--hard", "HEAD~"])?;
+        repo.write("empty.patch", &patch)?;
+        repo.run_allow_failure(["am", "empty.patch"])?;
+        let git = Git::new(repo.path());
+
+        assert!(git.git_path("rebase-apply/applying")?.exists());
+        assert_eq!(git.status()?.operation, None);
+        let Err(error) = git.ensure_clean_worktree("checkout") else {
+            return Err("expected paused am guardrail".into());
+        };
+        assert!(error.to_string().contains("am operation is in progress"));
+        Ok(())
+    }
+
+    #[test]
+    fn cherry_pick_and_revert_markers_remain_blocking() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        let git = Git::new(repo.path());
+
+        for (marker, operation) in [
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+        ] {
+            let path = git.git_path(marker)?;
+            fs::write(&path, "marker\n")?;
+
+            assert_eq!(git.status()?.operation, None);
+            let Err(error) = git.ensure_clean_worktree("checkout") else {
+                return Err(format!("expected {operation} marker to block checkout").into());
+            };
+            assert!(error.to_string().contains(operation));
+
+            fs::remove_file(path)?;
+        }
         Ok(())
     }
 
