@@ -208,6 +208,56 @@ impl Git {
         self.run_args(vec!["rebase".to_owned(), base.oid.clone()])
     }
 
+    pub fn recover(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+    ) -> Result<GitOutput, GitError> {
+        if operation == RepositoryOperation::Merge && action == RecoveryAction::Skip {
+            return Err(GitError::Blocked {
+                message: "merge skip is blocked because Git does not support it".to_owned(),
+            });
+        }
+
+        let status = self.status()?;
+        match status.operation {
+            Some(active) if active == operation => {}
+            Some(active) => {
+                return Err(GitError::Blocked {
+                    message: format!(
+                        "{} {} is blocked because a {} operation is active",
+                        operation.label(),
+                        action.label(),
+                        active.label()
+                    ),
+                });
+            }
+            None => {
+                return Err(GitError::Blocked {
+                    message: format!(
+                        "{} {} is blocked because no {} operation is active",
+                        operation.label(),
+                        action.label(),
+                        operation.label()
+                    ),
+                });
+            }
+        }
+        if action == RecoveryAction::Continue && !status.conflicted_files().is_empty() {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{} continue is blocked while unresolved conflicts are present",
+                    operation.label()
+                ),
+            });
+        }
+
+        self.run_recovery_args(vec![
+            operation.label().to_owned(),
+            format!("--{}", action.label()),
+        ])
+    }
+
     pub fn push_current_branch(
         &self,
         remote: &str,
@@ -882,6 +932,18 @@ impl Git {
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
+        self.run_args_with_editor(args, false)
+    }
+
+    fn run_recovery_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
+        self.run_args_with_editor(args, true)
+    }
+
+    fn run_args_with_editor(
+        &self,
+        args: Vec<String>,
+        disable_editor: bool,
+    ) -> Result<GitOutput, GitError> {
         let mut command = Command::new("git");
         command
             .current_dir(&self.cwd)
@@ -889,6 +951,11 @@ impl Git {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never");
+        if disable_editor {
+            command
+                .env("GIT_EDITOR", "true")
+                .env("GIT_SEQUENCE_EDITOR", "true");
+        }
         if self.ssh_executable.is_some() || env::var_os("GIT_SSH_COMMAND").is_none() {
             let ssh_executable = self
                 .ssh_executable
@@ -1260,6 +1327,23 @@ impl RepositoryOperation {
         match self {
             Self::Merge => "merge",
             Self::Rebase => "rebase",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    Continue,
+    Abort,
+    Skip,
+}
+
+impl RecoveryAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Abort => "abort",
+            Self::Skip => "skip",
         }
     }
 }
@@ -2129,6 +2213,206 @@ mod tests {
     }
 
     #[test]
+    fn merge_continue_requires_resolution_and_finishes_without_an_editor()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.run(["config", "core.editor", "false"])?;
+        let git = Git::new(repo.path());
+
+        let Err(error) = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue) else {
+            return Err("expected unresolved merge to block continue".into());
+        };
+        assert!(error.to_string().contains("unresolved conflicts"));
+
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        git.recover(RepositoryOperation::Merge, RecoveryAction::Continue)?;
+
+        assert_eq!(git.status()?.operation, None);
+        repo.run(["rev-parse", "--verify", "HEAD^2"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn merge_abort_clears_operation_and_restores_head() -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+
+        git.recover(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("conflict.txt"))?,
+            "main\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_continue_reports_the_next_conflict_then_finishes() -> Result<(), Box<dyn Error>> {
+        let repo = prepare_two_conflict_rebase()?;
+        repo.run(["config", "core.editor", "false"])?;
+        let git = Git::new(repo.path());
+
+        repo.write("first.txt", "topic first\n")?;
+        repo.run(["add", "first.txt"])?;
+        let Err(error) = git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue) else {
+            return Err("expected rebase to stop at the next conflict".into());
+        };
+        let GitError::GitFailed {
+            args,
+            stdout,
+            stderr,
+            ..
+        } = &error
+        else {
+            return Err(format!("expected git failure for next conflict, got {error}").into());
+        };
+        assert_eq!(args, &["rebase".to_owned(), "--continue".to_owned()]);
+        assert!(format!("{stdout}\n{stderr}").contains("second.txt"));
+        let status = git.status()?;
+        assert_eq!(status.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(status.conflicted_files().len(), 1);
+        assert_eq!(
+            status.conflicted_files()[0].path,
+            PathBuf::from("second.txt")
+        );
+
+        repo.write("second.txt", "topic second\n")?;
+        repo.run(["add", "second.txt"])?;
+        git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue)?;
+
+        assert_eq!(git.status()?.operation, None);
+        repo.run(["merge-base", "--is-ancestor", "main", "HEAD"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_abort_clears_operation_and_restores_head() -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path());
+
+        git.recover(RepositoryOperation::Rebase, RecoveryAction::Abort)?;
+
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("conflict.txt"))?,
+            "topic\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_skip_drops_the_conflicting_commit() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path());
+
+        git.recover(RepositoryOperation::Rebase, RecoveryAction::Skip)?;
+
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("conflict.txt"))?,
+            "main\n"
+        );
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            repo.git_stdout(["rev-parse", "main"])?.trim()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_merge_skip_absent_state_and_mismatched_state() -> Result<(), Box<dyn Error>>
+    {
+        let clean = initialized_repo()?;
+        let clean_git = Git::new(clean.path());
+        for (operation, action) in [
+            (RepositoryOperation::Merge, RecoveryAction::Continue),
+            (RepositoryOperation::Merge, RecoveryAction::Abort),
+            (RepositoryOperation::Rebase, RecoveryAction::Continue),
+            (RepositoryOperation::Rebase, RecoveryAction::Abort),
+            (RepositoryOperation::Rebase, RecoveryAction::Skip),
+        ] {
+            let Err(error) = clean_git.recover(operation, action) else {
+                return Err(
+                    format!("expected {operation:?} {action:?} to require active state").into(),
+                );
+            };
+            assert!(error.to_string().contains("no"));
+            assert!(error.to_string().contains("operation is active"));
+        }
+
+        let (merge_repo, _original_head) = prepare_merge_conflict()?;
+        let merge_git = Git::new(merge_repo.path());
+        let Err(error) = merge_git.recover(RepositoryOperation::Merge, RecoveryAction::Skip) else {
+            return Err("expected merge skip to be rejected".into());
+        };
+        assert!(error.to_string().contains("does not support"));
+        assert_eq!(
+            merge_git.status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
+
+        let Err(error) = merge_git.recover(RepositoryOperation::Rebase, RecoveryAction::Abort)
+        else {
+            return Err("expected mismatched rebase recovery to be rejected".into());
+        };
+        assert!(error.to_string().contains("merge operation is active"));
+        assert_eq!(
+            merge_git.status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_continue_runs_hooks_and_does_not_bypass_signing() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let hooks = repo.path().join("hooks");
+        fs::create_dir(&hooks)?;
+        let commit_msg_hook = hooks.join("commit-msg");
+        fs::write(&commit_msg_hook, "#!/bin/sh\ntouch hook-ran\n")?;
+        let mut permissions = fs::metadata(&commit_msg_hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&commit_msg_hook, permissions)?;
+        repo.run(["config", "core.hooksPath", "hooks"])?;
+
+        let signing_program = repo.path().join("signing-program");
+        fs::write(&signing_program, "#!/bin/sh\ntouch signing-ran\nexit 1\n")?;
+        let mut permissions = fs::metadata(&signing_program)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&signing_program, permissions)?;
+        repo.run_args(&["config", "gpg.program", &signing_program.to_string_lossy()])?;
+        repo.run(["config", "commit.gpgsign", "true"])?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(repo.path());
+
+        let Err(error) = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue) else {
+            return Err("expected configured signing failure".into());
+        };
+        let GitError::GitFailed { args, .. } = error else {
+            return Err("expected standard git merge failure".into());
+        };
+        assert_eq!(args, ["merge".to_owned(), "--continue".to_owned()]);
+        assert!(repo.path().join("hook-ran").exists());
+        assert!(repo.path().join("signing-ran").exists());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[test]
     fn detects_both_rebase_backends_and_no_operation_in_clean_repo() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         repo.run(["init", "-b", "main"])?;
@@ -2915,6 +3199,82 @@ mod tests {
             repo.path().as_os_str().as_bytes()
         );
         Ok(())
+    }
+
+    fn initialized_repo() -> Result<TempRepo, Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.write("README.md", "initial\n")?;
+        repo.run(["add", "README.md"])?;
+        repo.run(["commit", "-m", "initial"])?;
+        Ok(repo)
+    }
+
+    fn prepare_merge_conflict() -> Result<(TempRepo, String), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "other"])?;
+        repo.write("conflict.txt", "other\n")?;
+        repo.run(["commit", "-am", "other"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.run(["commit", "-am", "main"])?;
+        let original_head = repo.git_stdout(["rev-parse", "HEAD"])?.trim().to_owned();
+        repo.run_allow_failure(["merge", "other"])?;
+        assert_eq!(
+            Git::new(repo.path()).status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
+        Ok((repo, original_head))
+    }
+
+    fn prepare_rebase_conflict() -> Result<(TempRepo, String), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("conflict.txt", "topic\n")?;
+        repo.run(["commit", "-am", "topic"])?;
+        let original_head = repo.git_stdout(["rev-parse", "HEAD"])?.trim().to_owned();
+        repo.run(["switch", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.run(["commit", "-am", "main"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "main"])?;
+        assert_eq!(
+            Git::new(repo.path()).status()?.operation,
+            Some(RepositoryOperation::Rebase)
+        );
+        Ok((repo, original_head))
+    }
+
+    fn prepare_two_conflict_rebase() -> Result<TempRepo, Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write("first.txt", "base first\n")?;
+        repo.write("second.txt", "base second\n")?;
+        repo.run(["add", "first.txt", "second.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("first.txt", "topic first\n")?;
+        repo.run(["commit", "-am", "topic first"])?;
+        repo.write("second.txt", "topic second\n")?;
+        repo.run(["commit", "-am", "topic second"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("first.txt", "main first\n")?;
+        repo.write("second.txt", "main second\n")?;
+        repo.run(["commit", "-am", "main changes"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "main"])?;
+        assert_eq!(
+            Git::new(repo.path()).status()?.operation,
+            Some(RepositoryOperation::Rebase)
+        );
+        Ok(repo)
     }
 
     struct TempRepo {
