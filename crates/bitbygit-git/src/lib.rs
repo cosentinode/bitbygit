@@ -269,39 +269,21 @@ impl Git {
     }
 
     pub fn remote_head_oid(&self, remote: &str, branch: &str) -> Result<Option<String>, GitError> {
-        self.head_oid_at(remote, branch, None)
+        self.head_oid_at(remote, branch)
     }
 
     pub fn remote_url_head_oid(&self, url: &str, branch: &str) -> Result<Option<String>, GitError> {
-        self.head_oid_at(url, branch, None)
+        self.head_oid_at(url, branch)
     }
 
-    pub fn github_remote_url_head_oid(
-        &self,
-        url: &str,
-        branch: &str,
-    ) -> Result<Option<String>, GitError> {
-        self.head_oid_at(url, branch, Some("https:ssh"))
-    }
-
-    fn head_oid_at(
-        &self,
-        target: &str,
-        branch: &str,
-        allowed_protocols: Option<&str>,
-    ) -> Result<Option<String>, GitError> {
-        let mut args = Vec::new();
-        if allowed_protocols.is_some() {
-            args.extend(["-c".to_owned(), "credential.helper=".to_owned()]);
-        }
-        args.extend([
+    fn head_oid_at(&self, target: &str, branch: &str) -> Result<Option<String>, GitError> {
+        let output = self.run_args(vec![
             "ls-remote".to_owned(),
             "--heads".to_owned(),
             "--".to_owned(),
             target.to_owned(),
             format!("refs/heads/{branch}"),
-        ]);
-        let output = self.run_args_with_allowed_protocols(args, allowed_protocols)?;
+        ])?;
         Ok(output
             .stdout
             .lines()
@@ -883,14 +865,6 @@ impl Git {
     }
 
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
-        self.run_args_with_allowed_protocols(args, None)
-    }
-
-    fn run_args_with_allowed_protocols(
-        &self,
-        args: Vec<String>,
-        allowed_protocols: Option<&str>,
-    ) -> Result<GitOutput, GitError> {
         let mut command = Command::new("git");
         command
             .current_dir(&self.cwd)
@@ -904,9 +878,6 @@ impl Git {
             .map(|path| shell_quote(&path.to_string_lossy()))
             .unwrap_or_else(|| "ssh".to_owned());
         command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
-        if let Some(protocols) = allowed_protocols {
-            command.env("GIT_ALLOW_PROTOCOL", protocols);
-        }
         let output = command
             .args(&args)
             .output()
@@ -2718,54 +2689,6 @@ mod tests {
 
         let result =
             Git::new(repo.path()).remote_url_head_oid("ssh://git@127.0.0.1:1/repo.git", "main");
-
-        assert!(result.is_err());
-        assert!(!marker.exists());
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn github_remote_url_head_oid_rejects_ext_transport_even_when_enabled()
-    -> Result<(), Box<dyn Error>> {
-        let repo = TempRepo::new()?;
-        repo.run(["init", "-b", "main"])?;
-        repo.run(["config", "protocol.ext.allow", "always"])?;
-        let marker = repo.path().join("ext-ran");
-
-        let result = Git::new(repo.path())
-            .github_remote_url_head_oid(&format!("ext::touch {}", marker.display()), "main");
-
-        assert!(result.is_err());
-        assert!(!marker.exists());
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn github_remote_url_head_oid_ignores_configured_credential_helper()
-    -> Result<(), Box<dyn Error>> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let repo = TempRepo::new()?;
-        repo.run(["init", "-b", "main"])?;
-        let marker = repo.path().join("credential-helper-ran");
-        let helper = repo.path().join("credential-helper");
-        fs::write(
-            &helper,
-            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
-        )?;
-        let mut permissions = fs::metadata(&helper)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&helper, permissions)?;
-        repo.run_args(&[
-            "config",
-            "credential.helper",
-            &format!("!{}", helper.display()),
-        ])?;
-
-        let result = Git::new(repo.path())
-            .github_remote_url_head_oid("https://bitbygit@127.0.0.1:1/octo/repo.git", "main");
 
         assert!(result.is_err());
         assert!(!marker.exists());

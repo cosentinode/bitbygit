@@ -14,6 +14,8 @@ pub const AUTHENTICATE_GH_GUIDANCE: &str =
 pub struct GitHub {
     cwd: PathBuf,
     executable: PathBuf,
+    #[cfg(test)]
+    executable_args: Vec<String>,
     repository: Option<String>,
 }
 
@@ -26,6 +28,8 @@ impl GitHub {
         Self {
             cwd: cwd.into(),
             executable: executable.into(),
+            #[cfg(test)]
+            executable_args: Vec::new(),
             repository: None,
         }
     }
@@ -38,8 +42,16 @@ impl GitHub {
         Self {
             cwd: cwd.into(),
             executable: executable.into(),
+            #[cfg(test)]
+            executable_args: Vec::new(),
             repository: Some(repository.into()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_executable_args(mut self, executable_args: Vec<String>) -> Self {
+        self.executable_args = executable_args;
+        self
     }
 
     pub fn setup_status(&self) -> Result<GhSetupStatus, GhError> {
@@ -106,11 +118,19 @@ impl GitHub {
     }
 
     pub fn branch_exists(&self, branch: &str) -> Result<bool, GhError> {
+        Ok(self.branch_reference(branch)?.is_some())
+    }
+
+    pub fn branch_oid(&self, branch: &str) -> Result<Option<String>, GhError> {
+        Ok(self
+            .branch_reference(branch)?
+            .map(|reference| reference.object.sha))
+    }
+
+    fn branch_reference(&self, branch: &str) -> Result<Option<RestReference>, GhError> {
         self.ensure_ready()?;
         if branch.trim().is_empty() {
-            return Err(GhError::InvalidInput {
-                name: "base branch",
-            });
+            return Err(GhError::InvalidInput { name: "branch" });
         }
         let repository = self.repository_after_ready()?;
         let output = self.run_output(vec![
@@ -132,7 +152,7 @@ impl GitHub {
         Ok(pages
             .into_iter()
             .flatten()
-            .any(|reference| reference.name == expected))
+            .find(|reference| reference.name == expected))
     }
 
     fn repository_after_ready(&self) -> Result<Repository, GhError> {
@@ -244,8 +264,10 @@ impl GitHub {
         let mut command = Command::new(&self.executable);
         command
             .current_dir(&self.cwd)
-            .env("GH_PROMPT_DISABLED", "1")
-            .args(args);
+            .env("GH_PROMPT_DISABLED", "1");
+        #[cfg(test)]
+        command.args(&self.executable_args);
+        command.args(args);
         command
     }
 }
@@ -313,6 +335,12 @@ struct RestPullRequestRepository {
 struct RestReference {
     #[serde(rename = "ref")]
     name: String,
+    object: RestReferenceObject,
+}
+
+#[derive(Deserialize)]
+struct RestReferenceObject {
+    sha: String,
 }
 
 impl From<RestPullRequest> for PullRequest {
@@ -449,7 +477,6 @@ fn url_path_component(value: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_FAKE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -533,11 +560,9 @@ mod tests {
         let fake = FakeGh::new(
             "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] && [ \"${13}\" = --hostname ] && [ \"${14}\" = github.com ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature\",\"repo\":{\"full_name\":\"octo/repo\"}}}]]' ;;\n*) exit 1 ;;\nesac",
         )?;
-        let github = GitHub::with_executable_and_repository(
-            &fake.path,
-            &fake.executable,
-            "github.com/octo/repo",
-        );
+        let github =
+            GitHub::with_executable_and_repository(&fake.path, "/bin/sh", "github.com/octo/repo")
+                .with_executable_args(vec![fake.executable.display().to_string()]);
 
         let repository = github.repository()?;
         let pull_requests = github.existing_pull_requests("feature")?;
@@ -569,10 +594,14 @@ mod tests {
     #[test]
     fn checks_encoded_base_branch_reference() -> Result<(), Box<dyn Error>> {
         let fake = FakeGh::new(
-            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$6\" = repos/octo/repo/git/matching-refs/heads/release%2Fnext ] || exit 1; printf '%s\\n' '[[{\"ref\":\"refs/heads/release/next\"}]]' ;;\n*) exit 1 ;;\nesac",
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$6\" = repos/octo/repo/git/matching-refs/heads/release%2Fnext ] || exit 1; printf '%s\\n' '[[{\"ref\":\"refs/heads/release/next\",\"object\":{\"sha\":\"abc123\"}}]]' ;;\n*) exit 1 ;;\nesac",
         )?;
 
         assert!(fake.github().branch_exists("release/next")?);
+        assert_eq!(
+            fake.github().branch_oid("release/next")?.as_deref(),
+            Some("abc123")
+        );
         Ok(())
     }
 
@@ -613,6 +642,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn fake_gh_executes_reliably_in_parallel() -> Result<(), Box<dyn Error>> {
+        let threads = (0..32)
+            .map(|_| {
+                std::thread::spawn(|| -> Result<(), String> {
+                    let fake = FakeGh::new(
+                        "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nesac\nexit 1",
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if fake.github().setup_status().map_err(|error| error.to_string())?
+                        != GhSetupStatus::Ready
+                    {
+                        return Err("fake GitHub CLI was not ready".to_owned());
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("fake GitHub CLI thread panicked"))?
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
     struct FakeGh {
         path: PathBuf,
         executable: PathBuf,
@@ -646,9 +703,6 @@ mod tests {
                     prompt_values.display(),
                 ),
             )?;
-            let mut permissions = fs::metadata(&executable)?.permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&executable, permissions)?;
             Ok(Self {
                 path,
                 executable,
@@ -658,7 +712,8 @@ mod tests {
         }
 
         fn github(&self) -> GitHub {
-            GitHub::with_executable(&self.path, &self.executable)
+            GitHub::with_executable(&self.path, "/bin/sh")
+                .with_executable_args(vec![self.executable.display().to_string()])
         }
 
         fn invocations(&self) -> Result<String, io::Error> {

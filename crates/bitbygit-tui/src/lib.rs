@@ -1941,23 +1941,24 @@ impl OperationPlanner {
             "Open pull request blocked: current branch needs a commit before opening a pull request."
                 .to_owned()
         })?;
-        let remote_oid = git
-            .github_remote_url_head_oid(push_url, &upstream_branch)
-            .map_err(|error| format!("Unable to verify pushed branch: {error}"))?;
-        if remote_oid.as_deref() != Some(local_oid) {
-            return Err("Open pull request blocked: current branch is not pushed to its upstream. Push it with `push` first.".to_owned());
-        }
         let github_repository = github_base_repository(&git, &head_github_repository)?;
         let github = self.github(&github_repository);
         let repository = github.repository().map_err(open_pull_request_gh_error)?;
+        let head_github = self.github(&head_github_repository);
         let canonical_head_repository =
             if head_github_repository.eq_ignore_ascii_case(&github_repository) {
                 repository.clone()
             } else {
-                self.github(&head_github_repository)
+                head_github
                     .repository()
                     .map_err(open_pull_request_gh_error)?
             };
+        let remote_oid = head_github
+            .branch_oid(&upstream_branch)
+            .map_err(open_pull_request_gh_error)?;
+        if remote_oid.as_deref() != Some(local_oid) {
+            return Err("Open pull request blocked: current branch is not pushed to its upstream. Push it with `push` first.".to_owned());
+        }
         let head_repository = canonical_head_repository.name_with_owner;
         let canonical_head_github_repository = format!("github.com/{head_repository}");
         let canonical_github_repository = format!("github.com/{}", repository.name_with_owner);
@@ -2323,22 +2324,8 @@ fn validate_open_pull_request_plan(
             "Open pull request blocked: remote URLs changed since the plan was shown.".to_owned(),
         ));
     }
-    let push_url = single_pull_request_push_url(remote, &current_remote_urls)
+    single_pull_request_push_url(remote, &current_remote_urls)
         .map_err(StepExecutionError::Blocked)?;
-    let local_oid = target.oid.as_deref().ok_or_else(|| {
-        StepExecutionError::Blocked(
-            "Open pull request blocked: planned branch has no commit.".to_owned(),
-        )
-    })?;
-    let remote_oid = git
-        .github_remote_url_head_oid(push_url, upstream_branch)
-        .map_err(StepExecutionError::Git)?;
-    if remote_oid.as_deref() != Some(local_oid) {
-        return Err(StepExecutionError::Blocked(
-            "Open pull request blocked: current branch is no longer pushed to its upstream."
-                .to_owned(),
-        ));
-    }
     Ok(())
 }
 
@@ -2978,22 +2965,22 @@ impl PlanExecutor {
                     .to_owned(),
             ));
         }
+        let head_github = match github_executable {
+            Some(executable) => GitHub::with_executable_and_repository(
+                &self.repo_root,
+                executable,
+                head_github_repository,
+            ),
+            None => GitHub::with_executable_and_repository(
+                &self.repo_root,
+                "gh",
+                head_github_repository,
+            ),
+        };
         let current_head_repository =
             if head_github_repository.eq_ignore_ascii_case(github_repository) {
                 current_repository.clone()
             } else {
-                let head_github = match github_executable {
-                    Some(executable) => GitHub::with_executable_and_repository(
-                        &self.repo_root,
-                        executable,
-                        head_github_repository,
-                    ),
-                    None => GitHub::with_executable_and_repository(
-                        &self.repo_root,
-                        "gh",
-                        head_github_repository,
-                    ),
-                };
                 head_github
                     .repository()
                     .map_err(StepExecutionError::GitHub)?
@@ -3004,6 +2991,20 @@ impl PlanExecutor {
         {
             return Err(StepExecutionError::Blocked(
                 "Open pull request blocked: GitHub head repository changed since the plan was shown."
+                    .to_owned(),
+            ));
+        }
+        let local_oid = target.oid.as_deref().ok_or_else(|| {
+            StepExecutionError::Blocked(
+                "Open pull request blocked: planned branch has no commit.".to_owned(),
+            )
+        })?;
+        let remote_oid = head_github
+            .branch_oid(upstream_branch)
+            .map_err(StepExecutionError::GitHub)?;
+        if remote_oid.as_deref() != Some(local_oid) {
+            return Err(StepExecutionError::Blocked(
+                "Open pull request blocked: current branch is no longer pushed to its upstream."
                     .to_owned(),
             ));
         }
@@ -4228,6 +4229,44 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_https_pull_request_uses_authenticated_api_not_repository_credential_helpers()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-private-https")?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/octo/repo.git",
+            ],
+        )?;
+        let marker = repo.join("credential-helper-ran");
+        git_stdout(
+            &repo,
+            &[
+                "config",
+                "credential.helper",
+                &format!("!touch '{}'", marker.display()),
+            ],
+        )?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh("open-pr-private-https", false)?),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        assert!(operation.plan.preview_text().contains("base: main"));
+        assert!(!marker.exists());
+        Ok(())
+    }
+
     #[test]
     fn pull_request_uses_differently_named_tracked_remote_branch() -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("open-pr-different-upstream-branch")?;
@@ -4285,7 +4324,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_transport_failure_does_not_persist_remote_credentials()
+    fn pull_request_head_revalidation_failure_does_not_persist_remote_credentials()
     -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("open-pr-credential-audit")?;
         git_stdout(
@@ -4300,18 +4339,13 @@ mod tests {
         let fake_gh = fake_gh("open-pr-credential-audit", false)?;
         let planner = OperationPlanner {
             repo_root: repo.clone(),
-            github_executable: Some(fake_gh),
+            github_executable: Some(fake_gh.clone()),
             ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
             .plan_request(OperationRequest::OpenPullRequest { base: None })
             .map_err(std::io::Error::other)?;
-        let remote = PathBuf::from(
-            git_stdout(&repo, &["config", "remote.origin.testbare"])?
-                .trim()
-                .to_owned(),
-        );
-        std::fs::remove_dir_all(remote)?;
+        std::fs::write(fake_gh.with_file_name("head-missing"), "")?;
         let paths = isolated_store_paths("open-pr-credential-audit")?;
 
         let execution =
@@ -4319,10 +4353,11 @@ mod tests {
                 .execute(&operation.plan, operation.context);
 
         assert!(!execution.succeeded());
+        assert!(execution.message().contains("no longer pushed"));
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].result, "error");
-        assert!(entries[1].message.contains("git failed with status"));
+        assert!(entries[1].message.contains("no longer pushed"));
         assert!(!entries[1].message.contains("abc123"));
         assert!(!entries[1].message.contains("github.com/octo/repo"));
         Ok(())
@@ -5739,6 +5774,7 @@ mod tests {
         let executable = root.join("gh");
         let invocations = root.join("invocations");
         let base_missing = root.join("base-missing");
+        let head_missing = root.join("head-missing");
         let create_response = if create_succeeds {
             "printf '%s\\n' 'https://github.com/octo/repo/pull/43' ;;"
         } else {
@@ -5747,9 +5783,10 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\nif [ \"$repository\" = octo/old-repo ]; then repository=octo/repo; fi\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) case \"$*\" in *--repo*) exit 1 ;; esac; printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\napi:--method)\n  case \"$6\" in\n    */git/matching-refs/heads/*)\n      if [ -f '{}' ]; then printf '%s\\n' '[[]]'; else printf '%s\\n' '[[{{\"ref\":\"refs/heads/main\"}},{{\"ref\":\"refs/heads/release\"}}]]'; fi ;;\n    */pulls) case \"$*\" in *--head*|*'--limit 0'*) exit 1 ;; esac; printf '%s\\n' '[{}]' ;;\n    *) exit 1 ;;\n  esac ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
+                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\nif [ \"$repository\" = octo/old-repo ]; then repository=octo/repo; fi\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) case \"$*\" in *--repo*) exit 1 ;; esac; printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\napi:--method)\n  case \"$6\" in\n    */git/matching-refs/heads/*)\n      ref=${{6##*/heads/}}\n      ref=$(printf '%s' \"$ref\" | sed 's/%2F/\\//g')\n      if [ \"$ref\" = missing ] || {{ [ \"$ref\" = main ] && [ -f '{}' ]; }} || {{ [ \"$ref\" != main ] && [ \"$ref\" != release ] && [ -f '{}' ]; }}; then\n        printf '%s\\n' '[[]]'\n      else\n        oid=$(git rev-parse HEAD)\n        printf '[[{{\"ref\":\"refs/heads/%s\",\"object\":{{\"sha\":\"%s\"}}}}]]\\n' \"$ref\" \"$oid\"\n      fi ;;\n    */pulls) case \"$*\" in *--head*|*'--limit 0'*) exit 1 ;; esac; printf '%s\\n' '[{}]' ;;\n    *) exit 1 ;;\n  esac ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
                 invocations.display(),
                 base_missing.display(),
+                head_missing.display(),
                 pull_requests,
                 create_response
             ),
