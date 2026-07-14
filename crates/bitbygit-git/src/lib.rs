@@ -843,11 +843,16 @@ impl Git {
     fn snapshot_recovery_worktree(
         &self,
         root: &Path,
-        paths: BTreeSet<PathBuf>,
+        mut paths: BTreeSet<PathBuf>,
         capture: &mut RecoveryCapture,
     ) -> Result<Vec<RecoveryWorktreeEntry>, GitError> {
         let mut entries = Vec::with_capacity(paths.len());
-        for relative in paths {
+        let mut path_bytes = paths
+            .iter()
+            .map(|path| path.as_os_str().as_encoded_bytes().len())
+            .sum::<usize>();
+        let mut path_count = paths.len();
+        while let Some(relative) = paths.pop_first() {
             let path = root.join(&relative);
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -902,7 +907,33 @@ impl Git {
                         .map_err(|source| recovery_metadata_io_error(&relative, source))?,
                 )
             } else if file_type.is_dir() {
-                RecoveryWorktreeValue::Directory
+                let children = fs::read_dir(&path)
+                    .map_err(|source| recovery_metadata_io_error(&relative, source))?;
+                for child in children {
+                    let child =
+                        child.map_err(|source| recovery_metadata_io_error(&relative, source))?;
+                    let child = relative.join(child.file_name());
+                    if paths.insert(child.clone()) {
+                        if path_count == MAX_RECOVERY_RELEVANT_FILES {
+                            return Err(recovery_bound_error(format!(
+                                "relevant file count exceeds {MAX_RECOVERY_RELEVANT_FILES}"
+                            )));
+                        }
+                        path_count += 1;
+                        let child_bytes = child.as_os_str().as_encoded_bytes().len();
+                        path_bytes = path_bytes.saturating_add(child_bytes);
+                        if path_bytes > MAX_RECOVERY_PATH_BYTES {
+                            return Err(recovery_bound_error(format!(
+                                "relevant path bytes exceed {MAX_RECOVERY_PATH_BYTES}"
+                            )));
+                        }
+                        capture.retain(child_bytes.saturating_add(96), "relevant paths")?;
+                    }
+                }
+                RecoveryWorktreeValue::Directory {
+                    mode: recovery_file_mode(&metadata),
+                    identity: recovery_file_identity(&metadata),
+                }
             } else {
                 return Err(GitError::Blocked {
                     message: format!(
@@ -2177,7 +2208,10 @@ enum RecoveryWorktreeValue {
         identity: (u64, u64),
         digest: [u8; 32],
     },
-    Directory,
+    Directory {
+        mode: u32,
+        identity: (u64, u64),
+    },
     Symlink(PathBuf),
 }
 
@@ -3434,6 +3468,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_rebase_abort_preserves_ignored_directory_child_changed_after_preview()
+    -> Result<(), Box<dyn Error>> {
+        let repo = prepare_rebase_with_ignored_directory_collision()?;
+        let git = Git::new(repo.path());
+        let victim = repo.path().join("victim");
+        let child = victim.join("data");
+        let expected = git.recovery_state()?;
+        fs::write(&child, "changed after preview\n")?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected ignored directory child change to block rebase abort".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        assert!(victim.is_dir());
+        assert_eq!(fs::read_to_string(child)?, "changed after preview\n");
+        Ok(())
+    }
+
+    #[test]
     fn exact_rebase_uses_backend_orig_head_when_top_level_orig_head_is_wrong()
     -> Result<(), Box<dyn Error>> {
         let repo = prepare_rebase_with_ignored_victim()?;
@@ -4632,6 +4691,32 @@ mod tests {
         repo.run_allow_failure(["rebase", "--exec", "false", "main"])?;
         fs::create_dir(repo.path().join("target"))?;
         repo.write("target/victim.bin", "before preview\n")?;
+        assert_eq!(
+            Git::new(repo.path()).status()?.operation,
+            Some(RepositoryOperation::Rebase)
+        );
+        Ok(repo)
+    }
+
+    fn prepare_rebase_with_ignored_directory_collision() -> Result<TempRepo, Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write(".gitignore", "victim/\n")?;
+        repo.write("first.txt", "first\n")?;
+        repo.run(["add", ".gitignore", "first.txt"])?;
+        repo.run(["commit", "-m", "ignore victim"])?;
+        repo.write(".gitignore", "")?;
+        repo.write("victim", "committed file\n")?;
+        repo.run(["add", ".gitignore", "victim"])?;
+        repo.run(["commit", "-m", "track victim file"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("upstream.txt", "upstream\n")?;
+        repo.run(["add", "upstream.txt"])?;
+        repo.run(["commit", "-m", "upstream"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "--exec", "false", "main"])?;
+        fs::create_dir(repo.path().join("victim"))?;
+        repo.write("victim/data", "before preview\n")?;
         assert_eq!(
             Git::new(repo.path()).status()?.operation,
             Some(RepositoryOperation::Rebase)
