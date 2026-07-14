@@ -599,6 +599,29 @@ struct QueuedPromptSequence {
     remaining_requests: Vec<OperationRequest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubRepository(String);
+
+impl GitHubRepository {
+    fn new(hostname: &str, name_with_owner: &str) -> Self {
+        Self(format!("{hostname}/{name_with_owner}"))
+    }
+
+    fn hostname(&self) -> &str {
+        self.0.split_once('/').map_or("", |(hostname, _)| hostname)
+    }
+
+    fn name_with_owner(&self) -> &str {
+        self.0
+            .split_once('/')
+            .map_or("", |(_, name_with_owner)| name_with_owner)
+    }
+
+    fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
 impl QueuedPromptSequence {
     fn new(first: PreparedOperation, remaining_requests: Vec<OperationRequest>) -> Self {
         Self {
@@ -686,8 +709,8 @@ enum PendingPayload {
         base: String,
         title: String,
         repository: String,
-        github_repository: String,
-        head_github_repository: String,
+        github_repository: GitHubRepository,
+        head_github_repository: GitHubRepository,
         head_repository: String,
         head: String,
         github_executable: Option<PathBuf>,
@@ -1210,12 +1233,13 @@ fn open_pull_request_plan(
     head: &str,
     base: &str,
     title: &str,
-    repository: &str,
+    repository: &GitHubRepository,
     existing_url: Option<&str>,
 ) -> OperationPlan {
     let target = existing_url.map(ToOwned::to_owned).unwrap_or_else(|| {
         format!(
-            "https://github.com/{repository}/compare/{}...{}?expand=1",
+            "https://{}/compare/{}...{}?expand=1",
+            repository.0,
             compare_url_ref(base),
             compare_url_ref(head)
         )
@@ -1929,11 +1953,8 @@ impl OperationPlanner {
             .remote_push_urls(&remote)
             .map_err(|error| format!("Unable to prepare pull request remote: {error}"))?;
         let push_url = single_pull_request_push_url(&remote, &remote_urls)?;
-        let head_github_repository = github_repository_from_push_url(push_url).ok_or_else(|| {
-            format!(
-                "Open pull request blocked: remote {remote} does not identify a GitHub repository."
-            )
-        })?;
+        let head_github_repository = github_repository_from_push_url(push_url)
+            .map_err(|reason| format!("Open pull request blocked: remote {remote} {reason}"))?;
         let target = git
             .head_target()
             .map_err(|error| format!("Unable to snapshot pull request branch: {error}"))?;
@@ -1942,6 +1963,15 @@ impl OperationPlanner {
                 .to_owned()
         })?;
         let github_repository = github_base_repository(&git, &remote, &head_github_repository)?;
+        if !head_github_repository
+            .hostname()
+            .eq_ignore_ascii_case(github_repository.hostname())
+        {
+            return Err(
+                "Open pull request blocked: source and upstream remotes use different GitHub hosts."
+                    .to_owned(),
+            );
+        }
         let github = self.github(&github_repository);
         let repository = github.repository().map_err(open_pull_request_gh_error)?;
         let head_github = self.github(&head_github_repository);
@@ -1960,8 +1990,10 @@ impl OperationPlanner {
             return Err("Open pull request blocked: current branch is not pushed to its upstream. Push it with `push` first.".to_owned());
         }
         let head_repository = canonical_head_repository.name_with_owner;
-        let canonical_head_github_repository = format!("github.com/{head_repository}");
-        let canonical_github_repository = format!("github.com/{}", repository.name_with_owner);
+        let canonical_head_github_repository =
+            GitHubRepository::new(head_github_repository.hostname(), &head_repository);
+        let canonical_github_repository =
+            GitHubRepository::new(github_repository.hostname(), &repository.name_with_owner);
         let head = pull_request_head(
             &canonical_head_github_repository,
             &canonical_github_repository,
@@ -2002,7 +2034,7 @@ impl OperationPlanner {
                 &head,
                 &base,
                 &title,
-                &repository.name_with_owner,
+                &canonical_github_repository,
                 existing_url,
             ),
             ExecutionContext::from_payload(PendingPayload::OpenPullRequest {
@@ -2055,12 +2087,20 @@ impl OperationPlanner {
         Git::new(self.repo_root.clone())
     }
 
-    fn github(&self, repository: &str) -> GitHub {
+    fn github(&self, repository: &GitHubRepository) -> GitHub {
         match &self.github_executable {
-            Some(executable) => {
-                GitHub::with_executable_and_repository(&self.repo_root, executable, repository)
-            }
-            None => GitHub::with_executable_and_repository(&self.repo_root, "gh", repository),
+            Some(executable) => GitHub::with_executable_and_repository(
+                &self.repo_root,
+                executable,
+                repository.hostname(),
+                repository.name_with_owner(),
+            ),
+            None => GitHub::with_executable_and_repository(
+                &self.repo_root,
+                "gh",
+                repository.hostname(),
+                repository.name_with_owner(),
+            ),
         }
     }
 }
@@ -2093,12 +2133,14 @@ fn single_pull_request_push_url<'a>(remote: &str, urls: &'a [String]) -> Result<
     }
 }
 
-fn github_repository_from_push_url(url: &str) -> Option<String> {
+fn github_repository_from_push_url(url: &str) -> Result<GitHubRepository, &'static str> {
     let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
         if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("ssh") {
-            return None;
+            return Err("uses an unsupported URL; configure an HTTPS or SSH GitHub remote URL.");
         }
-        let (authority, path) = rest.split_once('/')?;
+        let (authority, path) = rest
+            .split_once('/')
+            .ok_or("has an invalid URL; use HOST/OWNER/REPOSITORY form.")?;
         (
             authority
                 .rsplit_once('@')
@@ -2106,9 +2148,11 @@ fn github_repository_from_push_url(url: &str) -> Option<String> {
             path,
         )
     } else {
-        let (authority, path) = url.split_once(':')?;
-        if authority.contains('/') {
-            return None;
+        let (authority, path) = url
+            .split_once(':')
+            .ok_or("uses an unsupported URL; configure an HTTPS or SSH GitHub remote URL.")?;
+        if authority.contains('/') || path.starts_with(':') {
+            return Err("uses an unsupported URL; configure an HTTPS or SSH GitHub remote URL.");
         }
         (
             authority
@@ -2117,45 +2161,82 @@ fn github_repository_from_push_url(url: &str) -> Option<String> {
             path,
         )
     };
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
+    if host.contains(':') {
+        return Err(
+            "uses a custom port, which is not supported by the GitHub CLI integration; configure a hostname-only remote URL.",
+        );
+    }
+    let hostname = host.to_ascii_lowercase();
+    if !valid_github_hostname(&hostname) {
+        return Err(
+            "has an invalid GitHub hostname; configure a valid HTTPS or SSH GitHub remote URL.",
+        );
     }
     let mut components = path.trim_end_matches('/').split('/');
-    let owner = components.next()?;
-    let repository = components.next()?;
+    let owner = components
+        .next()
+        .ok_or("does not identify a GitHub OWNER/REPOSITORY.")?;
+    let repository = components
+        .next()
+        .ok_or("does not identify a GitHub OWNER/REPOSITORY.")?;
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
-    if host.is_empty()
-        || owner.is_empty()
+    if owner.is_empty()
         || repository.is_empty()
         || components.next().is_some()
         || owner.contains(['?', '#'])
         || repository.contains(['?', '#'])
     {
-        return None;
+        return Err("does not identify a GitHub OWNER/REPOSITORY.");
     }
-    Some(format!("github.com/{owner}/{repository}"))
+    Ok(GitHubRepository::new(
+        &hostname,
+        &format!("{owner}/{repository}"),
+    ))
+}
+
+fn valid_github_hostname(hostname: &str) -> bool {
+    !hostname.is_empty()
+        && hostname.len() <= 253
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
 }
 
 fn github_base_repository(
     git: &Git,
     push_remote: &str,
-    head_repository: &str,
-) -> Result<String, String> {
+    head_repository: &GitHubRepository,
+) -> Result<GitHubRepository, String> {
     let remotes = git
         .remotes()
         .map_err(|error| format!("Unable to prepare pull request base remote: {error}"))?;
-    if let Some(fetch_repository) = remotes
+    if let Some(fetch_url) = remotes
         .iter()
         .find(|remote| remote.name == push_remote)
         .and_then(|remote| remote.fetch_url.as_deref())
-        .and_then(github_repository_from_push_url)
-        .filter(|repository| !repository.eq_ignore_ascii_case(head_repository))
     {
-        return Ok(fetch_repository);
+        let fetch_repository = github_repository_from_push_url(fetch_url).map_err(|reason| {
+            format!("Open pull request blocked: remote {push_remote} fetch URL {reason}")
+        })?;
+        if !fetch_repository.eq_ignore_ascii_case(head_repository) {
+            return Ok(fetch_repository);
+        }
     }
     let upstream = remotes.into_iter().find(|remote| remote.name == "upstream");
     let Some(upstream) = upstream else {
-        return Ok(head_repository.to_owned());
+        return Ok(head_repository.clone());
     };
     let url = upstream
         .fetch_url
@@ -2165,36 +2246,34 @@ fn github_base_repository(
             "Open pull request blocked: upstream remote has no URL; configure the base repository or remove the remote."
                 .to_owned()
         })?;
-    github_repository_from_push_url(url).ok_or_else(|| {
-        "Open pull request blocked: upstream remote does not identify a GitHub repository."
-            .to_owned()
-    })
+    github_repository_from_push_url(url)
+        .map_err(|reason| format!("Open pull request blocked: upstream remote {reason}"))
 }
 
 fn pull_request_head(
-    head_repository: &str,
-    base_repository: &str,
+    head_repository: &GitHubRepository,
+    base_repository: &GitHubRepository,
     branch: &str,
 ) -> Result<String, String> {
     if head_repository.eq_ignore_ascii_case(base_repository) {
         return Ok(branch.to_owned());
     }
-    let (head_host, head_name) = head_repository.split_once('/').ok_or_else(|| {
-        "Open pull request blocked: source remote does not identify a GitHub repository.".to_owned()
-    })?;
-    let (base_host, _) = base_repository.split_once('/').ok_or_else(|| {
-        "Open pull request blocked: upstream remote does not identify a GitHub repository."
-            .to_owned()
-    })?;
-    if !head_host.eq_ignore_ascii_case(base_host) {
+    if !head_repository
+        .hostname()
+        .eq_ignore_ascii_case(base_repository.hostname())
+    {
         return Err(
             "Open pull request blocked: source and upstream remotes use different GitHub hosts."
                 .to_owned(),
         );
     }
-    let (owner, _) = head_name.split_once('/').ok_or_else(|| {
-        "Open pull request blocked: source remote does not identify a GitHub repository.".to_owned()
-    })?;
+    let (owner, _) = head_repository
+        .name_with_owner()
+        .split_once('/')
+        .ok_or_else(|| {
+            "Open pull request blocked: source remote does not identify a GitHub repository."
+                .to_owned()
+        })?;
     Ok(format!("{owner}:{branch}"))
 }
 
@@ -2961,11 +3040,15 @@ impl PlanExecutor {
             Some(executable) => GitHub::with_executable_and_repository(
                 &self.repo_root,
                 executable,
-                github_repository,
+                github_repository.hostname(),
+                github_repository.name_with_owner(),
             ),
-            None => {
-                GitHub::with_executable_and_repository(&self.repo_root, "gh", github_repository)
-            }
+            None => GitHub::with_executable_and_repository(
+                &self.repo_root,
+                "gh",
+                github_repository.hostname(),
+                github_repository.name_with_owner(),
+            ),
         };
         let current_repository = github.repository().map_err(StepExecutionError::GitHub)?;
         if !current_repository
@@ -2981,12 +3064,14 @@ impl PlanExecutor {
             Some(executable) => GitHub::with_executable_and_repository(
                 &self.repo_root,
                 executable,
-                head_github_repository,
+                head_github_repository.hostname(),
+                head_github_repository.name_with_owner(),
             ),
             None => GitHub::with_executable_and_repository(
                 &self.repo_root,
                 "gh",
-                head_github_repository,
+                head_github_repository.hostname(),
+                head_github_repository.name_with_owner(),
             ),
         };
         let current_head_repository =
@@ -3021,8 +3106,14 @@ impl PlanExecutor {
             ));
         }
         let current_head = pull_request_head(
-            &format!("github.com/{}", current_head_repository.name_with_owner),
-            &format!("github.com/{}", current_repository.name_with_owner),
+            &GitHubRepository::new(
+                head_github_repository.hostname(),
+                &current_head_repository.name_with_owner,
+            ),
+            &GitHubRepository::new(
+                github_repository.hostname(),
+                &current_repository.name_with_owner,
+            ),
             upstream_branch,
         )
         .map_err(StepExecutionError::Blocked)?;
@@ -3751,7 +3842,7 @@ fn sanitized_git_error(error: &GitError) -> String {
 
 fn sanitized_github_error(error: &GhError) -> String {
     match error {
-        GhError::MissingCli | GhError::NotAuthenticated | GhError::InvalidInput { .. } => {
+        GhError::MissingCli | GhError::NotAuthenticated { .. } | GhError::InvalidInput { .. } => {
             error.to_string()
         }
         GhError::CommandFailed { status } => format!("GitHub CLI failed with status {status}"),
@@ -4280,6 +4371,104 @@ mod tests {
     }
 
     #[test]
+    fn enterprise_https_pull_request_scopes_all_gh_commands_to_remote_host()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-enterprise-https")?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://git.example.com/octo/repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh("open-pr-enterprise-https", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        assert!(
+            operation
+                .plan
+                .preview_text()
+                .contains("https://git.example.com/octo/repo/compare/main...feature/open-pr")
+        );
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-enterprise-https-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&operation.plan, operation.context);
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert_eq!(
+            execution.message(),
+            "Pull request created: https://git.example.com/octo/repo/pull/43"
+        );
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("auth status --active --hostname git.example.com"));
+        assert!(invocations.contains("repo view git.example.com/octo/repo"));
+        assert!(invocations.contains("--hostname git.example.com"));
+        assert!(invocations.contains("pr create"));
+        assert!(invocations.contains("--repo git.example.com/octo/repo"));
+        Ok(())
+    }
+
+    #[test]
+    fn enterprise_ssh_remote_surfaces_existing_pull_request() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-enterprise-ssh-existing")?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@git.example.com:octo/repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh_with_pull_requests(
+            "open-pr-enterprise-ssh-existing",
+            "[{\"number\":42,\"html_url\":\"https://git.example.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature/open-pr\",\"repo\":{\"full_name\":\"octo/repo\"}}}]",
+            true,
+        )?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        assert!(
+            operation
+                .plan
+                .preview_text()
+                .contains("https://git.example.com/octo/repo/pull/42")
+        );
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-enterprise-ssh-existing-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&operation.plan, operation.context);
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert!(execution.message().contains("Pull request already open"));
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("head=octo:feature/open-pr"));
+        assert!(invocations.contains("--hostname git.example.com"));
+        assert!(!invocations.contains("pr:create"));
+        Ok(())
+    }
+
+    #[test]
     fn pull_request_uses_differently_named_tracked_remote_branch() -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("open-pr-different-upstream-branch")?;
         git_stdout_with_ssh(
@@ -4558,7 +4747,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("does not identify a GitHub repository"));
+        assert!(error.contains("unsupported URL"));
         assert!(!marker.exists());
         Ok(())
     }
@@ -4912,13 +5101,46 @@ mod tests {
             "feature%ready",
             "release#candidate",
             "feature%ready",
-            "octo/repo",
+            &GitHubRepository::new("github.com", "octo/repo"),
             None,
         );
 
         assert!(plan.preview_text().contains(
             "https://github.com/octo/repo/compare/release%23candidate...feature%25ready?expand=1"
         ));
+    }
+
+    #[test]
+    fn github_remote_parser_supports_github_and_enterprise_ssh_forms() {
+        for (url, hostname) in [
+            ("https://github.com/octo/repo.git", "github.com"),
+            ("ssh://git@github.com/octo/repo.git", "github.com"),
+            ("https://git.example.com/octo/repo.git", "git.example.com"),
+            ("ssh://git@git.example.com/octo/repo.git", "git.example.com"),
+            ("git@git.example.com:octo/repo.git", "git.example.com"),
+        ] {
+            assert_eq!(
+                github_repository_from_push_url(url),
+                Ok(GitHubRepository::new(hostname, "octo/repo"))
+            );
+        }
+    }
+
+    #[test]
+    fn github_remote_parser_rejects_unsupported_or_invalid_targets() {
+        for url in [
+            "http://git.example.com/octo/repo.git",
+            "https://git.example.com:8443/octo/repo.git",
+            "ssh://git@-git.example.com/octo/repo.git",
+            "https://git.example.com/octo",
+            "https://git.example.com/octo/repo/extra.git",
+            "file:///octo/repo.git",
+        ] {
+            assert!(
+                github_repository_from_push_url(url).is_err(),
+                "{url} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -5839,7 +6061,7 @@ mod tests {
         let base_missing = root.join("base-missing");
         let head_missing = root.join("head-missing");
         let create_response = if create_succeeds {
-            "printf '%s\\n' 'https://github.com/octo/repo/pull/43' ;;"
+            "printf 'https://%s/%s/pull/43\\n' \"$GH_HOST\" \"$repository\" ;;"
         } else {
             "exit 1 ;;"
         };
