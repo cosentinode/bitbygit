@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -727,15 +727,26 @@ impl Git {
             worktree_diff: self
                 .run_raw(["diff", "--binary", "--no-ext-diff", "--"])?
                 .stdout,
-            ignored_worktree: self.ignored_worktree()?,
+            untracked_worktree: self.untracked_worktree()?,
             metadata: self.recovery_metadata()?,
             refs: self.recovery_refs(operation)?,
         })
     }
 
-    fn ignored_worktree(&self) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
+    fn untracked_worktree(&self) -> Result<Vec<RecoveryWorktreeEntry>, GitError> {
         let root = self.repo_root()?;
-        let paths = self
+        let mut paths = BTreeSet::new();
+        let nonignored = self
+            .run_raw([
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "-z",
+                "--",
+            ])?
+            .stdout;
+        let ignored = self
             .run_raw([
                 "ls-files",
                 "--others",
@@ -746,15 +757,63 @@ impl Git {
                 "--",
             ])?
             .stdout;
+        for output in [nonignored, ignored] {
+            paths.extend(
+                output
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .map(path_from_bytes),
+            );
+        }
+
         let mut entries = Vec::new();
-        for path in paths
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-        {
-            let relative = path_from_bytes(path);
-            snapshot_recovery_metadata(&relative, &root.join(&relative), &mut entries)?;
+        for relative in paths {
+            self.snapshot_recovery_worktree(&relative, &root.join(&relative), &mut entries)?;
         }
         Ok(entries)
+    }
+
+    fn snapshot_recovery_worktree(
+        &self,
+        relative: &Path,
+        path: &Path,
+        entries: &mut Vec<RecoveryWorktreeEntry>,
+    ) -> Result<(), GitError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                entries.push(RecoveryWorktreeEntry {
+                    path: relative.to_owned(),
+                    value: RecoveryWorktreeValue::Missing,
+                });
+                return Ok(());
+            }
+            Err(source) => return Err(recovery_metadata_io_error(relative, source)),
+        };
+        let file_type = metadata.file_type();
+        let value = if file_type.is_file() {
+            let oid = self
+                .run_path_args(["hash-object", "--no-filters"], Some(path), true)?
+                .stdout
+                .trim()
+                .to_owned();
+            RecoveryWorktreeValue::File {
+                size: metadata.len(),
+                oid,
+            }
+        } else if file_type.is_symlink() {
+            RecoveryWorktreeValue::Symlink(
+                fs::read_link(path)
+                    .map_err(|source| recovery_metadata_io_error(relative, source))?,
+            )
+        } else {
+            RecoveryWorktreeValue::Other
+        };
+        entries.push(RecoveryWorktreeEntry {
+            path: relative.to_owned(),
+            value,
+        });
+        Ok(())
     }
 
     fn recovery_metadata(&self) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
@@ -774,23 +833,41 @@ impl Git {
             return Ok(Vec::new());
         }
 
-        let mut args = vec![
-            OsString::from("for-each-ref"),
-            OsString::from("--format=%(refname)%00%(objectname)%00%(symref)"),
-            OsString::from("refs/rewritten"),
-        ];
+        let mut references = BTreeSet::new();
         for relative in ["rebase-merge/head-name", "rebase-apply/head-name"] {
             match fs::read(self.git_path(relative)?) {
                 Ok(reference) => {
                     let reference = strip_byte_line_ending(&reference);
                     if reference.starts_with(b"refs/") {
-                        args.push(path_from_bytes(reference).into_os_string());
+                        references.insert(path_from_bytes(reference).into_os_string());
                     }
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                 Err(source) => return Err(recovery_metadata_io_error(Path::new(relative), source)),
             }
         }
+        for relative in ["rebase-merge/update-refs", "rebase-apply/update-refs"] {
+            match fs::read(self.git_path(relative)?) {
+                Ok(contents) => {
+                    references.extend(
+                        contents
+                            .split(|byte| *byte == b'\n')
+                            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                            .filter(|line| line.starts_with(b"refs/"))
+                            .map(|line| path_from_bytes(line).into_os_string()),
+                    );
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(recovery_metadata_io_error(Path::new(relative), source)),
+            }
+        }
+
+        let mut args = vec![
+            OsString::from("for-each-ref"),
+            OsString::from("--format=%(refname)%00%(objectname)%00%(symref)"),
+            OsString::from("refs/rewritten"),
+        ];
+        args.extend(references);
 
         Ok(self.run_os_args(args, None, false)?.stdout)
     }
@@ -1520,9 +1597,23 @@ pub struct RecoveryState {
     status: Vec<u8>,
     index: Vec<u8>,
     worktree_diff: Vec<u8>,
-    ignored_worktree: Vec<RecoveryMetadataEntry>,
+    untracked_worktree: Vec<RecoveryWorktreeEntry>,
     metadata: Vec<RecoveryMetadataEntry>,
     refs: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryWorktreeEntry {
+    path: PathBuf,
+    value: RecoveryWorktreeValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoveryWorktreeValue {
+    Missing,
+    File { size: u64, oid: String },
+    Symlink(PathBuf),
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2701,6 +2792,55 @@ mod tests {
     }
 
     #[test]
+    fn exact_rebase_continue_rejects_changed_update_refs_branch() -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("first.txt", "first\n")?;
+        repo.run(["add", "first.txt"])?;
+        repo.run(["commit", "-m", "first"])?;
+        repo.run(["branch", "side"])?;
+        repo.write("second.txt", "second\n")?;
+        repo.run(["add", "second.txt"])?;
+        repo.run(["commit", "-m", "second"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("upstream.txt", "upstream\n")?;
+        repo.run(["add", "upstream.txt"])?;
+        repo.run(["commit", "-m", "upstream"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "--update-refs", "--exec", "false", "main"])?;
+
+        let git = Git::new(repo.path());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        let update_refs = fs::read(git.git_path("rebase-merge/update-refs")?)?;
+        assert!(
+            update_refs
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == b"refs/heads/side")
+        );
+        let expected = git.recovery_state()?;
+        let preview_head = repo.git_stdout(["rev-parse", "HEAD"])?.trim().to_owned();
+        let moved_side = repo.git_stdout(["rev-parse", "main"])?.trim().to_owned();
+        repo.run(["update-ref", "refs/heads/side", &moved_side])?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Continue,
+            &expected,
+        ) else {
+            return Err("expected changed update-refs branch to block rebase continue".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(repo.git_stdout(["rev-parse", "HEAD"])?.trim(), preview_head);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "refs/heads/side"])?.trim(),
+            moved_side
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exact_rebase_abort_preserves_ignored_file_changed_after_preview()
     -> Result<(), Box<dyn Error>> {
         let repo = initialized_repo()?;
@@ -2744,6 +2884,56 @@ mod tests {
             fs::read_to_string(repo.path().join("target/victim.bin"))?,
             "changed after preview\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_changed_untracked_file_content() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("notes.txt", "before preview\n")?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        repo.write("notes.txt", "changed after preview\n")?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected changed untracked file to block merge abort".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(
+            fs::read_to_string(repo.path().join("notes.txt"))?,
+            "changed after preview\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_state_fingerprints_large_sparse_ignored_file_without_retaining_content()
+    -> Result<(), Box<dyn Error>> {
+        const SPARSE_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        fs::write(git.git_path("info/exclude")?, "large.bin\n")?;
+        let sparse_path = repo.path().join("large.bin");
+        fs::File::create(&sparse_path)?.set_len(SPARSE_FILE_SIZE)?;
+
+        let state = git.recovery_state()?;
+        let sparse_entry = state
+            .untracked_worktree
+            .iter()
+            .find(|entry| entry.path == Path::new("large.bin"))
+            .ok_or("missing sparse ignored file fingerprint")?;
+        let RecoveryWorktreeValue::File { size, oid } = &sparse_entry.value else {
+            return Err("expected sparse ignored file fingerprint".into());
+        };
+        assert_eq!(*size, SPARSE_FILE_SIZE);
+        assert!(oid.len() <= 64);
+        assert_eq!(git.recovery_state()?, state);
         Ok(())
     }
 
