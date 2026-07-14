@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
@@ -872,12 +873,14 @@ impl Git {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never");
-        let ssh_executable = self
-            .ssh_executable
-            .as_ref()
-            .map(|path| shell_quote(&path.to_string_lossy()))
-            .unwrap_or_else(|| "ssh".to_owned());
-        command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
+        if self.ssh_executable.is_some() || env::var_os("GIT_SSH_COMMAND").is_none() {
+            let ssh_executable = self
+                .ssh_executable
+                .as_ref()
+                .map(|path| shell_quote(&path.to_string_lossy()))
+                .unwrap_or_else(|| "ssh".to_owned());
+            command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
+        }
         let output = command
             .args(&args)
             .output()
@@ -2692,6 +2695,83 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_preserves_inherited_ssh_command() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(repo) = env::var_os("BITBYGIT_TEST_INHERITED_SSH_REPO") {
+            Git::new(repo).fetch_remote_branch("origin", "main")?;
+            return Ok(());
+        }
+
+        let remote = TempRepo::new()?;
+        remote.run(["init", "--bare"])?;
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.run(["commit", "--allow-empty", "-m", "initial"])?;
+        let remote_path = remote.path().to_string_lossy().into_owned();
+        repo.run_args(&["remote", "add", "origin", &remote_path])?;
+        repo.run(["push", "origin", "main"])?;
+        repo.run([
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://git@127.0.0.1/repo.git",
+        ])?;
+
+        let inherited_marker = repo.path().join("inherited-ssh-ran");
+        let inherited_ssh = repo.path().join("inherited-ssh");
+        fs::write(
+            &inherited_ssh,
+            "#!/bin/sh\ntouch \"$BITBYGIT_TEST_INHERITED_SSH_MARKER\"\nexec git-upload-pack \"$BITBYGIT_TEST_INHERITED_SSH_REMOTE\"\n",
+        )?;
+        let mut permissions = fs::metadata(&inherited_ssh)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&inherited_ssh, permissions)?;
+
+        let configured_marker = repo.path().join("configured-ssh-ran");
+        let configured_ssh = repo.path().join("configured-ssh");
+        fs::write(
+            &configured_ssh,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexit 1\n",
+                configured_marker.display()
+            ),
+        )?;
+        let mut permissions = fs::metadata(&configured_ssh)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&configured_ssh, permissions)?;
+        repo.run_args(&[
+            "config",
+            "core.sshCommand",
+            &configured_ssh.display().to_string(),
+        ])?;
+
+        let output = Command::new(env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::fetch_preserves_inherited_ssh_command",
+                "--nocapture",
+            ])
+            .env("BITBYGIT_TEST_INHERITED_SSH_REPO", repo.path())
+            .env("BITBYGIT_TEST_INHERITED_SSH_REMOTE", remote.path())
+            .env("BITBYGIT_TEST_INHERITED_SSH_MARKER", &inherited_marker)
+            .env("GIT_SSH_COMMAND", &inherited_ssh)
+            .output()?;
+
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(inherited_marker.exists());
+        assert!(!configured_marker.exists());
         Ok(())
     }
 

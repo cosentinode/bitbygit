@@ -1941,7 +1941,7 @@ impl OperationPlanner {
             "Open pull request blocked: current branch needs a commit before opening a pull request."
                 .to_owned()
         })?;
-        let github_repository = github_base_repository(&git, &head_github_repository)?;
+        let github_repository = github_base_repository(&git, &remote, &head_github_repository)?;
         let github = self.github(&github_repository);
         let repository = github.repository().map_err(open_pull_request_gh_error)?;
         let head_github = self.github(&head_github_repository);
@@ -2136,12 +2136,24 @@ fn github_repository_from_push_url(url: &str) -> Option<String> {
     Some(format!("github.com/{owner}/{repository}"))
 }
 
-fn github_base_repository(git: &Git, head_repository: &str) -> Result<String, String> {
-    let upstream = git
+fn github_base_repository(
+    git: &Git,
+    push_remote: &str,
+    head_repository: &str,
+) -> Result<String, String> {
+    let remotes = git
         .remotes()
-        .map_err(|error| format!("Unable to prepare pull request base remote: {error}"))?
-        .into_iter()
-        .find(|remote| remote.name == "upstream");
+        .map_err(|error| format!("Unable to prepare pull request base remote: {error}"))?;
+    if let Some(fetch_repository) = remotes
+        .iter()
+        .find(|remote| remote.name == push_remote)
+        .and_then(|remote| remote.fetch_url.as_deref())
+        .and_then(github_repository_from_push_url)
+        .filter(|repository| !repository.eq_ignore_ascii_case(head_repository))
+    {
+        return Ok(fetch_repository);
+    }
+    let upstream = remotes.into_iter().find(|remote| remote.name == "upstream");
     let Some(upstream) = upstream else {
         return Ok(head_repository.to_owned());
     };
@@ -2936,7 +2948,7 @@ impl PlanExecutor {
             remote_urls,
             target,
         )?;
-        if !github_base_repository(git, head_github_repository)
+        if !github_base_repository(git, remote, head_github_repository)
             .map_err(StepExecutionError::Blocked)?
             .eq_ignore_ascii_case(github_repository)
         {
@@ -4703,6 +4715,57 @@ mod tests {
             assert!(invocation.contains("--repo github.com/upstream/repo"));
             assert!(invocation.contains("octo:feature/open-pr"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_targets_fetch_repository_for_a_split_remote() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-split-remote")?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/upstream/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "url.https://github.com/octo/repo.git.pushInsteadOf",
+                "https://github.com/upstream/repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh("open-pr-split-remote", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+
+        let preview = operation.plan.preview_text();
+        assert!(preview.contains("remote: origin"));
+        assert!(preview.contains("head: octo:feature/open-pr"));
+        assert!(preview.contains("https://github.com/upstream/repo/compare/main"));
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-split-remote-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&operation.plan, operation.context);
+
+        assert!(execution.succeeded(), "{}", execution.message());
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("repos/upstream/repo/pulls"));
+        assert!(invocations.contains("head=octo:feature/open-pr"));
+        assert!(invocations.contains("--repo github.com/upstream/repo"));
         Ok(())
     }
 
