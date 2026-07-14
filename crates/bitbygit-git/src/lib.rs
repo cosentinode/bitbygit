@@ -13,6 +13,7 @@ use std::os::unix::ffi::OsStringExt;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const SSH_OPTIONS: &str = "-oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes";
 const COMMIT_HOOKS: &[&str] = &[
     "pre-commit",
     "prepare-commit-msg",
@@ -23,11 +24,25 @@ const COMMIT_HOOKS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct Git {
     cwd: PathBuf,
+    ssh_executable: Option<PathBuf>,
 }
 
 impl Git {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: cwd.into() }
+        Self {
+            cwd: cwd.into(),
+            ssh_executable: None,
+        }
+    }
+
+    pub fn with_ssh_executable(
+        cwd: impl Into<PathBuf>,
+        ssh_executable: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            cwd: cwd.into(),
+            ssh_executable: Some(ssh_executable.into()),
+        }
     }
 
     pub fn repository(&self) -> Result<Repository, GitError> {
@@ -279,24 +294,21 @@ impl Git {
     }
 
     pub fn remote_push_urls(&self, remote: &str) -> Result<Vec<String>, GitError> {
-        match self.run_args(vec![
+        let output = self.run_args(vec![
             "remote".to_owned(),
             "get-url".to_owned(),
             "--push".to_owned(),
             "--all".to_owned(),
             "--".to_owned(),
             remote.to_owned(),
-        ]) {
-            Ok(output) => Ok(output
-                .stdout
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()),
-            Err(GitError::GitFailed { status, .. }) if status.code() == Some(2) => Ok(Vec::new()),
-            Err(error) => Err(error),
-        }
+        ])?;
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
     }
 
     pub fn pull(&self) -> Result<GitOutput, GitError> {
@@ -357,6 +369,41 @@ impl Git {
             .unwrap_or(merge.as_str())
             .to_owned();
         Ok(Some((remote, branch)))
+    }
+
+    pub fn push_target(&self, branch: &str) -> Result<Option<(String, String)>, GitError> {
+        let output = self.run_args(vec![
+            "for-each-ref".to_owned(),
+            "--format=%(push:remotename)%00%(push:short)".to_owned(),
+            "--count=1".to_owned(),
+            "--".to_owned(),
+            format!("refs/heads/{branch}"),
+        ])?;
+        let Some((remote, target)) = output.stdout.trim().split_once('\0') else {
+            return self.upstream_push_target(branch);
+        };
+        if !remote.is_empty() && target.is_empty() {
+            let push_default = self.config_value(["config", "--get", "push.default"])?;
+            let upstream = self.upstream_push_target(branch)?;
+            if push_default.as_deref().unwrap_or("simple") == "simple" {
+                return Ok(upstream.map(|(upstream_remote, upstream_branch)| {
+                    let push_branch = if upstream_remote == remote {
+                        upstream_branch
+                    } else {
+                        branch.to_owned()
+                    };
+                    (remote.to_owned(), push_branch)
+                }));
+            }
+            return Ok(None);
+        }
+        let Some(push_branch) = target.strip_prefix(&format!("{remote}/")) else {
+            return self.upstream_push_target(branch);
+        };
+        if remote.is_empty() || push_branch.is_empty() {
+            return self.upstream_push_target(branch);
+        }
+        Ok(Some((remote.to_owned(), push_branch.to_owned())))
     }
 
     pub fn remote_tracking_oid(
@@ -826,11 +873,13 @@ impl Git {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never");
-        if env::var_os("GIT_SSH_COMMAND").is_none() {
-            command.env(
-                "GIT_SSH_COMMAND",
-                "ssh -oBatchMode=yes -oNumberOfPasswordPrompts=0 -oKbdInteractiveAuthentication=no -oStrictHostKeyChecking=yes",
-            );
+        if self.ssh_executable.is_some() || env::var_os("GIT_SSH_COMMAND").is_none() {
+            let ssh_executable = self
+                .ssh_executable
+                .as_ref()
+                .map(|path| shell_quote(&path.to_string_lossy()))
+                .unwrap_or_else(|| "ssh".to_owned());
+            command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
         }
         let output = command
             .args(&args)
@@ -1595,6 +1644,10 @@ fn splitn_bytes(value: &[u8], delimiter: u8, count: usize) -> Vec<&[u8]> {
 fn split_once_byte(value: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
     let index = value.iter().position(|byte| *byte == delimiter)?;
     Some((&value[..index], &value[index + 1..]))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(unix)]
@@ -2543,6 +2596,182 @@ mod tests {
         repo.run(["init", "-b", "main"])?;
 
         assert_eq!(Git::new(repo.path()).upstream()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_push_urls_applies_push_instead_of_rewrites() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        repo.run([
+            "config",
+            "--add",
+            "url.https://github.com/fork/repo.git.pushInsteadOf",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        assert_eq!(
+            Git::new(repo.path()).remote_push_urls("origin")?,
+            vec!["https://github.com/fork/repo.git"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_push_urls_accepts_leading_hyphen_remote() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run([
+            "remote",
+            "add",
+            "--",
+            "-fork",
+            "https://github.com/fork/repo.git",
+        ])?;
+
+        assert_eq!(
+            Git::new(repo.path()).remote_push_urls("-fork")?,
+            vec!["https://github.com/fork/repo.git"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_target_uses_default_simple_in_triangular_workflow() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "feature"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.run(["commit", "--allow-empty", "-m", "initial"])?;
+        repo.run([
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        repo.run(["remote", "add", "fork", "https://github.com/fork/repo.git"])?;
+        repo.run(["update-ref", "refs/remotes/upstream/main", "HEAD"])?;
+        repo.run(["update-ref", "refs/remotes/fork/feature", "HEAD"])?;
+        repo.run(["config", "branch.feature.remote", "upstream"])?;
+        repo.run(["config", "branch.feature.merge", "refs/heads/main"])?;
+        repo.run(["config", "branch.feature.pushRemote", "fork"])?;
+
+        assert_eq!(
+            Git::new(repo.path()).push_target("feature")?,
+            Some(("fork".to_owned(), "feature".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_url_head_oid_ignores_configured_ssh_command() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        let marker = repo.path().join("configured-ssh-ran");
+        let configured_ssh = repo.path().join("configured-ssh");
+        fs::write(
+            &configured_ssh,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )?;
+        let mut permissions = fs::metadata(&configured_ssh)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&configured_ssh, permissions)?;
+        repo.run_args(&[
+            "config",
+            "core.sshCommand",
+            &configured_ssh.display().to_string(),
+        ])?;
+
+        let result =
+            Git::new(repo.path()).remote_url_head_oid("ssh://git@127.0.0.1:1/repo.git", "main");
+
+        assert!(result.is_err());
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_preserves_inherited_ssh_command() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(repo) = env::var_os("BITBYGIT_TEST_INHERITED_SSH_REPO") {
+            Git::new(repo).fetch_remote_branch("origin", "main")?;
+            return Ok(());
+        }
+
+        let remote = TempRepo::new()?;
+        remote.run(["init", "--bare"])?;
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.run(["commit", "--allow-empty", "-m", "initial"])?;
+        let remote_path = remote.path().to_string_lossy().into_owned();
+        repo.run_args(&["remote", "add", "origin", &remote_path])?;
+        repo.run(["push", "origin", "main"])?;
+        repo.run([
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://git@127.0.0.1/repo.git",
+        ])?;
+
+        let inherited_marker = repo.path().join("inherited-ssh-ran");
+        let inherited_ssh = repo.path().join("inherited-ssh");
+        fs::write(
+            &inherited_ssh,
+            "#!/bin/sh\ntouch \"$BITBYGIT_TEST_INHERITED_SSH_MARKER\"\nexec git-upload-pack \"$BITBYGIT_TEST_INHERITED_SSH_REMOTE\"\n",
+        )?;
+        let mut permissions = fs::metadata(&inherited_ssh)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&inherited_ssh, permissions)?;
+
+        let configured_marker = repo.path().join("configured-ssh-ran");
+        let configured_ssh = repo.path().join("configured-ssh");
+        fs::write(
+            &configured_ssh,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexit 1\n",
+                configured_marker.display()
+            ),
+        )?;
+        let mut permissions = fs::metadata(&configured_ssh)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&configured_ssh, permissions)?;
+        repo.run_args(&[
+            "config",
+            "core.sshCommand",
+            &configured_ssh.display().to_string(),
+        ])?;
+
+        let output = Command::new(env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::fetch_preserves_inherited_ssh_command",
+                "--nocapture",
+            ])
+            .env("BITBYGIT_TEST_INHERITED_SSH_REPO", repo.path())
+            .env("BITBYGIT_TEST_INHERITED_SSH_REMOTE", remote.path())
+            .env("BITBYGIT_TEST_INHERITED_SSH_MARKER", &inherited_marker)
+            .env("GIT_SSH_COMMAND", &inherited_ssh)
+            .output()?;
+
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(inherited_marker.exists());
+        assert!(!configured_marker.exists());
         Ok(())
     }
 

@@ -14,6 +14,9 @@ pub const AUTHENTICATE_GH_GUIDANCE: &str =
 pub struct GitHub {
     cwd: PathBuf,
     executable: PathBuf,
+    #[cfg(test)]
+    executable_args: Vec<String>,
+    repository: Option<String>,
 }
 
 impl GitHub {
@@ -25,7 +28,30 @@ impl GitHub {
         Self {
             cwd: cwd.into(),
             executable: executable.into(),
+            #[cfg(test)]
+            executable_args: Vec::new(),
+            repository: None,
         }
+    }
+
+    pub fn with_executable_and_repository(
+        cwd: impl Into<PathBuf>,
+        executable: impl Into<PathBuf>,
+        repository: impl Into<String>,
+    ) -> Self {
+        Self {
+            cwd: cwd.into(),
+            executable: executable.into(),
+            #[cfg(test)]
+            executable_args: Vec::new(),
+            repository: Some(repository.into()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_executable_args(mut self, executable_args: Vec<String>) -> Self {
+        self.executable_args = executable_args;
+        self
     }
 
     pub fn setup_status(&self) -> Result<GhSetupStatus, GhError> {
@@ -50,12 +76,95 @@ impl GitHub {
 
     pub fn repository(&self) -> Result<Repository, GhError> {
         self.ensure_ready()?;
+        self.repository_after_ready()
+    }
+
+    pub fn existing_pull_requests(&self, head: &str) -> Result<Vec<PullRequest>, GhError> {
+        self.ensure_ready()?;
+        let repository = self.repository_after_ready()?;
+        let (owner, branch) = match head.split_once(':') {
+            Some((owner, branch)) => (owner, branch),
+            None => (
+                repository
+                    .name_with_owner
+                    .split_once('/')
+                    .map_or("", |(owner, _)| owner),
+                head,
+            ),
+        };
+        if owner.is_empty() || branch.is_empty() {
+            return Err(GhError::InvalidInput {
+                name: "pull request head",
+            });
+        }
         let output = self.run_output(vec![
-            "repo".to_owned(),
-            "view".to_owned(),
+            "api".to_owned(),
+            "--method".to_owned(),
+            "GET".to_owned(),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+            format!("repos/{}/pulls", repository.name_with_owner),
+            "-f".to_owned(),
+            "state=open".to_owned(),
+            "-f".to_owned(),
+            format!("head={owner}:{branch}"),
+            "-f".to_owned(),
+            "per_page=100".to_owned(),
+            "--hostname".to_owned(),
+            "github.com".to_owned(),
+        ])?;
+        let pages: Vec<Vec<RestPullRequest>> = parse_json(&output, "pull request query")?;
+        Ok(pages.into_iter().flatten().map(PullRequest::from).collect())
+    }
+
+    pub fn branch_exists(&self, branch: &str) -> Result<bool, GhError> {
+        Ok(self.branch_reference(branch)?.is_some())
+    }
+
+    pub fn branch_oid(&self, branch: &str) -> Result<Option<String>, GhError> {
+        Ok(self
+            .branch_reference(branch)?
+            .map(|reference| reference.object.sha))
+    }
+
+    fn branch_reference(&self, branch: &str) -> Result<Option<RestReference>, GhError> {
+        self.ensure_ready()?;
+        if branch.trim().is_empty() {
+            return Err(GhError::InvalidInput { name: "branch" });
+        }
+        let repository = self.repository_after_ready()?;
+        let output = self.run_output(vec![
+            "api".to_owned(),
+            "--method".to_owned(),
+            "GET".to_owned(),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+            format!(
+                "repos/{}/git/matching-refs/heads/{}",
+                repository.name_with_owner,
+                url_path_component(branch)
+            ),
+            "--hostname".to_owned(),
+            "github.com".to_owned(),
+        ])?;
+        let pages: Vec<Vec<RestReference>> = parse_json(&output, "branch query")?;
+        let expected = format!("refs/heads/{branch}");
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .find(|reference| reference.name == expected))
+    }
+
+    fn repository_after_ready(&self) -> Result<Repository, GhError> {
+        let mut args = vec!["repo".to_owned(), "view".to_owned()];
+        if let Some(repository) = &self.repository {
+            args.push(repository.clone());
+        }
+        args.extend([
             "--json".to_owned(),
             "nameWithOwner,defaultBranchRef".to_owned(),
-        ])?;
+        ]);
+        let output = self.run_output(args)?;
         let repository: RepositoryResponse = parse_json(&output, "repository")?;
         let default_branch = repository
             .default_branch_ref
@@ -70,30 +179,13 @@ impl GitHub {
         })
     }
 
-    pub fn existing_pull_requests(&self, head: &str) -> Result<Vec<PullRequest>, GhError> {
-        self.ensure_ready()?;
-        let output = self.run_output(vec![
-            "pr".to_owned(),
-            "list".to_owned(),
-            "--head".to_owned(),
-            head.to_owned(),
-            "--state".to_owned(),
-            "open".to_owned(),
-            "--limit".to_owned(),
-            "0".to_owned(),
-            "--json".to_owned(),
-            "number,url,title,baseRefName,headRefName".to_owned(),
-        ])?;
-        parse_json(&output, "pull request query")
-    }
-
     pub fn create_pull_request(
         &self,
         request: &CreatePullRequest,
     ) -> Result<CreatedPullRequest, GhError> {
         self.ensure_ready()?;
         request.validate()?;
-        let output = self.run_output(vec![
+        let output = self.run_output(self.with_repository(vec![
             "pr".to_owned(),
             "create".to_owned(),
             "--title".to_owned(),
@@ -104,7 +196,7 @@ impl GitHub {
             request.base.clone(),
             "--head".to_owned(),
             request.head.clone(),
-        ])?;
+        ]))?;
         let url = output
             .lines()
             .map(str::trim)
@@ -123,6 +215,14 @@ impl GitHub {
             GhSetupStatus::MissingCli => Err(GhError::MissingCli),
             GhSetupStatus::NotAuthenticated => Err(GhError::NotAuthenticated),
         }
+    }
+
+    fn with_repository(&self, mut args: Vec<String>) -> Vec<String> {
+        if let Some(repository) = &self.repository {
+            args.push("--repo".to_owned());
+            args.push(repository.clone());
+        }
+        args
     }
 
     fn run_status(&self, args: Vec<String>) -> Result<(), GhError> {
@@ -164,8 +264,10 @@ impl GitHub {
         let mut command = Command::new(&self.executable);
         command
             .current_dir(&self.cwd)
-            .env("GH_PROMPT_DISABLED", "1")
-            .args(args);
+            .env("GH_PROMPT_DISABLED", "1");
+        #[cfg(test)]
+        command.args(&self.executable_args);
+        command.args(args);
         command
     }
 }
@@ -193,15 +295,70 @@ pub struct Repository {
     pub default_branch: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
     pub title: String,
-    #[serde(rename = "baseRefName")]
     pub base_ref_name: String,
-    #[serde(rename = "headRefName")]
     pub head_ref_name: String,
+    pub head_repository: Option<PullRequestRepository>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestRepository {
+    pub name_with_owner: String,
+}
+
+#[derive(Deserialize)]
+struct RestPullRequest {
+    number: u64,
+    html_url: String,
+    title: String,
+    base: RestPullRequestBranch,
+    head: RestPullRequestBranch,
+}
+
+#[derive(Deserialize)]
+struct RestPullRequestBranch {
+    #[serde(rename = "ref")]
+    reference: String,
+    repo: Option<RestPullRequestRepository>,
+}
+
+#[derive(Deserialize)]
+struct RestPullRequestRepository {
+    full_name: String,
+}
+
+#[derive(Deserialize)]
+struct RestReference {
+    #[serde(rename = "ref")]
+    name: String,
+    object: RestReferenceObject,
+}
+
+#[derive(Deserialize)]
+struct RestReferenceObject {
+    sha: String,
+}
+
+impl From<RestPullRequest> for PullRequest {
+    fn from(pull_request: RestPullRequest) -> Self {
+        Self {
+            number: pull_request.number,
+            url: pull_request.html_url,
+            title: pull_request.title,
+            base_ref_name: pull_request.base.reference,
+            head_ref_name: pull_request.head.reference,
+            head_repository: pull_request
+                .head
+                .repo
+                .map(|repository| PullRequestRepository {
+                    name_with_owner: repository.full_name,
+                }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,11 +454,29 @@ fn parse_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_str(output).map_err(|_| GhError::InvalidOutput { operation })
 }
 
+fn url_path_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    encoded
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_FAKE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -381,11 +556,13 @@ mod tests {
     }
 
     #[test]
-    fn queries_repository_and_all_existing_pull_requests() -> Result<(), Box<dyn Error>> {
+    fn decodes_rest_existing_pull_request_responses() -> Result<(), Box<dyn Error>> {
         let fake = FakeGh::new(
-            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\npr:list) printf '%s\\n' '[{\"number\":42,\"url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"baseRefName\":\"main\",\"headRefName\":\"feature\"}]' ;;\nesac",
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] && [ \"${13}\" = --hostname ] && [ \"${14}\" = github.com ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature\",\"repo\":{\"full_name\":\"octo/repo\"}}}]]' ;;\n*) exit 1 ;;\nesac",
         )?;
-        let github = fake.github();
+        let github =
+            GitHub::with_executable_and_repository(&fake.path, "/bin/sh", "github.com/octo/repo")
+                .with_executable_args(vec![fake.executable.display().to_string()]);
 
         let repository = github.repository()?;
         let pull_requests = github.existing_pull_requests("feature")?;
@@ -395,10 +572,47 @@ mod tests {
         assert_eq!(pull_requests.len(), 1);
         assert_eq!(pull_requests[0].number, 42);
         assert_eq!(pull_requests[0].url, "https://github.com/octo/repo/pull/42");
+        assert_eq!(pull_requests[0].base_ref_name, "main");
+        assert_eq!(pull_requests[0].head_ref_name, "feature");
+        assert_eq!(
+            pull_requests[0]
+                .head_repository
+                .as_ref()
+                .map(|repository| repository.name_with_owner.as_str()),
+            Some("octo/repo")
+        );
         assert!(fake.invocations()?.contains(
-            "pr\u{1f}list\u{1f}--head\u{1f}feature\u{1f}--state\u{1f}open\u{1f}--limit\u{1f}0\u{1f}--json\u{1f}number,url,title,baseRefName,headRefName\u{1f}\n"
+            "repo\u{1f}view\u{1f}github.com/octo/repo\u{1f}--json\u{1f}nameWithOwner,defaultBranchRef\u{1f}\n"
         ));
-        assert_eq!(fake.prompt_values()?, "1\n1\n1\n1\n1\n1\n");
+        assert!(fake.invocations()?.contains(
+            "api\u{1f}--method\u{1f}GET\u{1f}--paginate\u{1f}--slurp\u{1f}repos/octo/repo/pulls\u{1f}-f\u{1f}state=open\u{1f}-f\u{1f}head=octo:feature\u{1f}-f\u{1f}per_page=100\u{1f}--hostname\u{1f}github.com\u{1f}\n"
+        ));
+        assert_eq!(fake.prompt_values()?, "1\n1\n1\n1\n1\n1\n1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn checks_encoded_base_branch_reference() -> Result<(), Box<dyn Error>> {
+        let fake = FakeGh::new(
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$6\" = repos/octo/repo/git/matching-refs/heads/release%2Fnext ] || exit 1; printf '%s\\n' '[[{\"ref\":\"refs/heads/release/next\",\"object\":{\"sha\":\"abc123\"}}]]' ;;\n*) exit 1 ;;\nesac",
+        )?;
+
+        assert!(fake.github().branch_exists("release/next")?);
+        assert_eq!(
+            fake.github().branch_oid("release/next")?.as_deref(),
+            Some("abc123")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rest_queries_pin_github_com_when_gh_host_conflicts() -> Result<(), Box<dyn Error>> {
+        let fake = FakeGh::new(
+            "GH_HOST=example.com\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) case \"$6\" in\n*/pulls) [ \"${13}\" = --hostname ] && [ \"${14}\" = github.com ] || exit 1; printf '%s\\n' '[[]]' ;;\n*/git/matching-refs/heads/*) [ \"$7\" = --hostname ] && [ \"$8\" = github.com ] || exit 1; printf '%s\\n' '[[]]' ;;\n*) exit 1 ;;\nesac ;;\n*) exit 1 ;;\nesac",
+        )?;
+
+        assert!(fake.github().existing_pull_requests("feature")?.is_empty());
+        assert!(!fake.github().branch_exists("main")?);
         Ok(())
     }
 
@@ -428,6 +642,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn fake_gh_executes_reliably_in_parallel() -> Result<(), Box<dyn Error>> {
+        let threads = (0..32)
+            .map(|_| {
+                std::thread::spawn(|| -> Result<(), String> {
+                    let fake = FakeGh::new(
+                        "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nesac\nexit 1",
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if fake.github().setup_status().map_err(|error| error.to_string())?
+                        != GhSetupStatus::Ready
+                    {
+                        return Err("fake GitHub CLI was not ready".to_owned());
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("fake GitHub CLI thread panicked"))?
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
     struct FakeGh {
         path: PathBuf,
         executable: PathBuf,
@@ -438,8 +680,13 @@ mod tests {
     impl FakeGh {
         fn new(body: &str) -> Result<Self, Box<dyn Error>> {
             let id = NEXT_FAKE_ID.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("bitbygit-fake-gh-{}-{id}", std::process::id()));
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "bitbygit-fake-gh-{}-{id}-{nonce}",
+                std::process::id()
+            ));
             if path.exists() {
                 fs::remove_dir_all(&path)?;
             }
@@ -456,9 +703,6 @@ mod tests {
                     prompt_values.display(),
                 ),
             )?;
-            let mut permissions = fs::metadata(&executable)?.permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&executable, permissions)?;
             Ok(Self {
                 path,
                 executable,
@@ -468,7 +712,8 @@ mod tests {
         }
 
         fn github(&self) -> GitHub {
-            GitHub::with_executable(&self.path, &self.executable)
+            GitHub::with_executable(&self.path, "/bin/sh")
+                .with_executable_args(vec![self.executable.display().to_string()])
         }
 
         fn invocations(&self) -> Result<String, io::Error> {
