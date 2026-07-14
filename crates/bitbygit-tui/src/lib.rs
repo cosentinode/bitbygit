@@ -4672,7 +4672,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_uses_push_remote_in_triangular_workflow() -> Result<(), Box<dyn Error>> {
+    fn pull_request_uses_default_simple_in_triangular_workflow() -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("open-pr-triangular-fork")?;
         git_stdout(&repo, &["remote", "rename", "origin", "fork"])?;
         git_stdout(
@@ -4700,7 +4700,6 @@ mod tests {
             &repo,
             &["config", "branch.feature/open-pr.pushRemote", "fork"],
         )?;
-        git_stdout(&repo, &["config", "push.default", "current"])?;
         let fake_gh = fake_gh("open-pr-triangular-fork", false)?;
         let planner = OperationPlanner {
             repo_root: repo.clone(),

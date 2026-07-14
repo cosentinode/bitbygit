@@ -399,6 +399,21 @@ impl Git {
         let Some((remote, target)) = output.stdout.trim().split_once('\0') else {
             return self.upstream_push_target(branch);
         };
+        if !remote.is_empty() && target.is_empty() {
+            let push_default = self.config_value(["config", "--get", "push.default"])?;
+            let upstream = self.upstream_push_target(branch)?;
+            if push_default.as_deref().unwrap_or("simple") == "simple" {
+                return Ok(upstream.map(|(upstream_remote, upstream_branch)| {
+                    let push_branch = if upstream_remote == remote {
+                        upstream_branch
+                    } else {
+                        branch.to_owned()
+                    };
+                    (remote.to_owned(), push_branch)
+                }));
+            }
+            return Ok(None);
+        }
         let Some(push_branch) = target.strip_prefix(&format!("{remote}/")) else {
             return self.upstream_push_target(branch);
         };
@@ -2653,7 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn push_target_uses_branch_push_remote_in_triangular_workflow() -> Result<(), Box<dyn Error>> {
+    fn push_target_uses_default_simple_in_triangular_workflow() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         repo.run(["init", "-b", "feature"])?;
         repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
@@ -2671,7 +2686,6 @@ mod tests {
         repo.run(["config", "branch.feature.remote", "upstream"])?;
         repo.run(["config", "branch.feature.merge", "refs/heads/main"])?;
         repo.run(["config", "branch.feature.pushRemote", "fork"])?;
-        repo.run(["config", "push.default", "current"])?;
 
         assert_eq!(
             Git::new(repo.path()).push_target("feature")?,
