@@ -2185,29 +2185,7 @@ impl OperationPlanner {
     }
 
     fn ensure_conflict_mode_allowed(&self, requests: &[OperationRequest]) -> Result<(), String> {
-        let operation = self
-            .git()
-            .status()
-            .map_err(|error| format!("Unable to validate conflict-mode policy: {error}"))?
-            .operation;
-
-        for request in requests {
-            if let OperationRequest::Recover(recovery) = request {
-                if operation != Some(recovery_git_operation(*recovery)) {
-                    return Err(recovery_state_error(*recovery, operation));
-                }
-            }
-            if let Some(active) = operation
-                && !conflict_mode_allows(request)
-            {
-                return Err(format!(
-                    "{} blocked: an active {} must be resolved first.",
-                    request_action_label(request),
-                    operation_label(active).to_ascii_lowercase()
-                ));
-            }
-        }
-        Ok(())
+        validate_conflict_mode(&self.git(), requests)
     }
 
     fn default_remote_name(&self) -> Option<String> {
@@ -2243,6 +2221,36 @@ impl OperationPlanner {
             ),
         }
     }
+}
+
+fn validate_conflict_mode(git: &Git, requests: &[OperationRequest]) -> Result<(), String> {
+    if requests.iter().all(|request| {
+        conflict_mode_allows(request) && !matches!(request, OperationRequest::Recover(_))
+    }) {
+        return Ok(());
+    }
+    let operation = git
+        .status()
+        .map_err(|error| format!("Unable to validate conflict-mode policy: {error}"))?
+        .operation;
+
+    for request in requests {
+        if let OperationRequest::Recover(recovery) = request
+            && operation != Some(recovery_git_operation(*recovery))
+        {
+            return Err(recovery_state_error(*recovery, operation));
+        }
+        if let Some(active) = operation
+            && !conflict_mode_allows(request)
+        {
+            return Err(format!(
+                "{} blocked: an active {} must be resolved first.",
+                request_action_label(request),
+                operation_label(active).to_ascii_lowercase()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn conflict_mode_allows(request: &OperationRequest) -> bool {
@@ -2836,6 +2844,14 @@ impl PlanExecutor {
                 planned_step_count: 0,
                 step_results: Vec::new(),
                 plan_error: Some("operation plan has no steps".to_owned()),
+            };
+        }
+        if let Err(error) = validate_conflict_mode(&self.git(), std::slice::from_ref(&plan.request))
+        {
+            return PlanExecutionResult {
+                planned_step_count: plan.steps.len(),
+                step_results: Vec::new(),
+                plan_error: Some(error),
             };
         }
 
@@ -4845,6 +4861,57 @@ mod tests {
             .trim()
             .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn queued_sequence_revalidates_conflict_mode_before_first_side_effect()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("queued-conflict-policy")?;
+        let remote = isolated_bare_git_repo("queued-conflict-policy-remote")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("conflict.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "conflict.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "base"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        git_stdout(&repo, &["checkout", "-b", "conflicting"])?;
+        std::fs::write(repo.join("conflict.txt"), "other\n")?;
+        git_stdout(&repo, &["commit", "-am", "other"])?;
+        git_stdout(&repo, &["checkout", branch.as_str()])?;
+        std::fs::write(repo.join("conflict.txt"), "current\n")?;
+        git_stdout(&repo, &["commit", "-am", "current"])?;
+        git_stdout(
+            &repo,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )?;
+        git_stdout(&repo, &["push", "-u", "origin", branch.as_str()])?;
+        let remote_ref = format!("refs/heads/{branch}");
+        let remote_before = git_stdout(&remote, &["rev-parse", remote_ref.as_str()])?;
+        std::fs::write(repo.join("ahead.txt"), "local only\n")?;
+        git_stdout(&repo, &["add", "ahead.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "ahead"])?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![OperationRequest::Push, OperationRequest::Branches])
+            .map_err(std::io::Error::other)?;
+
+        let merge = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["merge", "conflicting"])
+            .output()?;
+        assert!(!merge.status.success());
+        let paths = isolated_store_paths("queued-conflict-policy-audit")?;
+
+        let result = PromptSequenceExecutor::with_audit_paths(&repo, paths.clone())
+            .execute(sequence.sequence);
+
+        assert!(result.message().contains("active merge"));
+        assert_eq!(
+            git_stdout(&remote, &["rev-parse", remote_ref.as_str()])?,
+            remote_before
+        );
+        assert!(LocalStore::open(paths)?.list_audit_entries()?.is_empty());
         Ok(())
     }
 

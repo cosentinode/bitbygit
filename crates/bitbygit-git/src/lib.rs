@@ -20,6 +20,17 @@ const COMMIT_HOOKS: &[&str] = &[
     "commit-msg",
     "post-commit",
 ];
+const RECOVERY_METADATA_PATHS: &[&str] = &[
+    "MERGE_HEAD",
+    "MERGE_MSG",
+    "MERGE_MODE",
+    "MERGE_AUTOSTASH",
+    "AUTO_MERGE",
+    "ORIG_HEAD",
+    "REBASE_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+];
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -715,7 +726,20 @@ impl Git {
             worktree_diff: self
                 .run_raw(["diff", "--binary", "--no-ext-diff", "--"])?
                 .stdout,
+            metadata: self.recovery_metadata()?,
         })
+    }
+
+    fn recovery_metadata(&self) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
+        let mut entries = Vec::new();
+        for relative in RECOVERY_METADATA_PATHS {
+            snapshot_recovery_metadata(
+                Path::new(relative),
+                &self.git_path(relative)?,
+                &mut entries,
+            )?;
+        }
+        Ok(entries)
     }
 
     pub fn stage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
@@ -1179,6 +1203,64 @@ impl Git {
     }
 }
 
+fn snapshot_recovery_metadata(
+    relative: &Path,
+    path: &Path,
+    entries: &mut Vec<RecoveryMetadataEntry>,
+) -> Result<(), GitError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            entries.push(RecoveryMetadataEntry {
+                path: relative.to_owned(),
+                value: RecoveryMetadataValue::Missing,
+            });
+            return Ok(());
+        }
+        Err(source) => return Err(recovery_metadata_io_error(relative, source)),
+    };
+    let file_type = metadata.file_type();
+    let value = if file_type.is_dir() {
+        RecoveryMetadataValue::Directory
+    } else if file_type.is_file() {
+        RecoveryMetadataValue::File(
+            fs::read(path).map_err(|source| recovery_metadata_io_error(relative, source))?,
+        )
+    } else if file_type.is_symlink() {
+        RecoveryMetadataValue::Symlink(
+            fs::read_link(path).map_err(|source| recovery_metadata_io_error(relative, source))?,
+        )
+    } else {
+        RecoveryMetadataValue::Other
+    };
+    entries.push(RecoveryMetadataEntry {
+        path: relative.to_owned(),
+        value,
+    });
+
+    if file_type.is_dir() {
+        let mut children = fs::read_dir(path)
+            .map_err(|source| recovery_metadata_io_error(relative, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| recovery_metadata_io_error(relative, source))?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            snapshot_recovery_metadata(&relative.join(child.file_name()), &child.path(), entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn recovery_metadata_io_error(path: &Path, source: std::io::Error) -> GitError {
+    GitError::Io {
+        args: vec![
+            "snapshot-recovery-metadata".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ],
+        source,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
     pub root: PathBuf,
@@ -1385,6 +1467,22 @@ pub struct RecoveryState {
     status: Vec<u8>,
     index: Vec<u8>,
     worktree_diff: Vec<u8>,
+    metadata: Vec<RecoveryMetadataEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryMetadataEntry {
+    path: PathBuf,
+    value: RecoveryMetadataValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoveryMetadataValue {
+    Missing,
+    Directory,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+    Other,
 }
 
 impl RecoveryAction {
@@ -2477,6 +2575,47 @@ mod tests {
 
         assert!(error.to_string().contains("state changed after preview"));
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_changed_merge_metadata() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        fs::write(git.git_path("MERGE_MSG")?, "changed merge message\n")?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected changed merge metadata to be rejected".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_changed_rebase_metadata() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let todo = git.git_path("rebase-merge/git-rebase-todo")?;
+        let mut changed_todo = fs::read(&todo)?;
+        changed_todo.extend_from_slice(b"# changed after preview\n");
+        fs::write(todo, changed_todo)?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected changed rebase metadata to be rejected".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
         Ok(())
     }
 
