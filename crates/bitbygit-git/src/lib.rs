@@ -4,9 +4,12 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::string::FromUtf8Error;
+
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -31,6 +34,14 @@ const RECOVERY_METADATA_PATHS: &[&str] = &[
     "rebase-merge",
     "rebase-apply",
 ];
+const MAX_RECOVERY_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RECOVERY_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RECOVERY_FILE_BYTES_READ: u64 = 64 * 1024 * 1024;
+const MAX_RECOVERY_RELEVANT_FILES: usize = 10_000;
+const MAX_RECOVERY_PATH_BYTES: usize = 256 * 1024;
+const MAX_RECOVERY_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RECOVERY_METADATA_ENTRIES: usize = 4_096;
+const MAX_RECOVERY_SUBPROCESSES: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -275,10 +286,21 @@ impl Git {
         action: RecoveryAction,
         expected_state: &RecoveryState,
     ) -> Result<GitOutput, GitError> {
-        if self.recovery_state()? != *expected_state {
+        let current_state = self.recovery_state()?;
+        if current_state != *expected_state {
             return Err(GitError::Blocked {
                 message: format!(
                     "{} {} is blocked because repository state changed after preview",
+                    operation.label(),
+                    action.label()
+                ),
+            });
+        }
+        let final_state = self.recovery_state()?;
+        if final_state != current_state {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{} {} is blocked because repository state changed during final recovery validation",
                     operation.label(),
                     action.label()
                 ),
@@ -716,149 +738,224 @@ impl Git {
     }
 
     pub fn recovery_state(&self) -> Result<RecoveryState, GitError> {
-        let operation = self.repository_operation()?;
+        let mut capture = RecoveryCapture::default();
+        let git_dir = path_from_bytes(strip_byte_line_ending(
+            &capture.required(self, &["rev-parse", "--absolute-git-dir"])?,
+        ));
+        let root = path_from_bytes(strip_byte_line_ending(
+            &capture.required(self, &["rev-parse", "--show-toplevel"])?,
+        ));
+        let operation = recovery_operation_at(&git_dir);
+        let head_oid = capture
+            .optional(self, &["rev-parse", "--verify", "--quiet", "HEAD"])?
+            .map(|output| String::from_utf8_lossy(strip_byte_line_ending(&output)).into_owned());
+        let head_reference = capture
+            .optional(self, &["symbolic-ref", "--quiet", "HEAD"])?
+            .map(|output| String::from_utf8_lossy(strip_byte_line_ending(&output)).into_owned());
+        let metadata = self.recovery_metadata(&git_dir, &mut capture)?;
+        let original_head = match operation {
+            Some(RepositoryOperation::Rebase) => Some(rebase_original_head(&metadata)?),
+            Some(RepositoryOperation::Merge) => capture
+                .optional(self, &["rev-parse", "--verify", "--quiet", "ORIG_HEAD"])?
+                .map(|output| {
+                    String::from_utf8_lossy(strip_byte_line_ending(&output)).into_owned()
+                }),
+            None => None,
+        };
+        let mut paths = BTreeSet::new();
+        let changed_paths =
+            capture.required(self, &["diff", "--raw", "-z", "--no-abbrev", "HEAD", "--"])?;
+        parse_recovery_changed_paths(&changed_paths, &mut paths)?;
+        if let Some(original_head) = original_head {
+            let destination_paths = capture.required(
+                self,
+                &[
+                    "diff",
+                    "--raw",
+                    "-z",
+                    "--no-abbrev",
+                    "HEAD",
+                    &original_head,
+                    "--",
+                ],
+            )?;
+            parse_recovery_changed_paths(&destination_paths, &mut paths)?;
+            if operation == Some(RepositoryOperation::Rebase) {
+                let range = format!("{}..{original_head}", head_oid.as_deref().unwrap_or("HEAD"));
+                let changed_paths = capture.required(
+                    self,
+                    &[
+                        "log",
+                        "--format=%x00",
+                        "--raw",
+                        "-z",
+                        "--no-abbrev",
+                        "--diff-merges=first-parent",
+                        &range,
+                        "--",
+                    ],
+                )?;
+                parse_recovery_changed_paths(&changed_paths, &mut paths)?;
+            }
+        }
+        let path_bytes = paths
+            .iter()
+            .map(|path| path.as_os_str().as_encoded_bytes().len())
+            .sum::<usize>();
+        if path_bytes > MAX_RECOVERY_PATH_BYTES {
+            return Err(recovery_bound_error(format!(
+                "relevant path bytes exceed {MAX_RECOVERY_PATH_BYTES}"
+            )));
+        }
+        capture.retain(
+            path_bytes.saturating_add(paths.len() * 96),
+            "relevant paths",
+        )?;
+
+        let mut index_args = vec![
+            OsString::from("ls-files"),
+            OsString::from("--stage"),
+            OsString::from("-z"),
+            OsString::from("--"),
+        ];
+        index_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+        let index = capture.required_os(self, index_args)?;
+        capture.retain(index.len(), "index output")?;
+
+        let worktree = self.snapshot_recovery_worktree(&root, paths, &mut capture)?;
+        run_recovery_capture_hook(&self.cwd);
+        let refs = self.recovery_refs(operation, &metadata, &mut capture)?;
+        capture.retain(refs.len(), "recovery refs")?;
+
         Ok(RecoveryState {
             operation,
-            head: self.head_target()?,
-            status: self
-                .run_raw(["status", "--porcelain=v2", "--branch", "-z"])?
-                .stdout,
-            index: self.run_raw(["ls-files", "--stage", "-z"])?.stdout,
-            worktree_diff: self
-                .run_raw(["diff", "--binary", "--no-ext-diff", "--"])?
-                .stdout,
-            untracked_worktree: self.untracked_worktree()?,
-            metadata: self.recovery_metadata()?,
-            refs: self.recovery_refs(operation)?,
+            head: HeadTarget {
+                oid: head_oid,
+                reference: head_reference,
+            },
+            index,
+            worktree,
+            metadata,
+            refs,
         })
-    }
-
-    fn untracked_worktree(&self) -> Result<Vec<RecoveryWorktreeEntry>, GitError> {
-        let root = self.repo_root()?;
-        let mut paths = BTreeSet::new();
-        let nonignored = self
-            .run_raw([
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "--full-name",
-                "-z",
-                "--",
-            ])?
-            .stdout;
-        let ignored = self
-            .run_raw([
-                "ls-files",
-                "--others",
-                "--ignored",
-                "--exclude-standard",
-                "--full-name",
-                "-z",
-                "--",
-            ])?
-            .stdout;
-        for output in [nonignored, ignored] {
-            paths.extend(
-                output
-                    .split(|byte| *byte == 0)
-                    .filter(|path| !path.is_empty())
-                    .map(path_from_bytes),
-            );
-        }
-
-        let mut entries = Vec::new();
-        for relative in paths {
-            self.snapshot_recovery_worktree(&relative, &root.join(&relative), &mut entries)?;
-        }
-        Ok(entries)
     }
 
     fn snapshot_recovery_worktree(
         &self,
-        relative: &Path,
-        path: &Path,
-        entries: &mut Vec<RecoveryWorktreeEntry>,
-    ) -> Result<(), GitError> {
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                entries.push(RecoveryWorktreeEntry {
-                    path: relative.to_owned(),
-                    value: RecoveryWorktreeValue::Missing,
+        root: &Path,
+        paths: BTreeSet<PathBuf>,
+        capture: &mut RecoveryCapture,
+    ) -> Result<Vec<RecoveryWorktreeEntry>, GitError> {
+        let mut entries = Vec::with_capacity(paths.len());
+        for relative in paths {
+            let path = root.join(&relative);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    entries.push(RecoveryWorktreeEntry {
+                        path: relative.to_owned(),
+                        value: RecoveryWorktreeValue::Missing,
+                    });
+                    continue;
+                }
+                Err(source) => return Err(recovery_metadata_io_error(&relative, source)),
+            };
+            let file_type = metadata.file_type();
+            let value = if file_type.is_file() {
+                let (file, opened_metadata) =
+                    open_recovery_regular_file(&path, &relative, &metadata)?;
+                let size = opened_metadata.len();
+                capture.reserve_file_bytes(size)?;
+                let file = BufReader::new(file);
+                let mut file = file.take(size.saturating_add(1));
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                let mut bytes_read = 0_u64;
+                loop {
+                    let read = file
+                        .read(&mut buffer)
+                        .map_err(|source| recovery_metadata_io_error(&relative, source))?;
+                    if read == 0 {
+                        break;
+                    }
+                    bytes_read = bytes_read.saturating_add(read as u64);
+                    if bytes_read > size {
+                        return Err(GitError::Blocked {
+                            message: format!(
+                                "recovery is blocked because relevant file {} changed while it was fingerprinted",
+                                relative.display()
+                            ),
+                        });
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                ensure_recovery_regular_file_path_unchanged(&path, &relative, &opened_metadata)?;
+                RecoveryWorktreeValue::File {
+                    size,
+                    mode: recovery_file_mode(&opened_metadata),
+                    identity: recovery_file_identity(&opened_metadata),
+                    digest: hasher.finalize().into(),
+                }
+            } else if file_type.is_symlink() {
+                RecoveryWorktreeValue::Symlink(
+                    fs::read_link(&path)
+                        .map_err(|source| recovery_metadata_io_error(&relative, source))?,
+                )
+            } else if file_type.is_dir() {
+                RecoveryWorktreeValue::Directory
+            } else {
+                return Err(GitError::Blocked {
+                    message: format!(
+                        "recovery is blocked because relevant path {} has an unsupported filesystem type",
+                        relative.display()
+                    ),
                 });
-                return Ok(());
-            }
-            Err(source) => return Err(recovery_metadata_io_error(relative, source)),
-        };
-        let file_type = metadata.file_type();
-        let value = if file_type.is_file() {
-            let oid = self
-                .run_path_args(["hash-object", "--no-filters"], Some(path), true)?
-                .stdout
-                .trim()
-                .to_owned();
-            RecoveryWorktreeValue::File {
-                size: metadata.len(),
-                oid,
-            }
-        } else if file_type.is_symlink() {
-            RecoveryWorktreeValue::Symlink(
-                fs::read_link(path)
-                    .map_err(|source| recovery_metadata_io_error(relative, source))?,
-            )
-        } else {
-            RecoveryWorktreeValue::Other
-        };
-        entries.push(RecoveryWorktreeEntry {
-            path: relative.to_owned(),
-            value,
-        });
-        Ok(())
-    }
-
-    fn recovery_metadata(&self) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
-        let mut entries = Vec::new();
-        for relative in RECOVERY_METADATA_PATHS {
-            snapshot_recovery_metadata(
-                Path::new(relative),
-                &self.git_path(relative)?,
-                &mut entries,
-            )?;
+            };
+            entries.push(RecoveryWorktreeEntry {
+                path: relative,
+                value,
+            });
         }
+        capture.retain(entries.len() * 80, "worktree fingerprints")?;
         Ok(entries)
     }
 
-    fn recovery_refs(&self, operation: Option<RepositoryOperation>) -> Result<Vec<u8>, GitError> {
+    fn recovery_metadata(
+        &self,
+        git_dir: &Path,
+        capture: &mut RecoveryCapture,
+    ) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
+        snapshot_recovery_metadata(git_dir, capture)
+    }
+
+    fn recovery_refs(
+        &self,
+        operation: Option<RepositoryOperation>,
+        metadata: &[RecoveryMetadataEntry],
+        capture: &mut RecoveryCapture,
+    ) -> Result<Vec<u8>, GitError> {
         if operation != Some(RepositoryOperation::Rebase) {
             return Ok(Vec::new());
         }
 
         let mut references = BTreeSet::new();
         for relative in ["rebase-merge/head-name", "rebase-apply/head-name"] {
-            match fs::read(self.git_path(relative)?) {
-                Ok(reference) => {
-                    let reference = strip_byte_line_ending(&reference);
-                    if reference.starts_with(b"refs/") {
-                        references.insert(path_from_bytes(reference).into_os_string());
-                    }
+            if let Some(reference) = recovery_metadata_file(metadata, relative) {
+                let reference = strip_byte_line_ending(reference);
+                if reference.starts_with(b"refs/") {
+                    references.insert(path_from_bytes(reference).into_os_string());
                 }
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(recovery_metadata_io_error(Path::new(relative), source)),
             }
         }
         for relative in ["rebase-merge/update-refs", "rebase-apply/update-refs"] {
-            match fs::read(self.git_path(relative)?) {
-                Ok(contents) => {
-                    references.extend(
-                        contents
-                            .split(|byte| *byte == b'\n')
-                            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-                            .filter(|line| line.starts_with(b"refs/"))
-                            .map(|line| path_from_bytes(line).into_os_string()),
-                    );
-                }
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(recovery_metadata_io_error(Path::new(relative), source)),
+            if let Some(contents) = recovery_metadata_file(metadata, relative) {
+                references.extend(
+                    contents
+                        .split(|byte| *byte == b'\n')
+                        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                        .filter(|line| line.starts_with(b"refs/"))
+                        .map(|line| path_from_bytes(line).into_os_string()),
+                );
             }
         }
 
@@ -869,7 +966,7 @@ impl Git {
         ];
         args.extend(references);
 
-        Ok(self.run_os_args(args, None, false)?.stdout)
+        capture.required_os(self, args)
     }
 
     pub fn stage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
@@ -1333,52 +1430,517 @@ impl Git {
     }
 }
 
-fn snapshot_recovery_metadata(
-    relative: &Path,
-    path: &Path,
-    entries: &mut Vec<RecoveryMetadataEntry>,
-) -> Result<(), GitError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            entries.push(RecoveryMetadataEntry {
-                path: relative.to_owned(),
-                value: RecoveryMetadataValue::Missing,
-            });
-            return Ok(());
-        }
-        Err(source) => return Err(recovery_metadata_io_error(relative, source)),
-    };
-    let file_type = metadata.file_type();
-    let value = if file_type.is_dir() {
-        RecoveryMetadataValue::Directory
-    } else if file_type.is_file() {
-        RecoveryMetadataValue::File(
-            fs::read(path).map_err(|source| recovery_metadata_io_error(relative, source))?,
-        )
-    } else if file_type.is_symlink() {
-        RecoveryMetadataValue::Symlink(
-            fs::read_link(path).map_err(|source| recovery_metadata_io_error(relative, source))?,
-        )
-    } else {
-        RecoveryMetadataValue::Other
-    };
-    entries.push(RecoveryMetadataEntry {
-        path: relative.to_owned(),
-        value,
-    });
+#[derive(Default)]
+struct RecoveryCapture {
+    output_bytes: usize,
+    retained_bytes: usize,
+    file_bytes_read: u64,
+    metadata_bytes: usize,
+    metadata_entries: usize,
+    subprocesses: usize,
+}
 
-    if file_type.is_dir() {
-        let mut children = fs::read_dir(path)
-            .map_err(|source| recovery_metadata_io_error(relative, source))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| recovery_metadata_io_error(relative, source))?;
-        children.sort_by_key(|entry| entry.file_name());
-        for child in children {
-            snapshot_recovery_metadata(&relative.join(child.file_name()), &child.path(), entries)?;
+impl RecoveryCapture {
+    fn required(&mut self, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
+        self.command(git, args.iter().map(OsString::from).collect(), false)?
+            .ok_or_else(|| GitError::Parse {
+                message: "required recovery guard command returned no output".to_owned(),
+            })
+    }
+
+    fn optional(&mut self, git: &Git, args: &[&str]) -> Result<Option<Vec<u8>>, GitError> {
+        self.command(git, args.iter().map(OsString::from).collect(), true)
+    }
+
+    fn required_os(&mut self, git: &Git, args: Vec<OsString>) -> Result<Vec<u8>, GitError> {
+        self.command(git, args, false)?
+            .ok_or_else(|| GitError::Parse {
+                message: "required recovery guard command returned no output".to_owned(),
+            })
+    }
+
+    fn command(
+        &mut self,
+        git: &Git,
+        args: Vec<OsString>,
+        allow_missing: bool,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        self.subprocesses += 1;
+        if self.subprocesses > MAX_RECOVERY_SUBPROCESSES {
+            return Err(recovery_bound_error(format!(
+                "subprocess count exceeds {MAX_RECOVERY_SUBPROCESSES}"
+            )));
+        }
+        let display_args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let mut command = Command::new("git");
+        command
+            .current_dir(&git.cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|source| GitError::Io {
+            args: display_args.clone(),
+            source,
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| GitError::Io {
+            args: display_args.clone(),
+            source: std::io::Error::other("recovery guard could not capture git stdout"),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| GitError::Io {
+            args: display_args.clone(),
+            source: std::io::Error::other("recovery guard could not capture git stderr"),
+        })?;
+        let output_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stdout_bytes = std::sync::Arc::clone(&output_bytes);
+        let stderr_bytes = std::sync::Arc::clone(&output_bytes);
+        let stdout_reader =
+            std::thread::spawn(move || read_bounded_recovery_output(stdout, stdout_bytes));
+        let stderr_reader =
+            std::thread::spawn(move || read_bounded_recovery_output(stderr, stderr_bytes));
+        let status = loop {
+            if output_bytes.load(std::sync::atomic::Ordering::Relaxed) > MAX_RECOVERY_OUTPUT_BYTES {
+                let _ = child.kill();
+                break child.wait();
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(source) => break Err(source),
+            }
+        }
+        .map_err(|source| GitError::Io {
+            args: display_args.clone(),
+            source,
+        })?;
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| GitError::Io {
+                args: display_args.clone(),
+                source: std::io::Error::other("recovery guard stdout reader panicked"),
+            })?
+            .map_err(|source| GitError::Io {
+                args: display_args.clone(),
+                source,
+            })?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| GitError::Io {
+                args: display_args.clone(),
+                source: std::io::Error::other("recovery guard stderr reader panicked"),
+            })?
+            .map_err(|source| GitError::Io {
+                args: display_args.clone(),
+                source,
+            })?;
+        let bytes = output_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        self.output_bytes = self.output_bytes.saturating_add(bytes);
+        if bytes > MAX_RECOVERY_OUTPUT_BYTES || self.output_bytes > MAX_RECOVERY_OUTPUT_BYTES {
+            return Err(recovery_bound_error(format!(
+                "Git output bytes exceed {MAX_RECOVERY_OUTPUT_BYTES}"
+            )));
+        }
+        if status.success() {
+            return Ok(Some(stdout));
+        }
+        if allow_missing && status.code() == Some(1) {
+            return Ok(None);
+        }
+        Err(GitError::GitFailed {
+            args: display_args,
+            status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
+    }
+
+    fn retain(&mut self, bytes: usize, description: &str) -> Result<(), GitError> {
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        if self.retained_bytes > MAX_RECOVERY_RETAINED_BYTES {
+            return Err(recovery_bound_error(format!(
+                "retained memory for {description} exceeds {MAX_RECOVERY_RETAINED_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn reserve_file_bytes(&mut self, bytes: u64) -> Result<(), GitError> {
+        self.file_bytes_read = self.file_bytes_read.saturating_add(bytes);
+        if self.file_bytes_read > MAX_RECOVERY_FILE_BYTES_READ {
+            return Err(recovery_bound_error(format!(
+                "file content bytes read exceed {MAX_RECOVERY_FILE_BYTES_READ}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn reserve_metadata_entry(&mut self) -> Result<(), GitError> {
+        if self.metadata_entries == MAX_RECOVERY_METADATA_ENTRIES {
+            return Err(recovery_bound_error(format!(
+                "metadata entries exceed {MAX_RECOVERY_METADATA_ENTRIES}"
+            )));
+        }
+        self.metadata_entries += 1;
+        Ok(())
+    }
+
+    fn reserve_metadata_bytes(&mut self, bytes: usize) -> Result<(), GitError> {
+        self.metadata_bytes = self.metadata_bytes.saturating_add(bytes);
+        if self.metadata_bytes > MAX_RECOVERY_METADATA_BYTES {
+            return Err(recovery_bound_error(format!(
+                "metadata bytes exceed {MAX_RECOVERY_METADATA_BYTES}"
+            )));
+        }
+        self.retain(bytes.saturating_add(80), "recovery metadata")
+    }
+}
+
+fn read_bounded_recovery_output(
+    mut stream: impl Read,
+    total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let previous = total.fetch_add(read, std::sync::atomic::Ordering::Relaxed);
+        if previous <= MAX_RECOVERY_OUTPUT_BYTES {
+            let keep = read.min(MAX_RECOVERY_OUTPUT_BYTES + 1 - previous);
+            retained.extend_from_slice(&buffer[..keep]);
+        }
+        if previous.saturating_add(read) > MAX_RECOVERY_OUTPUT_BYTES {
+            return Ok(retained);
         }
     }
+}
+
+fn recovery_bound_error(detail: String) -> GitError {
+    GitError::Blocked {
+        message: format!("recovery is blocked because the recovery guard {detail}"),
+    }
+}
+
+fn parse_recovery_changed_paths(
+    output: &[u8],
+    paths: &mut BTreeSet<PathBuf>,
+) -> Result<(), GitError> {
+    let mut expected_paths = 0;
+    for record in output.split(|byte| *byte == 0) {
+        if expected_paths > 0 {
+            if paths.len() == MAX_RECOVERY_RELEVANT_FILES {
+                return Err(recovery_bound_error(format!(
+                    "relevant file count exceeds {MAX_RECOVERY_RELEVANT_FILES}"
+                )));
+            }
+            paths.insert(path_from_bytes(record));
+            expected_paths -= 1;
+            continue;
+        }
+        let header = record.strip_prefix(b"\n").unwrap_or(record);
+        if !header.starts_with(b":") {
+            continue;
+        }
+        let status = header
+            .rsplit(|byte| *byte == b' ')
+            .next()
+            .and_then(|status| status.first())
+            .ok_or_else(|| GitError::Parse {
+                message: "recovery changed-path record has no status".to_owned(),
+            })?;
+        expected_paths = usize::from(matches!(status, b'R' | b'C')) + 1;
+    }
+    if expected_paths != 0 {
+        return Err(GitError::Parse {
+            message: "recovery changed-path output ended before its path".to_owned(),
+        });
+    }
     Ok(())
+}
+
+fn recovery_operation_at(git_dir: &Path) -> Option<RepositoryOperation> {
+    let rebase_apply = git_dir.join("rebase-apply");
+    if git_dir.join("rebase-merge").exists()
+        || (rebase_apply.exists() && !rebase_apply.join("applying").exists())
+    {
+        Some(RepositoryOperation::Rebase)
+    } else if git_dir.join("MERGE_HEAD").exists() {
+        Some(RepositoryOperation::Merge)
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn recovery_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn recovery_file_mode(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
+#[cfg(unix)]
+fn recovery_file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn recovery_file_identity(_metadata: &fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+fn open_recovery_regular_file(
+    path: &Path,
+    relative: &Path,
+    expected: &fs::Metadata,
+) -> Result<(fs::File, fs::Metadata), GitError> {
+    run_recovery_file_open_hook(path);
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path);
+
+    let file = file.map_err(|source| GitError::Blocked {
+        message: format!(
+            "recovery is blocked because regular file {} changed before it could be opened: {source}",
+            relative.display()
+        ),
+    })?;
+    let opened = file
+        .metadata()
+        .map_err(|source| recovery_metadata_io_error(relative, source))?;
+    if !opened.file_type().is_file()
+        || opened.len() != expected.len()
+        || recovery_file_mode(&opened) != recovery_file_mode(expected)
+        || recovery_file_identity(&opened) != recovery_file_identity(expected)
+    {
+        return Err(GitError::Blocked {
+            message: format!(
+                "recovery is blocked because regular file {} changed while it was opened",
+                relative.display()
+            ),
+        });
+    }
+    Ok((file, opened))
+}
+
+fn ensure_recovery_regular_file_path_unchanged(
+    path: &Path,
+    relative: &Path,
+    opened: &fs::Metadata,
+) -> Result<(), GitError> {
+    let current = fs::symlink_metadata(path).map_err(|source| GitError::Blocked {
+        message: format!(
+            "recovery is blocked because regular file {} changed while it was read: {source}",
+            relative.display()
+        ),
+    })?;
+    if !current.file_type().is_file()
+        || current.len() != opened.len()
+        || recovery_file_mode(&current) != recovery_file_mode(opened)
+        || recovery_file_identity(&current) != recovery_file_identity(opened)
+    {
+        return Err(GitError::Blocked {
+            message: format!(
+                "recovery is blocked because regular file {} changed while it was read",
+                relative.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+type RecoveryCaptureHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static RECOVERY_CAPTURE_HOOK: std::sync::Mutex<Option<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_recovery_capture_hook(cwd: &Path) {
+    if let Ok(mut hook) = RECOVERY_CAPTURE_HOOK.lock() {
+        if hook.as_ref().is_some_and(|(target, _)| target == cwd) {
+            let Some((_, hook)) = hook.take() else {
+                return;
+            };
+            hook();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_capture_hook(_cwd: &Path) {}
+
+#[cfg(test)]
+static RECOVERY_FILE_OPEN_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_file_open_hook(path: &Path) {
+    if let Ok(mut hooks) = RECOVERY_FILE_OPEN_HOOKS.lock() {
+        if let Some(index) = hooks.iter().position(|(target, _)| target == path) {
+            let (_, hook) = hooks.swap_remove(index);
+            hook();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_file_open_hook(_path: &Path) {}
+
+fn recovery_metadata_file<'a>(
+    metadata: &'a [RecoveryMetadataEntry],
+    relative: &str,
+) -> Option<&'a [u8]> {
+    metadata.iter().find_map(|entry| {
+        if entry.path == Path::new(relative) {
+            if let RecoveryMetadataValue::File(contents) = &entry.value {
+                return Some(contents.as_slice());
+            }
+        }
+        None
+    })
+}
+
+fn rebase_original_head(metadata: &[RecoveryMetadataEntry]) -> Result<String, GitError> {
+    let backends = ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .filter(|backend| {
+            metadata.iter().any(|entry| {
+                entry.path == Path::new(backend) && entry.value == RecoveryMetadataValue::Directory
+            })
+        })
+        .collect::<Vec<_>>();
+    let [backend] = backends.as_slice() else {
+        return Err(GitError::Blocked {
+            message: "recovery is blocked because the active rebase backend is ambiguous"
+                .to_owned(),
+        });
+    };
+    let relative = format!("{backend}/orig-head");
+    let Some(contents) = recovery_metadata_file(metadata, &relative) else {
+        return Err(GitError::Blocked {
+            message: format!("recovery is blocked because {relative} is unavailable"),
+        });
+    };
+    let oid = strip_byte_line_ending(contents);
+    if !matches!(oid.len(), 40 | 64) || !oid.iter().all(u8::is_ascii_hexdigit) {
+        return Err(GitError::Blocked {
+            message: format!("recovery is blocked because {relative} is not a valid object id"),
+        });
+    }
+    Ok(String::from_utf8_lossy(oid).into_owned())
+}
+
+fn snapshot_recovery_metadata(
+    git_dir: &Path,
+    capture: &mut RecoveryCapture,
+) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
+    let mut entries = Vec::new();
+    let mut pending = Vec::new();
+    for relative in RECOVERY_METADATA_PATHS.iter().rev() {
+        capture.reserve_metadata_entry()?;
+        pending.push((PathBuf::from(relative), git_dir.join(relative)));
+    }
+
+    while let Some((relative, path)) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                capture.reserve_metadata_bytes(relative.as_os_str().as_encoded_bytes().len())?;
+                entries.push(RecoveryMetadataEntry {
+                    path: relative,
+                    value: RecoveryMetadataValue::Missing,
+                });
+                continue;
+            }
+            Err(source) => return Err(recovery_metadata_io_error(&relative, source)),
+        };
+        let file_type = metadata.file_type();
+        let value = if file_type.is_dir() {
+            capture.reserve_metadata_bytes(relative.as_os_str().as_encoded_bytes().len())?;
+            RecoveryMetadataValue::Directory
+        } else if file_type.is_file() {
+            let maximum = MAX_RECOVERY_METADATA_BYTES.saturating_sub(capture.metadata_bytes);
+            let mut contents = Vec::new();
+            let (file, opened_metadata) = open_recovery_regular_file(&path, &relative, &metadata)?;
+            file.take(maximum.saturating_add(1) as u64)
+                .read_to_end(&mut contents)
+                .map_err(|source| recovery_metadata_io_error(&relative, source))?;
+            ensure_recovery_regular_file_path_unchanged(&path, &relative, &opened_metadata)?;
+            if contents.len() > maximum {
+                return Err(recovery_bound_error(format!(
+                    "metadata bytes exceed {MAX_RECOVERY_METADATA_BYTES}"
+                )));
+            }
+            capture.reserve_metadata_bytes(
+                relative
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+                    .saturating_add(contents.len()),
+            )?;
+            RecoveryMetadataValue::File(contents)
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&path)
+                .map_err(|source| recovery_metadata_io_error(&relative, source))?;
+            capture.reserve_metadata_bytes(
+                relative
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+                    .saturating_add(target.as_os_str().as_encoded_bytes().len()),
+            )?;
+            RecoveryMetadataValue::Symlink(target)
+        } else {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "recovery is blocked because control metadata {} has an unsupported filesystem type",
+                    relative.display()
+                ),
+            });
+        };
+        entries.push(RecoveryMetadataEntry {
+            path: relative.clone(),
+            value,
+        });
+
+        if file_type.is_dir() {
+            for child in fs::read_dir(&path)
+                .map_err(|source| recovery_metadata_io_error(&relative, source))?
+            {
+                let child =
+                    child.map_err(|source| recovery_metadata_io_error(&relative, source))?;
+                capture.reserve_metadata_entry()?;
+                pending.push((relative.join(child.file_name()), child.path()));
+            }
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
 }
 
 fn recovery_metadata_io_error(path: &Path, source: std::io::Error) -> GitError {
@@ -1594,10 +2156,8 @@ pub enum RecoveryAction {
 pub struct RecoveryState {
     operation: Option<RepositoryOperation>,
     head: HeadTarget,
-    status: Vec<u8>,
     index: Vec<u8>,
-    worktree_diff: Vec<u8>,
-    untracked_worktree: Vec<RecoveryWorktreeEntry>,
+    worktree: Vec<RecoveryWorktreeEntry>,
     metadata: Vec<RecoveryMetadataEntry>,
     refs: Vec<u8>,
 }
@@ -1611,9 +2171,14 @@ struct RecoveryWorktreeEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecoveryWorktreeValue {
     Missing,
-    File { size: u64, oid: String },
+    File {
+        size: u64,
+        mode: u32,
+        identity: (u64, u64),
+        digest: [u8; 32],
+    },
+    Directory,
     Symlink(PathBuf),
-    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1628,7 +2193,6 @@ enum RecoveryMetadataValue {
     Directory,
     File(Vec<u8>),
     Symlink(PathBuf),
-    Other,
 }
 
 impl RecoveryAction {
@@ -2840,69 +3404,113 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn exact_rebase_abort_preserves_ignored_file_changed_after_preview()
-    -> Result<(), Box<dyn Error>> {
-        let repo = initialized_repo()?;
-        repo.write(".gitignore", "target/\n")?;
-        repo.run(["add", ".gitignore"])?;
-        repo.run(["commit", "-m", "ignore target"])?;
-        repo.run(["switch", "-c", "topic"])?;
-        repo.write("first.txt", "first\n")?;
-        repo.run(["add", "first.txt"])?;
-        repo.run(["commit", "-m", "first"])?;
-        repo.write(".gitignore", "")?;
-        fs::create_dir(repo.path().join("target"))?;
-        repo.write("target/victim.bin", "committed\n")?;
-        repo.run(["add", ".gitignore", "target/victim.bin"])?;
-        repo.run(["commit", "-m", "track victim"])?;
-        repo.run(["switch", "main"])?;
-        repo.write("upstream.txt", "upstream\n")?;
-        repo.run(["add", "upstream.txt"])?;
-        repo.run(["commit", "-m", "upstream"])?;
-        repo.run(["switch", "topic"])?;
-        repo.run_allow_failure(["rebase", "--exec", "false", "main"])?;
+    fn exact_rebase_abort_preserves_ignored_file_chmod_after_preview() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = prepare_rebase_with_ignored_victim()?;
 
         let git = Git::new(repo.path());
-        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
-        fs::create_dir(repo.path().join("target"))?;
-        repo.write("target/victim.bin", "before preview\n")?;
+        let victim = repo.path().join("target/victim.bin");
         let expected = git.recovery_state()?;
-        repo.write("target/victim.bin", "changed after preview\n")?;
+        let mut permissions = fs::metadata(&victim)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&victim, permissions)?;
 
         let Err(error) = git.recover_exact(
             RepositoryOperation::Rebase,
             RecoveryAction::Abort,
             &expected,
         ) else {
-            return Err("expected changed ignored file to block rebase abort".into());
+            return Err("expected ignored executable mode change to block rebase abort".into());
         };
 
         assert!(error.to_string().contains("state changed after preview"));
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
-        assert_eq!(
-            fs::read_to_string(repo.path().join("target/victim.bin"))?,
-            "changed after preview\n"
-        );
+        assert_ne!(fs::metadata(victim)?.permissions().mode() & 0o111, 0);
         Ok(())
     }
 
     #[test]
-    fn exact_recovery_rejects_changed_untracked_file_content() -> Result<(), Box<dyn Error>> {
+    fn exact_rebase_uses_backend_orig_head_when_top_level_orig_head_is_wrong()
+    -> Result<(), Box<dyn Error>> {
+        let repo = prepare_rebase_with_ignored_victim()?;
+        let git = Git::new(repo.path());
+        let victim = repo.path().join("target/victim.bin");
+        repo.run(["update-ref", "ORIG_HEAD", "HEAD"])?;
+        assert_ne!(
+            fs::read_to_string(git.git_path("rebase-merge/orig-head")?)?.trim(),
+            repo.git_stdout(["rev-parse", "ORIG_HEAD"])?.trim()
+        );
+        let expected = git.recovery_state()?;
+        fs::write(&victim, "changed after preview\n")?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected ignored content change to block rebase abort".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(fs::read_to_string(victim)?, "changed after preview\n");
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_metadata_entry_bound_applies_before_wide_tree_traversal()
+    -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        let git = Git::new(repo.path());
+        let backend = git.git_path("rebase-merge")?;
+        fs::create_dir(&backend)?;
+        for index in 0..MAX_RECOVERY_METADATA_ENTRIES {
+            fs::write(backend.join(index.to_string()), [])?;
+        }
+
+        let Err(error) = git.recovery_state() else {
+            return Err("expected wide recovery metadata tree to exceed entry bound".into());
+        };
+        assert!(error.to_string().contains("metadata entries"));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_path_parser_stops_at_relevant_file_bound() -> Result<(), Box<dyn Error>> {
+        let mut output = Vec::new();
+        for index in 0..=MAX_RECOVERY_RELEVANT_FILES {
+            output.extend_from_slice(b":100644 100644 0000000 0000000 M\0");
+            output.extend_from_slice(format!("path-{index}\0").as_bytes());
+        }
+        let mut paths = BTreeSet::new();
+
+        let Err(error) = parse_recovery_changed_paths(&output, &mut paths) else {
+            return Err("expected changed paths to exceed relevant file bound".into());
+        };
+        assert!(error.to_string().contains("relevant file count"));
+        assert_eq!(paths.len(), MAX_RECOVERY_RELEVANT_FILES);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_ignores_unrelated_untracked_tree() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
+        fs::create_dir(repo.path().join("ignored"))?;
+        fs::write(repo.path().join(".git/info/exclude"), "ignored/\n")?;
+        for index in 0..=MAX_RECOVERY_RELEVANT_FILES {
+            repo.write(&format!("ignored/{index}"), "ignored\n")?;
+        }
         repo.write("notes.txt", "before preview\n")?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
         repo.write("notes.txt", "changed after preview\n")?;
 
-        let Err(error) =
-            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
-        else {
-            return Err("expected changed untracked file to block merge abort".into());
-        };
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
 
-        assert!(error.to_string().contains("state changed after preview"));
-        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(git.status()?.operation, None);
         assert_eq!(
             fs::read_to_string(repo.path().join("notes.txt"))?,
             "changed after preview\n"
@@ -2910,30 +3518,157 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
-    fn recovery_state_fingerprints_large_sparse_ignored_file_without_retaining_content()
-    -> Result<(), Box<dyn Error>> {
-        const SPARSE_FILE_SIZE: u64 = 256 * 1024 * 1024;
+    fn recovery_state_blocks_large_tracked_binary_before_reading_it() -> Result<(), Box<dyn Error>>
+    {
+        use std::io::Write;
 
         let (repo, _original_head) = prepare_merge_conflict()?;
         let git = Git::new(repo.path());
-        fs::write(git.git_path("info/exclude")?, "large.bin\n")?;
-        let sparse_path = repo.path().join("large.bin");
-        fs::File::create(&sparse_path)?.set_len(SPARSE_FILE_SIZE)?;
+        let mut file = fs::File::options()
+            .write(true)
+            .truncate(true)
+            .open(repo.path().join("conflict.txt"))?;
+        let mut chunk = [0_u8; 64 * 1024];
+        let mut value = 0x9e37_79b9_u32;
+        for byte in &mut chunk {
+            value ^= value << 13;
+            value ^= value >> 17;
+            value ^= value << 5;
+            *byte = value as u8;
+        }
+        for _ in 0..(MAX_RECOVERY_FILE_BYTES_READ / chunk.len() as u64) {
+            file.write_all(&chunk)?;
+        }
+        file.write_all(&[1])?;
+        file.flush()?;
 
-        let state = git.recovery_state()?;
-        let sparse_entry = state
-            .untracked_worktree
-            .iter()
-            .find(|entry| entry.path == Path::new("large.bin"))
-            .ok_or("missing sparse ignored file fingerprint")?;
-        let RecoveryWorktreeValue::File { size, oid } = &sparse_entry.value else {
-            return Err("expected sparse ignored file fingerprint".into());
+        let Err(error) = git.recovery_state() else {
+            return Err("expected large tracked file to exceed recovery read bound".into());
         };
-        assert_eq!(*size, SPARSE_FILE_SIZE);
-        assert!(oid.len() <= 64);
-        assert_eq!(git.recovery_state()?, state);
+        assert!(error.to_string().contains("file content bytes read"));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_blocks_relevant_filesystem_type_replacement() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let conflict = repo.path().join("conflict.txt");
+        fs::remove_file(&conflict)?;
+        fs::create_dir(&conflict)?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected filesystem type replacement to block recovery".into());
+        };
+        assert!(error.to_string().contains("state changed after preview"));
+        assert!(conflict.is_dir());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fingerprint_does_not_hang_on_fifo_replacement() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::FileTypeExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let conflict = repo.path().join("conflict.txt");
+        let fifo = repo.path().join("replacement-fifo");
+        let status = Command::new("mkfifo").arg(&fifo).status()?;
+        if !status.success() {
+            return Err("mkfifo failed".into());
+        }
+        let replacement = fifo.clone();
+        let destination = conflict.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _ = fs::rename(replacement, destination);
+        });
+        RECOVERY_FILE_OPEN_HOOKS
+            .lock()
+            .map_err(|_| "recovery file-open hook lock poisoned")?
+            .push((conflict.clone(), hook));
+
+        let Err(error) = git.recovery_state() else {
+            return Err("expected FIFO replacement to block recovery guard".into());
+        };
+        assert!(matches!(error, GitError::Blocked { .. }));
+        assert!(fs::symlink_metadata(conflict)?.file_type().is_fifo());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fingerprint_does_not_follow_symlink_replacement() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let conflict = repo.path().join("conflict.txt");
+        let secret = repo.path().join("secret.txt");
+        let replacement = repo.path().join("replacement-link");
+        fs::write(&secret, "must not be fingerprinted\n")?;
+        symlink(&secret, &replacement)?;
+        let destination = conflict.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _ = fs::rename(replacement, destination);
+        });
+        RECOVERY_FILE_OPEN_HOOKS
+            .lock()
+            .map_err(|_| "recovery file-open hook lock poisoned")?
+            .push((conflict.clone(), hook));
+
+        let Err(error) = git.recovery_state() else {
+            return Err("expected symlink replacement to block recovery guard".into());
+        };
+        assert!(matches!(error, GitError::Blocked { .. }));
+        assert!(fs::symlink_metadata(conflict)?.file_type().is_symlink());
+        assert_eq!(fs::read_to_string(secret)?, "must not be fingerprinted\n");
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_repeats_guard_after_synchronized_concurrent_edit()
+    -> Result<(), Box<dyn Error>> {
+        use std::sync::mpsc;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let conflict = repo.path().join("conflict.txt");
+        let (scanned_tx, scanned_rx) = mpsc::channel();
+        let (edited_tx, edited_rx) = mpsc::channel();
+        let editor = std::thread::spawn(move || {
+            let _ = scanned_rx.recv();
+            let result = fs::write(conflict, "concurrent edit\n");
+            let _ = edited_tx.send(result);
+        });
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _ = scanned_tx.send(());
+            let _ = edited_rx.recv();
+        });
+        *RECOVERY_CAPTURE_HOOK
+            .lock()
+            .map_err(|_| "recovery capture hook lock poisoned")? = Some((repo.path(), hook));
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected concurrent edit to block recovery".into());
+        };
+        editor.join().map_err(|_| "editor thread panicked")?;
+        assert!(
+            error
+                .to_string()
+                .contains("during final recovery validation")
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("conflict.txt"))?,
+            "concurrent edit\n"
+        );
         Ok(())
     }
 
@@ -3873,6 +4608,35 @@ mod tests {
             Some(RepositoryOperation::Rebase)
         );
         Ok((repo, original_head))
+    }
+
+    fn prepare_rebase_with_ignored_victim() -> Result<TempRepo, Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write(".gitignore", "target/\n")?;
+        repo.run(["add", ".gitignore"])?;
+        repo.run(["commit", "-m", "ignore target"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("first.txt", "first\n")?;
+        repo.run(["add", "first.txt"])?;
+        repo.run(["commit", "-m", "first"])?;
+        repo.write(".gitignore", "")?;
+        fs::create_dir(repo.path().join("target"))?;
+        repo.write("target/victim.bin", "committed\n")?;
+        repo.run(["add", ".gitignore", "target/victim.bin"])?;
+        repo.run(["commit", "-m", "track victim"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("upstream.txt", "upstream\n")?;
+        repo.run(["add", "upstream.txt"])?;
+        repo.run(["commit", "-m", "upstream"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "--exec", "false", "main"])?;
+        fs::create_dir(repo.path().join("target"))?;
+        repo.write("target/victim.bin", "before preview\n")?;
+        assert_eq!(
+            Git::new(repo.path()).status()?.operation,
+            Some(RepositoryOperation::Rebase)
+        );
+        Ok(repo)
     }
 
     fn prepare_two_conflict_rebase() -> Result<TempRepo, Box<dyn Error>> {
