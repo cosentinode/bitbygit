@@ -727,9 +727,34 @@ impl Git {
             worktree_diff: self
                 .run_raw(["diff", "--binary", "--no-ext-diff", "--"])?
                 .stdout,
+            ignored_worktree: self.ignored_worktree()?,
             metadata: self.recovery_metadata()?,
             refs: self.recovery_refs(operation)?,
         })
+    }
+
+    fn ignored_worktree(&self) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
+        let root = self.repo_root()?;
+        let paths = self
+            .run_raw([
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--full-name",
+                "-z",
+                "--",
+            ])?
+            .stdout;
+        let mut entries = Vec::new();
+        for path in paths
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let relative = path_from_bytes(path);
+            snapshot_recovery_metadata(&relative, &root.join(&relative), &mut entries)?;
+        }
+        Ok(entries)
     }
 
     fn recovery_metadata(&self) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
@@ -1495,6 +1520,7 @@ pub struct RecoveryState {
     status: Vec<u8>,
     index: Vec<u8>,
     worktree_diff: Vec<u8>,
+    ignored_worktree: Vec<RecoveryMetadataEntry>,
     metadata: Vec<RecoveryMetadataEntry>,
     refs: Vec<u8>,
 }
@@ -2670,6 +2696,53 @@ mod tests {
         assert_eq!(
             repo.git_stdout(["rev-parse", "refs/heads/topic"])?.trim(),
             newer_head
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_rebase_abort_preserves_ignored_file_changed_after_preview()
+    -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write(".gitignore", "target/\n")?;
+        repo.run(["add", ".gitignore"])?;
+        repo.run(["commit", "-m", "ignore target"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("first.txt", "first\n")?;
+        repo.run(["add", "first.txt"])?;
+        repo.run(["commit", "-m", "first"])?;
+        repo.write(".gitignore", "")?;
+        fs::create_dir(repo.path().join("target"))?;
+        repo.write("target/victim.bin", "committed\n")?;
+        repo.run(["add", ".gitignore", "target/victim.bin"])?;
+        repo.run(["commit", "-m", "track victim"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("upstream.txt", "upstream\n")?;
+        repo.run(["add", "upstream.txt"])?;
+        repo.run(["commit", "-m", "upstream"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "--exec", "false", "main"])?;
+
+        let git = Git::new(repo.path());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        fs::create_dir(repo.path().join("target"))?;
+        repo.write("target/victim.bin", "before preview\n")?;
+        let expected = git.recovery_state()?;
+        repo.write("target/victim.bin", "changed after preview\n")?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected changed ignored file to block rebase abort".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(
+            fs::read_to_string(repo.path().join("target/victim.bin"))?,
+            "changed after preview\n"
         );
         Ok(())
     }
