@@ -103,6 +103,34 @@ impl GitHub {
         Ok(pages.into_iter().flatten().map(PullRequest::from).collect())
     }
 
+    pub fn branch_exists(&self, branch: &str) -> Result<bool, GhError> {
+        self.ensure_ready()?;
+        if branch.trim().is_empty() {
+            return Err(GhError::InvalidInput {
+                name: "base branch",
+            });
+        }
+        let repository = self.repository_after_ready()?;
+        let output = self.run_output(vec![
+            "api".to_owned(),
+            "--method".to_owned(),
+            "GET".to_owned(),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+            format!(
+                "repos/{}/git/matching-refs/heads/{}",
+                repository.name_with_owner,
+                url_path_component(branch)
+            ),
+        ])?;
+        let pages: Vec<Vec<RestReference>> = parse_json(&output, "branch query")?;
+        let expected = format!("refs/heads/{branch}");
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .any(|reference| reference.name == expected))
+    }
+
     fn repository_after_ready(&self) -> Result<Repository, GhError> {
         let mut args = vec!["repo".to_owned(), "view".to_owned()];
         if let Some(repository) = &self.repository {
@@ -277,6 +305,12 @@ struct RestPullRequestRepository {
     full_name: String,
 }
 
+#[derive(Deserialize)]
+struct RestReference {
+    #[serde(rename = "ref")]
+    name: String,
+}
+
 impl From<RestPullRequest> for PullRequest {
     fn from(pull_request: RestPullRequest) -> Self {
         Self {
@@ -386,6 +420,25 @@ fn parse_json<T: for<'de> Deserialize<'de>>(
     operation: &'static str,
 ) -> Result<T, GhError> {
     serde_json::from_str(output).map_err(|_| GhError::InvalidOutput { operation })
+}
+
+fn url_path_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    encoded
 }
 
 #[cfg(all(test, unix))]
@@ -506,6 +559,16 @@ mod tests {
             "api\u{1f}--method\u{1f}GET\u{1f}--paginate\u{1f}--slurp\u{1f}repos/octo/repo/pulls\u{1f}-f\u{1f}state=open\u{1f}-f\u{1f}head=octo:feature\u{1f}-f\u{1f}per_page=100\u{1f}\n"
         ));
         assert_eq!(fake.prompt_values()?, "1\n1\n1\n1\n1\n1\n1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn checks_encoded_base_branch_reference() -> Result<(), Box<dyn Error>> {
+        let fake = FakeGh::new(
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$6\" = repos/octo/repo/git/matching-refs/heads/release%2Fnext ] || exit 1; printf '%s\\n' '[[{\"ref\":\"refs/heads/release/next\"}]]' ;;\n*) exit 1 ;;\nesac",
+        )?;
+
+        assert!(fake.github().branch_exists("release/next")?);
         Ok(())
     }
 
