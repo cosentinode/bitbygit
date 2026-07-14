@@ -42,6 +42,9 @@ const MAX_RECOVERY_PATH_BYTES: usize = 256 * 1024;
 const MAX_RECOVERY_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_METADATA_ENTRIES: usize = 4_096;
 const MAX_RECOVERY_SUBPROCESSES: usize = 12;
+const MAX_RECOVERY_GENERATION_ENTRIES: usize = 100_000;
+const MAX_RECOVERY_GENERATION_PATH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RECOVERY_GENERATION_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -297,21 +300,16 @@ impl Git {
                 ),
             });
         }
-        run_recovery_execution_hook(&self.cwd);
-        let execution_state = self.recovery_state()?;
-        if execution_state != current_state {
-            return Err(GitError::Blocked {
-                message: format!(
-                    "{} {} is blocked because repository state changed at the recovery execution boundary",
-                    operation.label(),
-                    action.label()
-                ),
-            });
-        }
-        self.run_recovery_args(vec![
-            operation.label().to_owned(),
-            format!("--{}", action.label()),
-        ])
+        let mut transaction = RecoveryTransaction::prepare(self)?;
+        let output = transaction.run_recovery(
+            self,
+            vec![
+                operation.label().to_owned(),
+                format!("--{}", action.label()),
+            ],
+        )?;
+        transaction.promote(self, &current_state)?;
+        Ok(output)
     }
 
     pub fn push_current_branch(
@@ -1254,6 +1252,7 @@ impl Git {
         self.run_args_with_editor(args, false)
     }
 
+    #[cfg(test)]
     fn run_recovery_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
         self.run_args_with_editor(args, true)
     }
@@ -1465,6 +1464,361 @@ impl Git {
         })
     }
 }
+
+struct RecoveryTransaction {
+    root: PathBuf,
+    candidate: PathBuf,
+    baseline: RecoveryGeneration,
+    keep_candidate: bool,
+}
+
+impl RecoveryTransaction {
+    fn prepare(git: &Git) -> Result<Self, GitError> {
+        let root = git
+            .repo_root()?
+            .canonicalize()
+            .map_err(|source| recovery_transaction_io("resolve repository root", source))?;
+        let git_dir = git
+            .git_path("")?
+            .canonicalize()
+            .map_err(|source| recovery_transaction_io("resolve Git directory", source))?;
+        let embedded_git_dir = root.join(".git");
+        if !embedded_git_dir.is_dir()
+            || embedded_git_dir.canonicalize().map_err(|source| {
+                recovery_transaction_io("resolve embedded Git directory", source)
+            })? != git_dir
+        {
+            return Err(recovery_transaction_blocked(
+                "atomic recovery requires a standalone repository with an embedded .git directory",
+            ));
+        }
+        let common_dir = path_from_bytes(strip_byte_line_ending(
+            &git.run_raw(["rev-parse", "--path-format=absolute", "--git-common-dir"])?
+                .stdout,
+        ))
+        .canonicalize()
+        .map_err(|source| recovery_transaction_io("resolve common Git directory", source))?;
+        if common_dir != git_dir {
+            return Err(recovery_transaction_blocked(
+                "atomic recovery does not support a shared common Git directory",
+            ));
+        }
+
+        let baseline = RecoveryGeneration::capture(&root)?;
+        let parent = root.parent().ok_or_else(|| {
+            recovery_transaction_blocked("repository root has no parent for isolated recovery")
+        })?;
+        let candidate = create_recovery_candidate(parent)?;
+        let mut transaction = Self {
+            root,
+            candidate,
+            baseline,
+            keep_candidate: false,
+        };
+        transaction.copy_repository()?;
+
+        let live_after_copy = RecoveryGeneration::capture(&transaction.root)?;
+        let copied = RecoveryGeneration::capture(&transaction.candidate)?;
+        if live_after_copy != transaction.baseline || copied != transaction.baseline {
+            return Err(recovery_transaction_blocked(
+                "repository changed while isolated recovery state was prepared",
+            ));
+        }
+        Ok(transaction)
+    }
+
+    fn copy_repository(&mut self) -> Result<(), GitError> {
+        let output = Command::new("cp")
+            .args(["-a", "--reflink=auto", "--"])
+            .arg(self.root.join("."))
+            .arg(&self.candidate)
+            .output()
+            .map_err(|source| recovery_transaction_io("start isolated repository copy", source))?;
+        if !output.status.success() {
+            return Err(recovery_transaction_blocked(format!(
+                "isolated repository copy failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        fs::set_permissions(
+            &self.candidate,
+            fs::metadata(&self.root)
+                .map_err(|source| {
+                    recovery_transaction_io("read repository root permissions", source)
+                })?
+                .permissions(),
+        )
+        .map_err(|source| {
+            recovery_transaction_io("preserve repository root permissions", source)
+        })?;
+        Ok(())
+    }
+
+    fn run_recovery(&self, git: &Git, args: Vec<String>) -> Result<GitOutput, GitError> {
+        let mut command = Command::new("unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--fork",
+                "sh",
+                "-c",
+                "mount --bind \"$1\" \"$2\" && cd \"$2\" && shift 2 && exec git \"$@\"",
+                "bitbygit-recovery",
+            ])
+            .arg(&self.candidate)
+            .arg(&self.root)
+            .args(&args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true");
+        if git.ssh_executable.is_some() || env::var_os("GIT_SSH_COMMAND").is_none() {
+            let ssh_executable = git
+                .ssh_executable
+                .as_ref()
+                .map(|path| shell_quote(&path.to_string_lossy()))
+                .unwrap_or_else(|| "ssh".to_owned());
+            command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
+        }
+        let output = command.output().map_err(|source| GitError::Io {
+            args: args.clone(),
+            source,
+        })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            return Err(GitError::GitFailed {
+                args,
+                status: output.status,
+                stdout,
+                stderr,
+            });
+        }
+        Ok(GitOutput {
+            status: output.status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn promote(&mut self, live_git: &Git, expected_state: &RecoveryState) -> Result<(), GitError> {
+        if live_git.recovery_state()? != *expected_state
+            || RecoveryGeneration::capture(&self.root)? != self.baseline
+        {
+            return Err(recovery_transaction_blocked(
+                "repository changed while recovery executed in isolation",
+            ));
+        }
+
+        run_recovery_promotion_hook(&self.root);
+        atomic_exchange_directories(&self.root, &self.candidate)?;
+        self.keep_candidate = true;
+        if RecoveryGeneration::capture(&self.candidate)? != self.baseline {
+            if let Err(error) = atomic_exchange_directories(&self.root, &self.candidate) {
+                return Err(recovery_transaction_blocked(format!(
+                    "repository changed during atomic recovery promotion and rollback failed; both complete generations were retained: {error}"
+                )));
+            }
+            self.keep_candidate = false;
+            return Err(recovery_transaction_blocked(
+                "repository changed during atomic recovery promotion",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RecoveryTransaction {
+    fn drop(&mut self) {
+        if !self.keep_candidate {
+            let _result = fs::remove_dir_all(&self.candidate);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryGeneration {
+    entries: Vec<RecoveryGenerationEntry>,
+}
+
+impl RecoveryGeneration {
+    fn capture(root: &Path) -> Result<Self, GitError> {
+        let mut entries = Vec::new();
+        let mut pending = vec![PathBuf::new()];
+        let mut path_bytes = 0_usize;
+        let mut file_bytes = 0_u64;
+        while let Some(relative_dir) = pending.pop() {
+            let directory = root.join(&relative_dir);
+            let mut children = fs::read_dir(&directory)
+                .map_err(|source| recovery_transaction_io("read repository generation", source))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| recovery_transaction_io("read repository generation", source))?;
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children.into_iter().rev() {
+                let relative = relative_dir.join(child.file_name());
+                path_bytes =
+                    path_bytes.saturating_add(relative.as_os_str().as_encoded_bytes().len());
+                if entries.len() == MAX_RECOVERY_GENERATION_ENTRIES
+                    || path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
+                {
+                    return Err(recovery_transaction_blocked(
+                        "repository generation exceeds atomic recovery entry or path bounds",
+                    ));
+                }
+                let path = child.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|source| {
+                    recovery_transaction_io("inspect repository generation entry", source)
+                })?;
+                let file_type = metadata.file_type();
+                let value = if file_type.is_dir() {
+                    pending.push(relative.clone());
+                    RecoveryGenerationValue::Directory {
+                        mode: recovery_file_mode(&metadata),
+                    }
+                } else if file_type.is_file() {
+                    file_bytes = file_bytes.saturating_add(metadata.len());
+                    if file_bytes > MAX_RECOVERY_GENERATION_FILE_BYTES {
+                        return Err(recovery_transaction_blocked(
+                            "repository generation exceeds atomic recovery content bound",
+                        ));
+                    }
+                    let identity = recovery_file_identity(&metadata);
+                    let mut file = BufReader::new(fs::File::open(&path).map_err(|source| {
+                        recovery_transaction_io("open repository generation file", source)
+                    })?);
+                    let mut hasher = Sha256::new();
+                    std::io::copy(&mut file, &mut hasher).map_err(|source| {
+                        recovery_transaction_io("hash repository generation file", source)
+                    })?;
+                    let current = fs::symlink_metadata(&path).map_err(|source| {
+                        recovery_transaction_io("recheck repository generation file", source)
+                    })?;
+                    if !current.is_file()
+                        || current.len() != metadata.len()
+                        || recovery_file_mode(&current) != recovery_file_mode(&metadata)
+                        || recovery_file_identity(&current) != identity
+                    {
+                        return Err(recovery_transaction_blocked(
+                            "repository generation changed while it was captured",
+                        ));
+                    }
+                    RecoveryGenerationValue::File {
+                        mode: recovery_file_mode(&metadata),
+                        size: metadata.len(),
+                        digest: hasher.finalize().into(),
+                    }
+                } else if file_type.is_symlink() {
+                    RecoveryGenerationValue::Symlink(fs::read_link(&path).map_err(|source| {
+                        recovery_transaction_io("read repository generation symlink", source)
+                    })?)
+                } else {
+                    return Err(recovery_transaction_blocked(format!(
+                        "atomic recovery does not support special filesystem entry {}",
+                        relative.display()
+                    )));
+                };
+                entries.push(RecoveryGenerationEntry {
+                    path: relative,
+                    value,
+                });
+            }
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryGenerationEntry {
+    path: PathBuf,
+    value: RecoveryGenerationValue,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryGenerationValue {
+    Directory {
+        mode: u32,
+    },
+    File {
+        mode: u32,
+        size: u64,
+        digest: [u8; 32],
+    },
+    Symlink(PathBuf),
+}
+
+fn create_recovery_candidate(parent: &Path) -> Result<PathBuf, GitError> {
+    for attempt in 0..100_u32 {
+        let candidate = parent.join(format!(
+            ".bitbygit-recovery-backup-{}-{}-{attempt}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(recovery_transaction_io(
+                    "create isolated repository",
+                    source,
+                ));
+            }
+        }
+    }
+    Err(recovery_transaction_blocked(
+        "could not reserve an isolated repository path",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_exchange_directories(left: &Path, right: &Path) -> Result<(), GitError> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, left, CWD, right, RenameFlags::EXCHANGE).map_err(|source| {
+        recovery_transaction_blocked(format!("atomic directory exchange failed: {source}"))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn atomic_exchange_directories(_left: &Path, _right: &Path) -> Result<(), GitError> {
+    Err(recovery_transaction_blocked(
+        "atomic recovery is not supported on this platform",
+    ))
+}
+
+fn recovery_transaction_io(action: &str, source: std::io::Error) -> GitError {
+    recovery_transaction_blocked(format!("atomic recovery could not {action}: {source}"))
+}
+
+fn recovery_transaction_blocked(message: impl Into<String>) -> GitError {
+    GitError::Blocked {
+        message: message.into(),
+    }
+}
+
+#[cfg(test)]
+static RECOVERY_PROMOTION_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_promotion_hook(root: &Path) {
+    if let Ok(mut hooks) = RECOVERY_PROMOTION_HOOKS.lock()
+        && let Some(index) = hooks.iter().position(|(target, _)| target == root)
+    {
+        let (_, hook) = hooks.swap_remove(index);
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_promotion_hook(_root: &Path) {}
 
 #[derive(Default)]
 struct RecoveryCapture {
@@ -1829,23 +2183,6 @@ fn run_recovery_capture_hook(cwd: &Path) {
 
 #[cfg(not(test))]
 fn run_recovery_capture_hook(_cwd: &Path) {}
-
-#[cfg(test)]
-static RECOVERY_EXECUTION_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
-    std::sync::Mutex::new(Vec::new());
-
-#[cfg(test)]
-fn run_recovery_execution_hook(cwd: &Path) {
-    if let Ok(mut hooks) = RECOVERY_EXECUTION_HOOKS.lock() {
-        if let Some(index) = hooks.iter().position(|(target, _)| target == cwd) {
-            let (_, hook) = hooks.swap_remove(index);
-            hook();
-        }
-    }
-}
-
-#[cfg(not(test))]
-fn run_recovery_execution_hook(_cwd: &Path) {}
 
 #[cfg(test)]
 static RECOVERY_FILE_OPEN_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
@@ -3792,11 +4129,7 @@ mod tests {
             return Err("expected concurrent edit to block recovery".into());
         };
         editor.join().map_err(|_| "editor thread panicked")?;
-        assert!(
-            error
-                .to_string()
-                .contains("at the recovery execution boundary")
-        );
+        assert!(error.to_string().contains("repository changed"));
         assert_eq!(
             fs::read_to_string(repo.path().join("conflict.txt"))?,
             "concurrent edit\n"
@@ -3804,55 +4137,38 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn exact_rebase_abort_blocks_ref_race_at_execution_boundary_without_partial_recovery()
+    fn isolated_rebase_abort_preserves_ref_race_during_prepared_hook_without_partial_recovery()
     -> Result<(), Box<dyn Error>> {
-        use std::sync::mpsc;
-
         let (repo, original_head) = prepare_rebase_conflict()?;
+        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
         let preview_head = repo.git_stdout(["rev-parse", "HEAD"])?;
         let preview_conflict = fs::read(repo.path().join("conflict.txt"))?;
         let newer_head = repo.git_stdout(["rev-parse", "main"])?.trim().to_owned();
         assert_ne!(newer_head, original_head);
-
-        let (validated_tx, validated_rx) = mpsc::channel();
-        let (moved_tx, moved_rx) = mpsc::channel();
-        let repo_path = repo.path();
-        let moved_head = newer_head.clone();
-        let mover = std::thread::spawn(move || {
-            let _ = validated_rx.recv();
-            let output = Command::new("git")
-                .current_dir(repo_path)
-                .args(["update-ref", "refs/heads/topic", &moved_head])
-                .output();
-            let _ = moved_tx.send(());
-            output
+        let worker_path = repo.path();
+        let worker_state = expected.clone();
+        let worker = std::thread::spawn(move || {
+            Git::new(worker_path).recover_exact(
+                RepositoryOperation::Rebase,
+                RecoveryAction::Abort,
+                &worker_state,
+            )
         });
-        let hook: RecoveryCaptureHook = Box::new(move || {
-            let _ = validated_tx.send(());
-            let _ = moved_rx.recv();
-        });
-        RECOVERY_EXECUTION_HOOKS
-            .lock()
-            .map_err(|_| "recovery execution hook lock poisoned")?
-            .push((repo.path(), hook));
+        wait_for_recovery_barrier(&signal)?;
+        fs::write(git.git_path("refs/heads/topic")?, format!("{newer_head}\n"))?;
+        fs::write(&release, [])?;
 
-        let Err(error) = git.recover_exact(
-            RepositoryOperation::Rebase,
-            RecoveryAction::Abort,
-            &expected,
-        ) else {
+        let Err(error) = worker.join().map_err(|_| "recovery worker panicked")? else {
             return Err("expected exact rebase abort to fail closed".into());
         };
-        let output = mover.join().map_err(|_| "branch mover thread panicked")??;
-
-        assert!(output.status.success());
         assert!(
             error
                 .to_string()
-                .contains("at the recovery execution boundary"),
+                .contains("while recovery executed in isolation"),
             "{error}"
         );
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
@@ -3869,33 +4185,42 @@ mod tests {
             repo.git_stdout(["rev-parse", "refs/heads/topic"])?.trim(),
             newer_head
         );
+        let _ = fs::remove_file(signal);
+        let _ = fs::remove_file(release);
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn exact_recovery_blocks_worktree_race_at_execution_boundary() -> Result<(), Box<dyn Error>> {
-        let (repo, _original_head) = prepare_merge_conflict()?;
+    fn isolated_recovery_preserves_post_spawn_worktree_race() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
-        let conflict = repo.path().join("conflict.txt");
-        let hook: RecoveryCaptureHook = Box::new(move || {
-            let _ = fs::write(conflict, "late worktree edit\n");
+        let worker_path = repo.path();
+        let worker_state = expected.clone();
+        let worker = std::thread::spawn(move || {
+            Git::new(worker_path).recover_exact(
+                RepositoryOperation::Rebase,
+                RecoveryAction::Abort,
+                &worker_state,
+            )
         });
-        RECOVERY_EXECUTION_HOOKS
-            .lock()
-            .map_err(|_| "recovery execution hook lock poisoned")?
-            .push((repo.path(), hook));
+        wait_for_recovery_barrier(&signal)?;
+        fs::write(
+            repo.path().join("conflict.txt"),
+            "post-spawn worktree edit\n",
+        )?;
+        fs::write(&release, [])?;
 
-        let Err(error) =
-            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
-        else {
+        let Err(error) = worker.join().map_err(|_| "recovery worker panicked")? else {
             return Err("expected late worktree edit to block recovery".into());
         };
 
         assert!(
             error
                 .to_string()
-                .contains("at the recovery execution boundary")
+                .contains("while recovery executed in isolation")
         );
         let current = git.recovery_state()?;
         assert_eq!(current.head, expected.head);
@@ -3904,49 +4229,56 @@ mod tests {
         assert_eq!(current.refs, expected.refs);
         assert_eq!(
             fs::read_to_string(repo.path().join("conflict.txt"))?,
-            "late worktree edit\n"
+            "post-spawn worktree edit\n"
         );
-        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        let _ = fs::remove_file(signal);
+        let _ = fs::remove_file(release);
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn exact_recovery_blocks_index_race_at_execution_boundary() -> Result<(), Box<dyn Error>> {
-        let (repo, _original_head) = prepare_merge_conflict()?;
+    fn isolated_recovery_preserves_post_spawn_index_race() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
         let original_blob = repo
             .git_stdout(["rev-parse", "HEAD:conflict.txt"])?
             .trim()
             .to_owned();
-        let repo_path = repo.path();
-        let hook: RecoveryCaptureHook = Box::new(move || {
-            let _ = Command::new("git")
-                .current_dir(repo_path)
-                .args([
-                    "update-index",
-                    "--cacheinfo",
-                    "100644",
-                    &original_blob,
-                    "conflict.txt",
-                ])
-                .output();
+        let worker_path = repo.path();
+        let worker_state = expected.clone();
+        let worker = std::thread::spawn(move || {
+            Git::new(worker_path).recover_exact(
+                RepositoryOperation::Rebase,
+                RecoveryAction::Abort,
+                &worker_state,
+            )
         });
-        RECOVERY_EXECUTION_HOOKS
-            .lock()
-            .map_err(|_| "recovery execution hook lock poisoned")?
-            .push((repo.path(), hook));
+        wait_for_recovery_barrier(&signal)?;
+        let output = Command::new("git")
+            .current_dir(repo.path())
+            .args([
+                "update-index",
+                "--cacheinfo",
+                "100644",
+                &original_blob,
+                "conflict.txt",
+            ])
+            .output()?;
+        assert!(output.status.success());
+        fs::write(&release, [])?;
 
-        let Err(error) =
-            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
-        else {
+        let Err(error) = worker.join().map_err(|_| "recovery worker panicked")? else {
             return Err("expected late index edit to block recovery".into());
         };
 
         assert!(
             error
                 .to_string()
-                .contains("at the recovery execution boundary")
+                .contains("while recovery executed in isolation")
         );
         let current = git.recovery_state()?;
         assert_eq!(current.head, expected.head);
@@ -3954,7 +4286,47 @@ mod tests {
         assert_eq!(current.worktree, expected.worktree);
         assert_eq!(current.metadata, expected.metadata);
         assert_eq!(current.refs, expected.refs);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        let _ = fs::remove_file(signal);
+        let _ = fs::remove_file(release);
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_promotion_rolls_back_race_after_expected_value_check() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let conflict = repo.path().join("conflict.txt");
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _ = fs::write(conflict, "promotion race\n");
+        });
+        RECOVERY_PROMOTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery promotion hook lock poisoned")?
+            .push((repo.path().canonicalize()?, hook));
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected promotion race to roll back recovery".into());
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("during atomic recovery promotion")
+        );
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        let current = git.recovery_state()?;
+        assert_eq!(current.head, expected.head);
+        assert_eq!(current.index, expected.index);
+        assert_eq!(current.metadata, expected.metadata);
+        assert_eq!(current.refs, expected.refs);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("conflict.txt"))?,
+            "promotion race\n"
+        );
         Ok(())
     }
 
@@ -3980,7 +4352,7 @@ mod tests {
         let commit_hook = hooks.join("commit-msg");
         fs::write(
             &commit_hook,
-            "#!/bin/sh\ntouch configured-commit-hook-ran\n",
+            "#!/bin/sh\npwd > configured-commit-hook-ran\n",
         )?;
         let transaction_hook = hooks.join("reference-transaction");
         fs::write(
@@ -4013,7 +4385,10 @@ mod tests {
         git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Continue, &state)?;
 
         assert_eq!(git.status()?.operation, None);
-        assert!(repo.path().join("configured-commit-hook-ran").exists());
+        assert_eq!(
+            fs::read_to_string(repo.path().join("configured-commit-hook-ran"))?.trim(),
+            repo.path().canonicalize()?.to_string_lossy()
+        );
         assert!(repo.path().join("configured-reference-hook-ran").exists());
         assert_eq!(fs::read(config_path)?, config_before);
         for (path, contents) in hook_files.iter().zip(contents_before) {
@@ -4061,12 +4436,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (repo, _original_head) = prepare_merge_conflict()?;
+        let hook_marker = repo.path().with_extension("hook-ran");
+        let signing_marker = repo.path().with_extension("signing-ran");
         let hooks = repo.path().join("hooks");
         fs::create_dir(&hooks)?;
         let commit_msg_hook = hooks.join("commit-msg");
         fs::write(
             &commit_msg_hook,
-            "#!/bin/sh\ntouch hook-ran\nprintf '\\377'\n",
+            format!(
+                "#!/bin/sh\ntouch {}\nprintf '\\377'\n",
+                shell_quote(&hook_marker.to_string_lossy())
+            ),
         )?;
         let mut permissions = fs::metadata(&commit_msg_hook)?.permissions();
         permissions.set_mode(0o755);
@@ -4074,7 +4454,13 @@ mod tests {
         repo.run(["config", "core.hooksPath", "hooks"])?;
 
         let signing_program = repo.path().join("signing-program");
-        fs::write(&signing_program, "#!/bin/sh\ntouch signing-ran\nexit 1\n")?;
+        fs::write(
+            &signing_program,
+            format!(
+                "#!/bin/sh\ntouch {}\nexit 1\n",
+                shell_quote(&signing_marker.to_string_lossy())
+            ),
+        )?;
         let mut permissions = fs::metadata(&signing_program)?.permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&signing_program, permissions)?;
@@ -4101,8 +4487,8 @@ mod tests {
         };
         assert!(args.ends_with(&["merge".to_owned(), "--continue".to_owned()]));
         assert!(format!("{stdout}{stderr}").contains('\u{fffd}'));
-        assert!(repo.path().join("hook-ran").exists());
-        assert!(repo.path().join("signing-ran").exists());
+        assert!(hook_marker.exists());
+        assert!(signing_marker.exists());
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         Ok(())
     }
@@ -5078,6 +5464,48 @@ mod tests {
         assert!(git.git_path("MERGE_HEAD")?.exists());
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
         Ok((repo, original_head))
+    }
+
+    #[cfg(unix)]
+    fn install_recovery_prepared_barrier(
+        repo: &TempRepo,
+    ) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo_path = repo.path();
+        let parent = repo_path.parent().ok_or("test repository has no parent")?;
+        let name = repo_path
+            .file_name()
+            .ok_or("test repository has no file name")?
+            .to_string_lossy();
+        let signal = parent.join(format!("{name}-recovery-child-prepared"));
+        let release = parent.join(format!("{name}-recovery-child-release"));
+        let _ = fs::remove_file(&signal);
+        let _ = fs::remove_file(&release);
+        let hook = repo.path().join(".git/hooks/reference-transaction");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = prepared ]; then\n  touch {}\n  while [ ! -e {} ]; do sleep 0.01; done\nfi\n",
+                shell_quote(&signal.to_string_lossy()),
+                shell_quote(&release.to_string_lossy())
+            ),
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(hook, permissions)?;
+        Ok((signal, release))
+    }
+
+    #[cfg(unix)]
+    fn wait_for_recovery_barrier(signal: &Path) -> Result<(), Box<dyn Error>> {
+        for _ in 0..500 {
+            if signal.exists() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Err("isolated recovery child did not reach its prepared hook".into())
     }
 
     struct TempRepo {
