@@ -314,6 +314,7 @@ impl Git {
             "get-url".to_owned(),
             "--push".to_owned(),
             "--all".to_owned(),
+            "--".to_owned(),
             remote.to_owned(),
         ])?;
         Ok(output
@@ -2605,6 +2606,25 @@ mod tests {
         ])?;
         assert_eq!(
             Git::new(repo.path()).remote_push_urls("origin")?,
+            vec!["https://github.com/fork/repo.git"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_push_urls_accepts_leading_hyphen_remote() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "main"])?;
+        repo.run([
+            "remote",
+            "add",
+            "--",
+            "-fork",
+            "https://github.com/fork/repo.git",
+        ])?;
+
+        assert_eq!(
+            Git::new(repo.path()).remote_push_urls("-fork")?,
             vec!["https://github.com/fork/repo.git"]
         );
         Ok(())
