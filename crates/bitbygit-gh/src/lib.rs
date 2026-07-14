@@ -9,6 +9,7 @@ pub const INSTALL_GH_GUIDANCE: &str =
     "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/.";
 pub const AUTHENTICATE_GH_GUIDANCE: &str =
     "GitHub CLI is not authenticated. Run `gh auth login` and try again.";
+const DEFAULT_HOSTNAME: &str = "github.com";
 
 #[derive(Debug, Clone)]
 pub struct GitHub {
@@ -16,6 +17,7 @@ pub struct GitHub {
     executable: PathBuf,
     #[cfg(test)]
     executable_args: Vec<String>,
+    hostname: String,
     repository: Option<String>,
 }
 
@@ -30,6 +32,7 @@ impl GitHub {
             executable: executable.into(),
             #[cfg(test)]
             executable_args: Vec::new(),
+            hostname: DEFAULT_HOSTNAME.to_owned(),
             repository: None,
         }
     }
@@ -37,6 +40,7 @@ impl GitHub {
     pub fn with_executable_and_repository(
         cwd: impl Into<PathBuf>,
         executable: impl Into<PathBuf>,
+        hostname: impl Into<String>,
         repository: impl Into<String>,
     ) -> Self {
         Self {
@@ -44,6 +48,7 @@ impl GitHub {
             executable: executable.into(),
             #[cfg(test)]
             executable_args: Vec::new(),
+            hostname: hostname.into(),
             repository: Some(repository.into()),
         }
     }
@@ -66,7 +71,7 @@ impl GitHub {
             "status".to_owned(),
             "--active".to_owned(),
             "--hostname".to_owned(),
-            "github.com".to_owned(),
+            self.hostname.clone(),
         ]) {
             Ok(()) => Ok(GhSetupStatus::Ready),
             Err(GhError::CommandFailed { .. }) => Ok(GhSetupStatus::NotAuthenticated),
@@ -111,7 +116,7 @@ impl GitHub {
             "-f".to_owned(),
             "per_page=100".to_owned(),
             "--hostname".to_owned(),
-            "github.com".to_owned(),
+            self.hostname.clone(),
         ])?;
         let pages: Vec<Vec<RestPullRequest>> = parse_json(&output, "pull request query")?;
         Ok(pages.into_iter().flatten().map(PullRequest::from).collect())
@@ -145,7 +150,7 @@ impl GitHub {
                 url_path_component(branch)
             ),
             "--hostname".to_owned(),
-            "github.com".to_owned(),
+            self.hostname.clone(),
         ])?;
         let pages: Vec<Vec<RestReference>> = parse_json(&output, "branch query")?;
         let expected = format!("refs/heads/{branch}");
@@ -158,7 +163,7 @@ impl GitHub {
     fn repository_after_ready(&self) -> Result<Repository, GhError> {
         let mut args = vec!["repo".to_owned(), "view".to_owned()];
         if let Some(repository) = &self.repository {
-            args.push(repository.clone());
+            args.push(self.qualified_repository(repository));
         }
         args.extend([
             "--json".to_owned(),
@@ -213,16 +218,22 @@ impl GitHub {
         match self.setup_status()? {
             GhSetupStatus::Ready => Ok(()),
             GhSetupStatus::MissingCli => Err(GhError::MissingCli),
-            GhSetupStatus::NotAuthenticated => Err(GhError::NotAuthenticated),
+            GhSetupStatus::NotAuthenticated => Err(GhError::NotAuthenticated {
+                hostname: self.hostname.clone(),
+            }),
         }
     }
 
     fn with_repository(&self, mut args: Vec<String>) -> Vec<String> {
         if let Some(repository) = &self.repository {
             args.push("--repo".to_owned());
-            args.push(repository.clone());
+            args.push(self.qualified_repository(repository));
         }
         args
+    }
+
+    fn qualified_repository(&self, repository: &str) -> String {
+        format!("{}/{repository}", self.hostname)
     }
 
     fn run_status(&self, args: Vec<String>) -> Result<(), GhError> {
@@ -264,6 +275,7 @@ impl GitHub {
         let mut command = Command::new(&self.executable);
         command
             .current_dir(&self.cwd)
+            .env("GH_HOST", &self.hostname)
             .env("GH_PROMPT_DISABLED", "1");
         #[cfg(test)]
         command.args(&self.executable_args);
@@ -392,7 +404,7 @@ pub struct CreatedPullRequest {
 #[derive(Debug)]
 pub enum GhError {
     MissingCli,
-    NotAuthenticated,
+    NotAuthenticated { hostname: String },
     Io { source: io::Error },
     CommandFailed { status: ExitStatus },
     InvalidInput { name: &'static str },
@@ -403,7 +415,10 @@ impl Display for GhError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingCli => formatter.write_str(INSTALL_GH_GUIDANCE),
-            Self::NotAuthenticated => formatter.write_str(AUTHENTICATE_GH_GUIDANCE),
+            Self::NotAuthenticated { hostname } => write!(
+                formatter,
+                "GitHub CLI is not authenticated for {hostname}. Run `gh auth login --hostname {hostname}` and try again."
+            ),
             Self::Io { source } => write!(formatter, "failed to run GitHub CLI: {source}"),
             Self::CommandFailed { status } => {
                 write!(formatter, "GitHub CLI failed with status {status}")
@@ -426,7 +441,7 @@ impl Error for GhError {
         match self {
             Self::Io { source } => Some(source),
             Self::MissingCli
-            | Self::NotAuthenticated
+            | Self::NotAuthenticated { .. }
             | Self::CommandFailed { .. }
             | Self::InvalidInput { .. }
             | Self::InvalidOutput { .. } => None,
@@ -560,9 +575,13 @@ mod tests {
         let fake = FakeGh::new(
             "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) [ \"$3\" = github.com/octo/repo ] && [ \"$4\" = --json ] && [ \"$5\" = nameWithOwner,defaultBranchRef ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) [ \"$3\" = GET ] && [ \"$4\" = --paginate ] && [ \"$5\" = --slurp ] && [ \"$6\" = repos/octo/repo/pulls ] && [ \"$7\" = -f ] && [ \"$8\" = state=open ] && [ \"$9\" = -f ] && [ \"${10}\" = head=octo:feature ] && [ \"${11}\" = -f ] && [ \"${12}\" = per_page=100 ] && [ \"${13}\" = --hostname ] && [ \"${14}\" = github.com ] || exit 1; printf '%s\\n' '[[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature\",\"repo\":{\"full_name\":\"octo/repo\"}}}]]' ;;\n*) exit 1 ;;\nesac",
         )?;
-        let github =
-            GitHub::with_executable_and_repository(&fake.path, "/bin/sh", "github.com/octo/repo")
-                .with_executable_args(vec![fake.executable.display().to_string()]);
+        let github = GitHub::with_executable_and_repository(
+            &fake.path,
+            "/bin/sh",
+            "github.com",
+            "octo/repo",
+        )
+        .with_executable_args(vec![fake.executable.display().to_string()]);
 
         let repository = github.repository()?;
         let pull_requests = github.existing_pull_requests("feature")?;
@@ -613,6 +632,61 @@ mod tests {
 
         assert!(fake.github().existing_pull_requests("feature")?.is_empty());
         assert!(!fake.github().branch_exists("main")?);
+        Ok(())
+    }
+
+    #[test]
+    fn enterprise_commands_are_scoped_to_the_selected_host() -> Result<(), Box<dyn Error>> {
+        let fake = FakeGh::new(
+            "[ \"$GH_HOST\" = git.example.com ] || exit 1\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) [ \"$3:$4:$5\" = --active:--hostname:git.example.com ] || exit 1 ;;\nrepo:view) [ \"$3\" = git.example.com/octo/repo ] || exit 1; printf '%s\\n' '{\"nameWithOwner\":\"octo/repo\",\"defaultBranchRef\":{\"name\":\"main\"}}' ;;\napi:--method) case \"$6\" in\n*/pulls) [ \"${13}:${14}\" = --hostname:git.example.com ] || exit 1; printf '%s\\n' '[[]]' ;;\n*/git/matching-refs/heads/*) [ \"$7:$8\" = --hostname:git.example.com ] || exit 1; printf '%s\\n' '[[]]' ;;\nesac ;;\npr:create) case \"$*\" in *'--repo git.example.com/octo/repo'*) printf '%s\\n' 'https://git.example.com/octo/repo/pull/43' ;; *) exit 1 ;; esac ;;\n*) exit 1 ;;\nesac",
+        )?;
+        let github = GitHub::with_executable_and_repository(
+            &fake.path,
+            "/bin/sh",
+            "git.example.com",
+            "octo/repo",
+        )
+        .with_executable_args(vec![fake.executable.display().to_string()]);
+
+        assert_eq!(github.repository()?.name_with_owner, "octo/repo");
+        assert!(github.existing_pull_requests("feature")?.is_empty());
+        assert!(!github.branch_exists("main")?);
+        assert_eq!(
+            github
+                .create_pull_request(&CreatePullRequest {
+                    title: "Feature".to_owned(),
+                    body: String::new(),
+                    base: "main".to_owned(),
+                    head: "feature".to_owned(),
+                })?
+                .url,
+            "https://git.example.com/octo/repo/pull/43"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enterprise_auth_failure_names_the_selected_host() -> Result<(), Box<dyn Error>> {
+        let fake = FakeGh::new(
+            "case \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 1 ;;\nesac\nexit 1",
+        )?;
+        let github = GitHub::with_executable_and_repository(
+            &fake.path,
+            "/bin/sh",
+            "git.example.com",
+            "octo/repo",
+        )
+        .with_executable_args(vec![fake.executable.display().to_string()]);
+
+        let error = match github.repository() {
+            Ok(_) => return Err(io::Error::other("authentication must fail").into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "GitHub CLI is not authenticated for git.example.com. Run `gh auth login --hostname git.example.com` and try again."
+        );
         Ok(())
     }
 
