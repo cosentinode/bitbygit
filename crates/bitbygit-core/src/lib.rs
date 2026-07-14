@@ -39,12 +39,39 @@ pub enum OperationRequest {
     Rebase {
         base: String,
     },
+    Recover(RecoveryRequest),
     OpenPullRequest {
         base: Option<String>,
     },
     PromptSequence {
         requests: Vec<OperationRequest>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRequest {
+    MergeContinue,
+    MergeAbort,
+    RebaseContinue,
+    RebaseAbort,
+    RebaseSkip,
+}
+
+impl RecoveryRequest {
+    pub const fn operation_label(self) -> &'static str {
+        match self {
+            Self::MergeContinue | Self::MergeAbort => "merge",
+            Self::RebaseContinue | Self::RebaseAbort | Self::RebaseSkip => "rebase",
+        }
+    }
+
+    pub const fn action_label(self) -> &'static str {
+        match self {
+            Self::MergeContinue | Self::RebaseContinue => "continue",
+            Self::MergeAbort | Self::RebaseAbort => "abort",
+            Self::RebaseSkip => "skip",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +93,11 @@ pub enum OperationKind {
     CreateBranch,
     MergeFastForward,
     Rebase,
+    MergeContinue,
+    MergeAbort,
+    RebaseContinue,
+    RebaseAbort,
+    RebaseSkip,
     OpenPullRequest,
 }
 
@@ -88,6 +120,11 @@ impl OperationKind {
             Self::CreateBranch => "create branch",
             Self::MergeFastForward => "merge",
             Self::Rebase => "rebase",
+            Self::MergeContinue => "merge continue",
+            Self::MergeAbort => "merge abort",
+            Self::RebaseContinue => "rebase continue",
+            Self::RebaseAbort => "rebase abort",
+            Self::RebaseSkip => "rebase skip",
             Self::OpenPullRequest => "open pull request",
         }
     }
@@ -111,6 +148,11 @@ impl OperationKind {
             Self::CreateBranch => "create_branch",
             Self::MergeFastForward => "merge_ff_only",
             Self::Rebase => "rebase",
+            Self::MergeContinue => "merge_continue",
+            Self::MergeAbort => "merge_abort",
+            Self::RebaseContinue => "rebase_continue",
+            Self::RebaseAbort => "rebase_abort",
+            Self::RebaseSkip => "rebase_skip",
             Self::OpenPullRequest => "open_pull_request",
         }
     }

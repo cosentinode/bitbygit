@@ -258,6 +258,24 @@ impl Git {
         ])
     }
 
+    pub fn recover_exact(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        expected_state: &RecoveryState,
+    ) -> Result<GitOutput, GitError> {
+        if self.recovery_state()? != *expected_state {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "{} {} is blocked because repository state changed after preview",
+                    operation.label(),
+                    action.label()
+                ),
+            });
+        }
+        self.recover(operation, action)
+    }
+
     pub fn push_current_branch(
         &self,
         remote: &str,
@@ -684,6 +702,20 @@ impl Git {
         let mut status = parse_status_bytes(&output.stdout)?;
         status.operation = self.repository_operation()?;
         Ok(status)
+    }
+
+    pub fn recovery_state(&self) -> Result<RecoveryState, GitError> {
+        Ok(RecoveryState {
+            operation: self.repository_operation()?,
+            head: self.head_target()?,
+            status: self
+                .run_raw(["status", "--porcelain=v2", "--branch", "-z"])?
+                .stdout,
+            index: self.run_raw(["ls-files", "--stage", "-z"])?.stdout,
+            worktree_diff: self
+                .run_raw(["diff", "--binary", "--no-ext-diff", "--"])?
+                .stdout,
+        })
     }
 
     pub fn stage_path(&self, path: &Path) -> Result<GitOutput, GitError> {
@@ -1344,6 +1376,15 @@ pub enum RecoveryAction {
     Continue,
     Abort,
     Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryState {
+    operation: Option<RepositoryOperation>,
+    head: HeadTarget,
+    status: Vec<u8>,
+    index: Vec<u8>,
+    worktree_diff: Vec<u8>,
 }
 
 impl RecoveryAction {
@@ -2418,6 +2459,24 @@ mod tests {
             merge_git.status()?.operation,
             Some(RepositoryOperation::Merge)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_state_changed_after_preview() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        repo.write("conflict.txt", "changed after preview\n")?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected changed recovery state to be rejected".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         Ok(())
     }
 

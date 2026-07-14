@@ -18,13 +18,14 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use bitbygit_core::{
     ConfirmationRequirement, OperationKind, OperationPlan, OperationRequest, OperationStep,
-    RiskLevel,
+    RecoveryRequest, RiskLevel,
     prompt_parser::{ParsedPrompt, parse_prompt},
 };
 use bitbygit_gh::{CreatePullRequest, GhError, GitHub};
 use bitbygit_git::{
     BranchInfo, BranchKind, BranchState, BranchTarget, ChangeKind, Git, GitError, GitOutput, Head,
-    HeadTarget, RepositoryOperation, StatusEntry, StatusEntryType,
+    HeadTarget, RecoveryAction as GitRecoveryAction, RecoveryState, RepositoryOperation,
+    StatusEntry, StatusEntryType,
 };
 use bitbygit_store::{AuditEntry, LocalStore, RepoId, StorePaths};
 
@@ -703,6 +704,9 @@ enum PendingPayload {
         base: BranchTarget,
         target: HeadTarget,
     },
+    Recovery {
+        state: RecoveryState,
+    },
     OpenPullRequest {
         branch: String,
         upstream: String,
@@ -1231,6 +1235,44 @@ fn rebase_plan(current: &str, base: &BranchTarget) -> OperationPlan {
     )
 }
 
+fn recovery_plan(request: RecoveryRequest) -> OperationPlan {
+    let operation = request.operation_label();
+    let action = request.action_label();
+    OperationPlan::new(
+        OperationRequest::Recover(request),
+        format!("{} {} plan", capitalize(operation), action),
+        vec![
+            OperationStep::new(
+                recovery_operation_kind(request),
+                RiskLevel::High,
+                format!("{action} active {operation}"),
+            )
+            .with_detail("block if repository state changes after preview"),
+        ],
+        format!(
+            "Explicit confirmation required: press uppercase Y to {action} the {operation} or n to cancel."
+        ),
+    )
+}
+
+fn recovery_operation_kind(request: RecoveryRequest) -> OperationKind {
+    match request {
+        RecoveryRequest::MergeContinue => OperationKind::MergeContinue,
+        RecoveryRequest::MergeAbort => OperationKind::MergeAbort,
+        RecoveryRequest::RebaseContinue => OperationKind::RebaseContinue,
+        RecoveryRequest::RebaseAbort => OperationKind::RebaseAbort,
+        RecoveryRequest::RebaseSkip => OperationKind::RebaseSkip,
+    }
+}
+
+fn capitalize(value: &str) -> String {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + characters.as_str())
+        .unwrap_or_default()
+}
+
 fn open_pull_request_plan(
     request: OperationRequest,
     remote: &str,
@@ -1448,6 +1490,15 @@ fn prompt_sequence_request_preview(
             RiskLevel::High,
             format!("rebase current branch onto {base}"),
         )),
+        OperationRequest::Recover(request) => Ok(PromptSequenceStepPreview::new(
+            recovery_operation_kind(*request),
+            RiskLevel::High,
+            format!(
+                "{} active {}",
+                request.action_label(),
+                request.operation_label()
+            ),
+        )),
         OperationRequest::OpenPullRequest { base } => {
             let preview = PromptSequenceStepPreview::new(
                 OperationKind::OpenPullRequest,
@@ -1595,6 +1646,7 @@ impl OperationPlanner {
     }
 
     fn plan_request(&self, request: OperationRequest) -> Result<PreparedOperation, String> {
+        self.ensure_conflict_mode_allowed(std::slice::from_ref(&request))?;
         match request {
             OperationRequest::RefreshStatus => {
                 Err("Refresh status is handled directly by the UI.".to_owned())
@@ -1633,6 +1685,7 @@ impl OperationPlanner {
             }
             OperationRequest::Merge { branch } => self.plan_merge(branch),
             OperationRequest::Rebase { base } => self.plan_rebase(base),
+            OperationRequest::Recover(request) => self.plan_recovery(request),
             OperationRequest::OpenPullRequest { base } => self.plan_open_pull_request(base),
             OperationRequest::PromptSequence { .. } => {
                 Err("Prompt sequences are handled by prompt submission.".to_owned())
@@ -1647,6 +1700,7 @@ impl OperationPlanner {
         if requests.len() < 2 {
             return Err("Prompt sequence requires at least two steps.".to_owned());
         }
+        self.ensure_conflict_mode_allowed(&requests)?;
         for (index, request) in requests.iter().enumerate() {
             prompt_sequence_request_preview(request).map_err(|error| {
                 format!("Prompt sequence step {} is blocked: {error}", index + 1)
@@ -1962,6 +2016,34 @@ impl OperationPlanner {
         ))
     }
 
+    fn plan_recovery(&self, request: RecoveryRequest) -> Result<PreparedOperation, String> {
+        let git = self.git();
+        let status = git
+            .status()
+            .map_err(|error| format!("Unable to prepare recovery plan: {error}"))?;
+        let operation = recovery_git_operation(request);
+        if status.operation != Some(operation) {
+            return Err(recovery_state_error(request, status.operation));
+        }
+        if matches!(
+            request,
+            RecoveryRequest::MergeContinue | RecoveryRequest::RebaseContinue
+        ) && !status.conflicted_files().is_empty()
+        {
+            return Err(format!(
+                "{} continue blocked: resolve and stage all conflicts first.",
+                capitalize(request.operation_label())
+            ));
+        }
+        let state = git
+            .recovery_state()
+            .map_err(|error| format!("Unable to snapshot recovery state: {error}"))?;
+        Ok(PreparedOperation::new(
+            recovery_plan(request),
+            ExecutionContext::from_payload(PendingPayload::Recovery { state }),
+        ))
+    }
+
     fn plan_open_pull_request(
         &self,
         requested_base: Option<String>,
@@ -2102,6 +2184,32 @@ impl OperationPlanner {
         branch_name(&status.branch).map_err(|error| error.replace("Operation", action))
     }
 
+    fn ensure_conflict_mode_allowed(&self, requests: &[OperationRequest]) -> Result<(), String> {
+        let operation = self
+            .git()
+            .status()
+            .map_err(|error| format!("Unable to validate conflict-mode policy: {error}"))?
+            .operation;
+
+        for request in requests {
+            if let OperationRequest::Recover(recovery) = request {
+                if operation != Some(recovery_git_operation(*recovery)) {
+                    return Err(recovery_state_error(*recovery, operation));
+                }
+            }
+            if let Some(active) = operation
+                && !conflict_mode_allows(request)
+            {
+                return Err(format!(
+                    "{} blocked: an active {} must be resolved first.",
+                    request_action_label(request),
+                    operation_label(active).to_ascii_lowercase()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn default_remote_name(&self) -> Option<String> {
         let remotes = self.git().remotes().ok()?;
         remotes
@@ -2134,6 +2242,85 @@ impl OperationPlanner {
                 repository.name_with_owner(),
             ),
         }
+    }
+}
+
+fn conflict_mode_allows(request: &OperationRequest) -> bool {
+    matches!(
+        request,
+        OperationRequest::RefreshStatus
+            | OperationRequest::ViewDiff { .. }
+            | OperationRequest::Fetch
+            | OperationRequest::StagePaths { .. }
+            | OperationRequest::UnstagePaths { .. }
+            | OperationRequest::StageAll
+            | OperationRequest::UnstageAll
+            | OperationRequest::Branches
+            | OperationRequest::Recover(_)
+    )
+}
+
+fn request_action_label(request: &OperationRequest) -> String {
+    match request {
+        OperationRequest::RefreshStatus => "Refresh status",
+        OperationRequest::ViewDiff { .. } => "View diff",
+        OperationRequest::Fetch => "Fetch",
+        OperationRequest::StagePaths { .. } => "Stage",
+        OperationRequest::UnstagePaths { .. } => "Unstage",
+        OperationRequest::StageAll => "Stage all",
+        OperationRequest::UnstageAll => "Unstage all",
+        OperationRequest::Commit { .. } => "Commit",
+        OperationRequest::Push => "Push",
+        OperationRequest::Pull { rebase: false } => "Pull",
+        OperationRequest::Pull { rebase: true } => "Pull rebase",
+        OperationRequest::Branches => "Branches",
+        OperationRequest::Checkout { .. } => "Checkout",
+        OperationRequest::CreateBranch { .. } => "Create branch",
+        OperationRequest::Merge { .. } => "Merge",
+        OperationRequest::Rebase { .. } => "Rebase",
+        OperationRequest::Recover(request) => {
+            return format!(
+                "{} {}",
+                capitalize(request.operation_label()),
+                request.action_label()
+            );
+        }
+        OperationRequest::OpenPullRequest { .. } => "Open pull request",
+        OperationRequest::PromptSequence { .. } => "Prompt sequence",
+    }
+    .to_owned()
+}
+
+fn recovery_git_operation(request: RecoveryRequest) -> RepositoryOperation {
+    match request {
+        RecoveryRequest::MergeContinue | RecoveryRequest::MergeAbort => RepositoryOperation::Merge,
+        RecoveryRequest::RebaseContinue
+        | RecoveryRequest::RebaseAbort
+        | RecoveryRequest::RebaseSkip => RepositoryOperation::Rebase,
+    }
+}
+
+fn recovery_git_action(request: RecoveryRequest) -> GitRecoveryAction {
+    match request {
+        RecoveryRequest::MergeContinue | RecoveryRequest::RebaseContinue => {
+            GitRecoveryAction::Continue
+        }
+        RecoveryRequest::MergeAbort | RecoveryRequest::RebaseAbort => GitRecoveryAction::Abort,
+        RecoveryRequest::RebaseSkip => GitRecoveryAction::Skip,
+    }
+}
+
+fn recovery_state_error(request: RecoveryRequest, active: Option<RepositoryOperation>) -> String {
+    let action = request_action_label(&OperationRequest::Recover(request));
+    match active {
+        Some(active) => format!(
+            "{action} blocked: an active {} does not match the requested recovery.",
+            operation_label(active).to_ascii_lowercase()
+        ),
+        None => format!(
+            "{action} blocked: no active {} exists.",
+            request.operation_label()
+        ),
     }
 }
 
@@ -2731,6 +2918,11 @@ impl PlanExecutor {
             OperationKind::CreateBranch => self.run_create_branch_step(plan, context, &git),
             OperationKind::MergeFastForward => self.run_merge_step(plan, context, &git),
             OperationKind::Rebase => self.run_rebase_step(plan, context, &git),
+            OperationKind::MergeContinue
+            | OperationKind::MergeAbort
+            | OperationKind::RebaseContinue
+            | OperationKind::RebaseAbort
+            | OperationKind::RebaseSkip => self.run_recovery_step(plan, step, context, &git),
             OperationKind::OpenPullRequest => self.run_open_pull_request_step(plan, context, &git),
             OperationKind::RefreshStatus | OperationKind::ViewDiff => {
                 Err(StepExecutionError::Unsupported(format!(
@@ -3010,6 +3202,33 @@ impl PlanExecutor {
             ));
         }
         git_output(git.rebase_onto(target, head))
+    }
+
+    fn run_recovery_step(
+        &self,
+        plan: &OperationPlan,
+        step: &OperationStep,
+        context: &ExecutionContext,
+        git: &Git,
+    ) -> StepRunResult {
+        let OperationRequest::Recover(request) = &plan.request else {
+            return Err(StepExecutionError::Unsupported(
+                "recovery step requires a typed recovery request".to_owned(),
+            ));
+        };
+        if step.kind != recovery_operation_kind(*request) {
+            return Err(StepExecutionError::Unsupported(
+                "recovery step request does not match its operation kind".to_owned(),
+            ));
+        }
+        let PendingPayload::Recovery { state } = typed_payload(context, step.kind)? else {
+            return Err(mismatched_context(step.kind));
+        };
+        git_output(git.recover_exact(
+            recovery_git_operation(*request),
+            recovery_git_action(*request),
+            state,
+        ))
     }
 
     fn run_open_pull_request_step(
@@ -3729,6 +3948,11 @@ fn should_show_git_output(kind: OperationKind) -> bool {
             | OperationKind::CreateBranch
             | OperationKind::MergeFastForward
             | OperationKind::Rebase
+            | OperationKind::MergeContinue
+            | OperationKind::MergeAbort
+            | OperationKind::RebaseContinue
+            | OperationKind::RebaseAbort
+            | OperationKind::RebaseSkip
     )
 }
 
@@ -4533,6 +4757,176 @@ mod tests {
             operation.context.payload,
             Some(PendingPayload::Rebase { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_plans_are_typed_high_risk_and_use_stable_audit_names() {
+        let cases = [
+            (
+                RecoveryRequest::MergeContinue,
+                OperationKind::MergeContinue,
+                "merge_continue",
+            ),
+            (
+                RecoveryRequest::MergeAbort,
+                OperationKind::MergeAbort,
+                "merge_abort",
+            ),
+            (
+                RecoveryRequest::RebaseContinue,
+                OperationKind::RebaseContinue,
+                "rebase_continue",
+            ),
+            (
+                RecoveryRequest::RebaseAbort,
+                OperationKind::RebaseAbort,
+                "rebase_abort",
+            ),
+            (
+                RecoveryRequest::RebaseSkip,
+                OperationKind::RebaseSkip,
+                "rebase_skip",
+            ),
+        ];
+
+        for (request, kind, audit_name) in cases {
+            let plan = recovery_plan(request);
+            assert_eq!(plan.request, OperationRequest::Recover(request));
+            assert_eq!(plan.steps[0].kind, kind);
+            assert_eq!(plan.confirmation.risk_level, RiskLevel::High);
+            assert_eq!(
+                plan.confirmation.requirement,
+                ConfirmationRequirement::ExplicitConfirmation
+            );
+            assert!(plan.confirmation.prompt.contains("uppercase Y"));
+            assert_eq!(kind.audit_operation(), audit_name);
+        }
+    }
+
+    #[test]
+    fn conflict_mode_blocks_risky_requests_before_sequence_side_effects()
+    -> Result<(), Box<dyn Error>> {
+        let repo = merge_conflict_repo("conflict-policy")?;
+        std::fs::write(repo.join("unrelated.txt"), "do not stage\n")?;
+        let planner = OperationPlanner::new(&repo);
+
+        assert!(planner.plan_request(OperationRequest::StageAll).is_ok());
+        assert!(planner.plan_request(OperationRequest::Branches).is_ok());
+        assert!(
+            planner
+                .plan_request(OperationRequest::RefreshStatus)
+                .is_err_and(|error| error.contains("handled directly by the UI"))
+        );
+        assert!(
+            planner
+                .plan_request(OperationRequest::ViewDiff {
+                    path: "conflict.txt".to_owned(),
+                })
+                .is_err_and(|error| error.contains("handled directly by the UI"))
+        );
+        assert!(
+            planner
+                .plan_request(OperationRequest::Push)
+                .is_err_and(|error| error.contains("active merge"))
+        );
+
+        let Err(error) =
+            planner.plan_prompt_sequence(vec![OperationRequest::StageAll, OperationRequest::Push])
+        else {
+            return Err("risky deferred step should block the whole sequence".into());
+        };
+        assert!(error.contains("active merge"));
+        assert!(
+            git_stdout(
+                &repo,
+                &["diff", "--cached", "--name-only", "--", "unrelated.txt"]
+            )?
+            .trim()
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_planner_matches_active_state_and_continue_prerequisites()
+    -> Result<(), Box<dyn Error>> {
+        let repo = merge_conflict_repo("recovery-planner")?;
+        let planner = OperationPlanner::new(repo);
+
+        let operation = planner
+            .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            operation.plan.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        assert!(matches!(
+            operation.context.payload,
+            Some(PendingPayload::Recovery { .. })
+        ));
+        assert!(
+            planner
+                .plan_request(OperationRequest::Recover(RecoveryRequest::MergeContinue))
+                .is_err_and(|error| error.contains("resolve and stage all conflicts"))
+        );
+        assert!(
+            planner
+                .plan_request(OperationRequest::Recover(RecoveryRequest::RebaseAbort))
+                .is_err_and(|error| error.contains("does not match"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_execution_revalidates_state_and_audits_safely() -> Result<(), Box<dyn Error>> {
+        let repo = merge_conflict_repo("recovery-revalidation")?;
+        let operation = OperationPlanner::new(&repo)
+            .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
+            .map_err(std::io::Error::other)?;
+        std::fs::write(repo.join("conflict.txt"), "changed after preview\n")?;
+        let paths = isolated_store_paths("recovery-revalidation-audit")?;
+
+        let execution = PlanExecutor::with_audit_paths(&repo, paths.clone())
+            .execute(&operation.plan, operation.context);
+
+        assert!(!execution.succeeded());
+        assert!(execution.message().contains("state changed after preview"));
+        assert_eq!(
+            Git::new(&repo).status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.operation == "merge_abort"));
+        assert_eq!(entries[1].result, "error");
+        assert!(
+            !entries[1]
+                .message
+                .contains(&repo.to_string_lossy().to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_recovery_executes_and_records_stable_audit_entries() -> Result<(), Box<dyn Error>>
+    {
+        let repo = merge_conflict_repo("recovery-audit")?;
+        let operation = OperationPlanner::new(&repo)
+            .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("recovery-audit")?;
+
+        let execution = PlanExecutor::with_audit_paths(&repo, paths.clone())
+            .execute(&operation.plan, operation.context);
+
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert_eq!(Git::new(&repo).status()?.operation, None);
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.operation == "merge_abort"));
+        assert_eq!(entries[0].message, "pending");
+        assert_eq!(entries[1].message, "completed");
         Ok(())
     }
 
@@ -6190,6 +6584,35 @@ mod tests {
             .into());
         }
         Ok(root)
+    }
+
+    fn merge_conflict_repo(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let repo = isolated_git_repo(name)?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("conflict.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "conflict.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "base"])?;
+        let base = git_stdout(&repo, &["branch", "--show-current"])?;
+        git_stdout(&repo, &["checkout", "-b", "conflicting"])?;
+        std::fs::write(repo.join("conflict.txt"), "other\n")?;
+        git_stdout(&repo, &["commit", "-am", "other"])?;
+        git_stdout(&repo, &["checkout", base.trim()])?;
+        std::fs::write(repo.join("conflict.txt"), "current\n")?;
+        git_stdout(&repo, &["commit", "-am", "current"])?;
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["merge", "conflicting"])
+            .output()?;
+        if output.status.success() {
+            return Err(std::io::Error::other("expected merge conflict").into());
+        }
+        assert_eq!(
+            Git::new(&repo).status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
+        Ok(repo)
     }
 
     fn isolated_bare_git_repo(name: &str) -> Result<PathBuf, Box<dyn Error>> {
