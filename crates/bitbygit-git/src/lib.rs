@@ -547,14 +547,14 @@ impl Git {
     }
 
     fn repository_operation(&self) -> Result<Option<RepositoryOperation>, GitError> {
-        if self.git_path("MERGE_HEAD")?.exists() {
-            return Ok(Some(RepositoryOperation::Merge));
-        }
         let rebase_apply = self.git_path("rebase-apply")?;
         if self.git_path("rebase-merge")?.exists()
             || (rebase_apply.exists() && !rebase_apply.join("applying").exists())
         {
             return Ok(Some(RepositoryOperation::Rebase));
+        }
+        if self.git_path("MERGE_HEAD")?.exists() {
+            return Ok(Some(RepositoryOperation::Merge));
         }
         Ok(None)
     }
@@ -972,16 +972,24 @@ impl Git {
                 source,
             })?;
 
-        let stdout = String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
-            args: args.clone(),
-            stream: OutputStream::Stdout,
-            source,
-        })?;
-        let stderr = String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
-            args: args.clone(),
-            stream: OutputStream::Stderr,
-            source,
-        })?;
+        let stdout = if disable_editor && output.status.success() {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        } else {
+            String::from_utf8(output.stdout).map_err(|source| GitError::Utf8 {
+                args: args.clone(),
+                stream: OutputStream::Stdout,
+                source,
+            })?
+        };
+        let stderr = if disable_editor && output.status.success() {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        } else {
+            String::from_utf8(output.stderr).map_err(|source| GitError::Utf8 {
+                args: args.clone(),
+                stream: OutputStream::Stderr,
+                source,
+            })?
+        };
 
         if !output.status.success() {
             return Err(GitError::GitFailed {
@@ -2330,6 +2338,46 @@ mod tests {
     }
 
     #[test]
+    fn rebase_merge_step_recovery_preserves_rebase_identity() -> Result<(), Box<dyn Error>> {
+        let (abort_repo, original_head) = prepare_rebase_merge_conflict()?;
+        let abort_git = Git::new(abort_repo.path());
+
+        let Err(error) = abort_git.recover(RepositoryOperation::Merge, RecoveryAction::Abort)
+        else {
+            return Err("expected nested merge recovery to be rejected".into());
+        };
+        assert!(error.to_string().contains("rebase operation is active"));
+        assert!(abort_git.git_path("rebase-merge")?.exists());
+        assert!(abort_git.git_path("MERGE_HEAD")?.exists());
+
+        abort_git.recover(RepositoryOperation::Rebase, RecoveryAction::Abort)?;
+        assert_eq!(abort_git.status()?.operation, None);
+        assert_eq!(
+            abort_repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+
+        let (continue_repo, _original_head) = prepare_rebase_merge_conflict()?;
+        let continue_git = Git::new(continue_repo.path());
+        let Err(error) =
+            continue_git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue)
+        else {
+            return Err("expected unresolved nested merge to block continue".into());
+        };
+        assert!(error.to_string().contains("unresolved conflicts"));
+        continue_repo.write("conflict.txt", "resolved again\n")?;
+        continue_repo.run(["add", "conflict.txt"])?;
+        continue_git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue)?;
+        assert_eq!(continue_git.status()?.operation, None);
+
+        let (skip_repo, _original_head) = prepare_rebase_merge_conflict()?;
+        let skip_git = Git::new(skip_repo.path());
+        skip_git.recover(RepositoryOperation::Rebase, RecoveryAction::Skip)?;
+        assert_eq!(skip_git.status()?.operation, None);
+        Ok(())
+    }
+
+    #[test]
     fn recovery_rejects_merge_skip_absent_state_and_mismatched_state() -> Result<(), Box<dyn Error>>
     {
         let clean = initialized_repo()?;
@@ -2409,6 +2457,29 @@ mod tests {
         assert!(repo.path().join("hook-ran").exists());
         assert!(repo.path().join("signing-ran").exists());
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_recovery_preserves_non_utf8_hook_output() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let hook = repo.path().join(".git").join("hooks").join("commit-msg");
+        fs::write(&hook, "#!/bin/sh\nprintf '\\377'\n")?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(repo.path());
+
+        let output = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue)?;
+
+        assert!(format!("{}{}", output.stdout, output.stderr).contains('\u{fffd}'));
+        assert_eq!(git.status()?.operation, None);
+        repo.run(["rev-parse", "--verify", "HEAD^2"])?;
         Ok(())
     }
 
@@ -3275,6 +3346,36 @@ mod tests {
             Some(RepositoryOperation::Rebase)
         );
         Ok(repo)
+    }
+
+    fn prepare_rebase_merge_conflict() -> Result<(TempRepo, String), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("conflict.txt", "topic\n")?;
+        repo.run(["commit", "-am", "topic"])?;
+        repo.run(["switch", "-c", "side", "main"])?;
+        repo.write("conflict.txt", "side\n")?;
+        repo.run(["commit", "-am", "side"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["merge", "--no-ff", "side"])?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        repo.run(["commit", "-m", "merge side"])?;
+        let original_head = repo.git_stdout(["rev-parse", "HEAD"])?.trim().to_owned();
+        repo.run(["switch", "main"])?;
+        repo.write("upstream.txt", "upstream\n")?;
+        repo.run(["add", "upstream.txt"])?;
+        repo.run(["commit", "-m", "upstream"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "--rebase-merges", "main"])?;
+        let git = Git::new(repo.path());
+        assert!(git.git_path("rebase-merge")?.exists());
+        assert!(git.git_path("MERGE_HEAD")?.exists());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok((repo, original_head))
     }
 
     struct TempRepo {
