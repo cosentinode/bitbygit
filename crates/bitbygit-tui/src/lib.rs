@@ -1444,8 +1444,20 @@ fn prompt_sequence_request_preview(
             RiskLevel::High,
             format!("rebase current branch onto {base}"),
         )),
-        OperationRequest::OpenPullRequest { .. } => {
-            Err("open pull request is only available as a single prompt".to_owned())
+        OperationRequest::OpenPullRequest { base } => {
+            let preview = PromptSequenceStepPreview::new(
+                OperationKind::OpenPullRequest,
+                RiskLevel::Medium,
+                "open or surface pull request",
+            )
+            .with_detail("provider: GitHub")
+            .with_detail(
+                "re-plan branch, remote, base, and pull request state immediately before this step",
+            );
+            Ok(match base {
+                Some(base) => preview.with_detail(format!("base: {base}")),
+                None => preview.with_detail("base: repository default (resolved after push)"),
+            })
         }
         OperationRequest::RefreshStatus
         | OperationRequest::ViewDiff { .. }
@@ -3171,6 +3183,9 @@ impl PlanExecutor {
 struct PromptSequenceExecutor {
     repo_root: PathBuf,
     audit: AuditDestination,
+    github_executable: Option<PathBuf>,
+    #[cfg(test)]
+    ssh_executable: Option<PathBuf>,
 }
 
 impl PromptSequenceExecutor {
@@ -3178,6 +3193,9 @@ impl PromptSequenceExecutor {
         Self {
             repo_root: current_dir(),
             audit: AuditDestination::Environment,
+            github_executable: None,
+            #[cfg(test)]
+            ssh_executable: None,
         }
     }
 
@@ -3186,6 +3204,23 @@ impl PromptSequenceExecutor {
         Self {
             repo_root: repo_root.into(),
             audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            ssh_executable: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_audit_paths_and_tools(
+        repo_root: impl Into<PathBuf>,
+        paths: StorePaths,
+        github_executable: impl Into<PathBuf>,
+        ssh_executable: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+            audit: AuditDestination::Paths(paths),
+            github_executable: Some(github_executable.into()),
+            ssh_executable: Some(ssh_executable.into()),
         }
     }
 
@@ -3193,15 +3228,15 @@ impl PromptSequenceExecutor {
         let total_steps = sequence.total_steps();
         let planner = OperationPlanner {
             repo_root: self.repo_root.clone(),
-            github_executable: None,
+            github_executable: self.github_executable.clone(),
             #[cfg(test)]
-            ssh_executable: None,
+            ssh_executable: self.ssh_executable.clone(),
         };
         let executor = PlanExecutor {
             repo_root: self.repo_root.clone(),
             audit: self.audit.clone(),
             #[cfg(test)]
-            ssh_executable: None,
+            ssh_executable: self.ssh_executable.clone(),
         };
         let mut step_results = Vec::with_capacity(total_steps);
 
@@ -4144,8 +4179,8 @@ mod tests {
     }
 
     #[test]
-    fn prompt_sequence_stops_before_push_when_commit_execution_fails() -> Result<(), Box<dyn Error>>
-    {
+    fn prompt_sequence_stops_before_push_and_pr_when_commit_execution_fails()
+    -> Result<(), Box<dyn Error>> {
         let repo = isolated_git_repo("prompt-sequence-commit-fails")?;
         configure_git_identity(&repo)?;
         std::fs::write(repo.join("file.txt"), "hello\n")?;
@@ -4156,26 +4191,74 @@ mod tests {
                     message: "ship staged".to_owned(),
                 },
                 OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
             ])
             .map_err(std::io::Error::other)?;
         std::fs::write(repo.join("file.txt"), "changed after preview\n")?;
         git_stdout(&repo, &["add", "file.txt"])?;
         let paths = isolated_store_paths("prompt-sequence-commit-fails-audit")?;
+        let fake_gh = fake_gh("prompt-sequence-commit-fails", false)?;
 
-        let result = PromptSequenceExecutor::with_audit_paths(&repo, paths.clone())
-            .execute(sequence.sequence);
+        let result = PromptSequenceExecutor::with_audit_paths_and_tools(
+            &repo,
+            paths.clone(),
+            &fake_gh,
+            test_ssh_command()?,
+        )
+        .execute(sequence.sequence);
 
         assert!(
             result
                 .message()
-                .contains("Prompt sequence stopped after step 1 of 2.")
+                .contains("Prompt sequence stopped after step 1 of 3.")
         );
+        assert!(!fake_gh.with_file_name("invocations").exists());
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         let operations = entries
             .iter()
             .map(|entry| entry.operation.as_str())
             .collect::<Vec<_>>();
         assert_eq!(operations, vec!["commit", "commit"]);
+        assert_eq!(entries[1].result, "error");
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_sequence_stops_before_pr_when_push_fails() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("prompt-sequence-push-fails")?;
+        let fake_gh = fake_gh("prompt-sequence-push-fails", false)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        let remote = git_stdout(&repo, &["config", "--get", "remote.origin.testbare"])?;
+        std::fs::remove_dir_all(remote.trim())?;
+        let paths = isolated_store_paths("prompt-sequence-push-fails-audit")?;
+
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        assert!(
+            result
+                .message()
+                .contains("Prompt sequence stopped after step 1 of 2.")
+        );
+        assert!(!fake_gh.with_file_name("invocations").exists());
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        let operations = entries
+            .iter()
+            .map(|entry| entry.operation.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(operations, vec!["push", "push"]);
         assert_eq!(entries[1].result, "error");
         Ok(())
     }
@@ -4225,6 +4308,153 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(operations, vec!["commit", "commit", "push", "push"]);
         assert!(entries.iter().all(|entry| entry.result != "error"));
+        Ok(())
+    }
+
+    #[test]
+    fn commit_push_pr_sequence_replans_and_creates_pr() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("prompt-sequence-open-pr")?;
+        let fake_gh = fake_gh("prompt-sequence-open-pr", false)?;
+        let ssh = test_ssh_command()?;
+        std::fs::write(repo.join("file.txt"), "ready for review\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(ssh.clone()),
+        };
+
+        let ParsedPrompt::Sequence(requests) =
+            parse_prompt("commit -m \"ship review\" and push and open pr")?
+        else {
+            return Err(std::io::Error::other("expected prompt sequence").into());
+        };
+        let sequence = planner
+            .plan_prompt_sequence(requests)
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(preview.contains("1. commit 1 staged file(s)"));
+        assert!(preview.contains("2. push current branch"));
+        assert!(preview.contains("3. open or surface pull request"));
+        assert!(preview.contains("base: repository default (resolved after push)"));
+        assert!(preview.contains("planned after step 2 succeeds"));
+        let paths = isolated_store_paths("prompt-sequence-open-pr-audit")?;
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(message.contains("Prompt sequence completed 3 step(s)."));
+        assert!(message.contains("Pull request created: https://github.com/octo/repo/pull/43"));
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("pr:create"));
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        let operations = entries
+            .iter()
+            .map(|entry| entry.operation.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            vec![
+                "commit",
+                "commit",
+                "push",
+                "push",
+                "open_pull_request",
+                "open_pull_request"
+            ]
+        );
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.operation == "open_pull_request")
+                .all(|entry| !entry.message.contains("pull/43")
+                    && !entry.message.contains("feature/open-pr"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_gh_after_push_stops_pr_with_setup_guidance() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("prompt-sequence-missing-gh")?;
+        let ssh = test_ssh_command()?;
+        std::fs::write(repo.join("file.txt"), "push before setup check\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "ahead"])?;
+        let missing_gh = repo.join("missing-gh");
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(missing_gh.clone()),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("prompt-sequence-missing-gh-audit")?;
+
+        let result = PromptSequenceExecutor::with_audit_paths_and_tools(
+            &repo,
+            paths.clone(),
+            missing_gh,
+            ssh.clone(),
+        )
+        .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(message.contains("Prompt sequence stopped before step 2 of 2."));
+        assert!(message.contains(bitbygit_gh::INSTALL_GH_GUIDANCE));
+        assert_remote_matches_head(&repo, &ssh)?;
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.operation == "push"));
+        Ok(())
+    }
+
+    #[test]
+    fn gh_auth_failure_after_push_stops_pr_with_setup_guidance() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("prompt-sequence-gh-auth")?;
+        let fake_gh = fake_gh("prompt-sequence-gh-auth", false)?;
+        std::fs::write(fake_gh.with_file_name("auth-fails"), "")?;
+        let ssh = test_ssh_command()?;
+        std::fs::write(repo.join("file.txt"), "push before auth check\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "ahead"])?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("prompt-sequence-gh-auth-audit")?;
+
+        let result = PromptSequenceExecutor::with_audit_paths_and_tools(
+            &repo,
+            paths.clone(),
+            &fake_gh,
+            ssh.clone(),
+        )
+        .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(message.contains("Prompt sequence stopped before step 2 of 2."));
+        assert!(message.contains("GitHub CLI is not authenticated for github.com"));
+        assert!(message.contains("gh auth login --hostname github.com"));
+        assert_remote_matches_head(&repo, &ssh)?;
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("auth:status"));
+        assert!(!invocations.contains("pr:create"));
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.operation == "push"));
         Ok(())
     }
 
@@ -6012,6 +6242,22 @@ mod tests {
         Ok(String::from_utf8(output.stdout)?)
     }
 
+    fn assert_remote_matches_head(
+        repo: &std::path::Path,
+        ssh_executable: &std::path::Path,
+    ) -> Result<(), Box<dyn Error>> {
+        let branch = git_stdout(repo, &["branch", "--show-current"])?;
+        let remote_ref = format!("refs/heads/{}", branch.trim());
+        let remote = git_stdout_with_ssh(
+            repo,
+            &["ls-remote", "origin", remote_ref.as_str()],
+            ssh_executable,
+        )?;
+        let head = git_stdout(repo, &["rev-parse", "HEAD"])?;
+        assert!(remote.starts_with(head.trim()));
+        Ok(())
+    }
+
     fn test_ssh_command() -> Result<PathBuf, Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt;
         use std::sync::OnceLock;
@@ -6060,6 +6306,7 @@ mod tests {
         let invocations = root.join("invocations");
         let base_missing = root.join("base-missing");
         let head_missing = root.join("head-missing");
+        let auth_fails = root.join("auth-fails");
         let create_response = if create_succeeds {
             "printf 'https://%s/%s/pull/43\\n' \"$GH_HOST\" \"$repository\" ;;"
         } else {
@@ -6068,8 +6315,9 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\nif [ \"$repository\" = octo/old-repo ]; then repository=octo/repo; fi\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) exit 0 ;;\nrepo:view) case \"$*\" in *--repo*) exit 1 ;; esac; printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\napi:--method)\n  case \"$6\" in\n    */git/matching-refs/heads/*)\n      ref=${{6##*/heads/}}\n      ref=$(printf '%s' \"$ref\" | sed 's/%2F/\\//g')\n      if [ \"$ref\" = missing ] || {{ [ \"$ref\" = main ] && [ -f '{}' ]; }} || {{ [ \"$ref\" != main ] && [ \"$ref\" != release ] && [ -f '{}' ]; }}; then\n        printf '%s\\n' '[[]]'\n      else\n        oid=$(git rev-parse HEAD)\n        printf '[[{{\"ref\":\"refs/heads/%s\",\"object\":{{\"sha\":\"%s\"}}}}]]\\n' \"$ref\" \"$oid\"\n      fi ;;\n    */pulls) case \"$*\" in *--head*|*'--limit 0'*) exit 1 ;; esac; printf '%s\\n' '[{}]' ;;\n    *) exit 1 ;;\n  esac ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
+                "#!/bin/sh\nprintf '%s:%s %s\\n' \"$1\" \"$2\" \"$*\" >> '{}'\nrepository=octo/repo\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    github.com/*/*) repository=${{arg#github.com/}} ;;\n  esac\ndone\nif [ \"$repository\" = octo/old-repo ]; then repository=octo/repo; fi\ncase \"$1:$2\" in\n--version:*) exit 0 ;;\nauth:status) [ ! -f '{}' ] ;;\nrepo:view) case \"$*\" in *--repo*) exit 1 ;; esac; printf '{{\"nameWithOwner\":\"%s\",\"defaultBranchRef\":{{\"name\":\"main\"}}}}\\n' \"$repository\" ;;\napi:--method)\n  case \"$6\" in\n    */git/matching-refs/heads/*)\n      ref=${{6##*/heads/}}\n      ref=$(printf '%s' \"$ref\" | sed 's/%2F/\\//g')\n      if [ \"$ref\" = missing ] || {{ [ \"$ref\" = main ] && [ -f '{}' ]; }} || {{ [ \"$ref\" != main ] && [ \"$ref\" != release ] && [ -f '{}' ]; }}; then\n        printf '%s\\n' '[[]]'\n      else\n        oid=$(git rev-parse HEAD)\n        printf '[[{{\"ref\":\"refs/heads/%s\",\"object\":{{\"sha\":\"%s\"}}}}]]\\n' \"$ref\" \"$oid\"\n      fi ;;\n    */pulls) case \"$*\" in *--head*|*'--limit 0'*) exit 1 ;; esac; printf '%s\\n' '[{}]' ;;\n    *) exit 1 ;;\n  esac ;;\npr:create) {}\n*) exit 1 ;;\nesac\n",
                 invocations.display(),
+                auth_fails.display(),
                 base_missing.display(),
                 head_missing.display(),
                 pull_requests,
