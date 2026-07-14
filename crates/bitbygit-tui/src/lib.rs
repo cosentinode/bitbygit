@@ -3495,6 +3495,19 @@ impl PromptSequenceExecutor {
         };
         let mut step_results = Vec::with_capacity(total_steps);
 
+        let requests = std::iter::once(&sequence.first.plan.request)
+            .chain(sequence.remaining_requests.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = validate_conflict_mode(&executor.git(), &requests) {
+            step_results.push(PromptSequenceStepResult::planning_failed(
+                1,
+                prompt_sequence_request_title(&sequence.first.plan.request),
+                error,
+            ));
+            return PromptSequenceExecutionResult::new(total_steps, step_results);
+        }
+
         let first = Self::execute_prepared_step(&executor, 1, sequence.first);
         let first_succeeded = first.succeeded;
         step_results.push(first);
@@ -4910,6 +4923,79 @@ mod tests {
         assert_eq!(
             git_stdout(&remote, &["rev-parse", remote_ref.as_str()])?,
             remote_before
+        );
+        assert!(LocalStore::open(paths)?.list_audit_entries()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn queued_sequence_revalidates_deferred_requests_before_first_side_effect()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("queued-deferred-conflict-policy")?;
+        let remote = isolated_bare_git_repo("queued-deferred-conflict-policy-remote")?;
+        configure_git_identity(&repo)?;
+        configure_git_identity(&remote)?;
+        std::fs::write(repo.join("conflict.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "conflict.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "base"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        git_stdout(
+            &repo,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )?;
+        git_stdout(&repo, &["push", "-u", "origin", branch.as_str()])?;
+        let remote_ref = format!("refs/heads/{branch}");
+        let tracking_ref = format!("refs/remotes/origin/{branch}");
+        let tracking_before = git_stdout(&repo, &["rev-parse", tracking_ref.as_str()])?;
+
+        git_stdout(&repo, &["checkout", "-b", "conflicting"])?;
+        std::fs::write(repo.join("conflict.txt"), "other\n")?;
+        git_stdout(&repo, &["commit", "-am", "other"])?;
+        git_stdout(&repo, &["checkout", branch.as_str()])?;
+        std::fs::write(repo.join("conflict.txt"), "current\n")?;
+        git_stdout(&repo, &["commit", "-am", "current"])?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Push])
+            .map_err(std::io::Error::other)?;
+
+        let remote_tree = git_stdout(&remote, &["rev-parse", "HEAD^{tree}"])?;
+        let remote_head = git_stdout(&remote, &["rev-parse", remote_ref.as_str()])?;
+        let remote_update = git_stdout(
+            &remote,
+            &[
+                "commit-tree",
+                remote_tree.trim(),
+                "-p",
+                remote_head.trim(),
+                "-m",
+                "remote update",
+            ],
+        )?;
+        git_stdout(
+            &remote,
+            &[
+                "update-ref",
+                remote_ref.as_str(),
+                remote_update.trim(),
+                remote_head.trim(),
+            ],
+        )?;
+        let merge = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["merge", "conflicting"])
+            .output()?;
+        assert!(!merge.status.success());
+        let paths = isolated_store_paths("queued-deferred-conflict-policy-audit")?;
+
+        let result = PromptSequenceExecutor::with_audit_paths(&repo, paths.clone())
+            .execute(sequence.sequence);
+
+        assert!(result.message().contains("active merge"));
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", tracking_ref.as_str()])?,
+            tracking_before
         );
         assert!(LocalStore::open(paths)?.list_audit_entries()?.is_empty());
         Ok(())
