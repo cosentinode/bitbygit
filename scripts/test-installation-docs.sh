@@ -5,6 +5,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 docs="${root}/docs/installation.md"
 workflow="${root}/.github/workflows/release.yml"
+ci_workflow="${root}/.github/workflows/ci.yml"
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 
@@ -27,6 +28,7 @@ extract_block() {
 
 docs_text="$(<"${docs}")"
 workflow_text="$(<"${workflow}")"
+ci_workflow_text="$(<"${ci_workflow}")"
 workspace_version="$(perl -ne '
   $workspace = 1 if /^\[workspace\.package\]$/;
   if ($workspace && /^version = "([^"]+)"$/) { print $1; exit }
@@ -46,6 +48,10 @@ done < <(perl -0777 -ne '
 [[ "${#release_artifacts[@]}" -eq 4 ]] || fail "expected four release artifacts"
 for artifact in "${release_artifacts[@]}"; do
   [[ "${docs_text}" == *"${artifact}"* ]] || fail "missing release artifact ${artifact}"
+done
+[[ "${ci_workflow_text}" == *"toolchain: 1.85.0"* ]] || fail "CI does not pin the documented minimum Rust version"
+for target in x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+  [[ "${ci_workflow_text}" == *"target: ${target}"* ]] || fail "Rust 1.85 CI does not build ${target}"
 done
 [[ "${workflow_text}" == *'package="bitbygit-${version}-${{ matrix.target }}"'* ]] || fail "release package directory contract changed"
 [[ "${docs_text}" == *'PACKAGE="bitbygit-${VERSION}-${TARGET}"'* ]] || fail "Bash package directory does not match release layout"
@@ -178,10 +184,52 @@ extract_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
 )
 [[ ! -e "${failure_dir}/side-effects" ]] || fail "${failure_heading} extracted or installed after checksum failure"
 
-[[ "${docs_text}" == *'git clone --branch "v${VERSION}" --depth 1'* ]] || fail "Bash source build is not pinned to the selected tag"
-[[ "${docs_text}" == *'git clone --branch "v$Version" --depth 1'* ]] || fail "PowerShell source build is not pinned to the selected tag"
+[[ "${docs_text}" == *'git -C bitbygit fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${TAG}:${TAG}"'* ]] || fail "Bash source build does not fetch the exact selected tag"
+[[ "${docs_text}" == *'git -C bitbygit checkout --detach "${tag_commit}"'* ]] || fail "Bash source build does not detach at the selected tag"
+[[ "${docs_text}" == *'git -C $SourceDir fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${Tag}:${Tag}"'* ]] || fail "PowerShell source build does not fetch the exact selected tag"
+[[ "${docs_text}" == *'git -C $SourceDir checkout --detach $TagCommit'* ]] || fail "PowerShell source build does not detach at the selected tag"
 [[ "${docs_text}" == *'"${HOME}/.local/bin/bitbygit" --version'* ]] || fail "Unix installation does not validate the installed path"
 [[ "${docs_text}" == *'& $InstalledBinary --version'* ]] || fail "Windows installation does not validate the installed path"
+
+source_remote="${tmp}/source-remote.git"
+source_seed="${tmp}/source-seed"
+git init --bare --quiet "${source_remote}"
+git init --quiet "${source_seed}"
+git -C "${source_seed}" config user.email validator@example.invalid
+git -C "${source_seed}" config user.name "Installation validator"
+mkdir -p "${source_seed}/target/release"
+printf '#!/usr/bin/env sh\nprintf '\''bitbygit %s\\n'\''\n' "${workspace_version}" > "${source_seed}/target/release/bitbygit"
+chmod +x "${source_seed}/target/release/bitbygit"
+git -C "${source_seed}" add -f target/release/bitbygit
+git -C "${source_seed}" commit --quiet -m "tagged source"
+git -C "${source_seed}" tag -a "v${workspace_version}" -m "release ${workspace_version}"
+printf '#!/usr/bin/env sh\nprintf '\''bitbygit 9.9.9\\n'\''\n' > "${source_seed}/target/release/bitbygit"
+git -C "${source_seed}" commit --quiet -am "same-named branch"
+git -C "${source_seed}" branch "v${workspace_version}"
+git -C "${source_seed}" push --quiet "${source_remote}" \
+  "refs/heads/v${workspace_version}:refs/heads/v${workspace_version}" \
+  "refs/tags/v${workspace_version}:refs/tags/v${workspace_version}"
+
+source_dir="${tmp}/source-install"
+mkdir -p "${source_dir}/home" "${source_dir}/mock-bin"
+cat > "${source_dir}/mock-bin/cargo" <<'MOCK'
+#!/usr/bin/env sh
+exit 0
+MOCK
+chmod +x "${source_dir}/mock-bin/cargo"
+source_snippet="$(extract_block "Build from source" bash)"
+source_snippet="${source_snippet/https:\/\/github.com\/cosentinode\/bitbygit.git/${source_remote}}"
+printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
+(
+  cd "${source_dir}"
+  export HOME="${source_dir}/home"
+  export PATH="${source_dir}/mock-bin:${PATH}"
+  source "${source_dir}/snippet.bash" || fail "Bash source block failed with colliding branch and tag names"
+  tag_commit="$(git --git-dir="${source_remote}" rev-parse "refs/tags/v${workspace_version}^{commit}")"
+  branch_commit="$(git --git-dir="${source_remote}" rev-parse "refs/heads/v${workspace_version}")"
+  head_commit="$(git -C bitbygit rev-parse HEAD)"
+  [[ "${head_commit}" == "${tag_commit}" && "${head_commit}" != "${branch_commit}" ]] || fail "Bash source block did not check out the exact tag object"
+)
 
 check_links() {
   local markdown="$1"

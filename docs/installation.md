@@ -135,7 +135,8 @@ if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
 }
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (($UserPath -split ";") -notcontains $InstallDir) {
-    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
+    $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
+    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
 }
 $env:Path = "$InstallDir;$env:Path"
 }
@@ -165,7 +166,13 @@ On Linux or macOS, run:
 ```bash
 bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 VERSION=0.1.0
-git clone --branch "v${VERSION}" --depth 1 https://github.com/cosentinode/bitbygit.git
+TAG="refs/tags/v${VERSION}"
+mkdir bitbygit
+git -C bitbygit init
+git -C bitbygit fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${TAG}:${TAG}"
+tag_commit="$(git -C bitbygit rev-parse --verify "${TAG}^{commit}")"
+git -C bitbygit checkout --detach "${tag_commit}"
+[[ "$(git -C bitbygit rev-parse --verify HEAD)" == "${tag_commit}" ]]
 cd bitbygit
 cargo build --locked --release -p bitbygit
 built_output="$(target/release/bitbygit --version)"
@@ -192,9 +199,19 @@ On Windows, run in PowerShell:
 $ErrorActionPreference = "Stop"
 
 $Version = "0.1.0"
+$Tag = "refs/tags/v$Version"
 $SourceDir = Join-Path (Get-Location) "bitbygit"
-git clone --branch "v$Version" --depth 1 https://github.com/cosentinode/bitbygit.git $SourceDir
-if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+New-Item -ItemType Directory -Path $SourceDir | Out-Null
+git -C $SourceDir init
+if ($LASTEXITCODE -ne 0) { throw "git init failed" }
+git -C $SourceDir fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${Tag}:${Tag}"
+if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+$TagCommit = git -C $SourceDir rev-parse --verify "${Tag}^{commit}"
+if ($LASTEXITCODE -ne 0) { throw "release tag verification failed" }
+git -C $SourceDir checkout --detach $TagCommit
+if ($LASTEXITCODE -ne 0) { throw "release tag checkout failed" }
+$HeadCommit = git -C $SourceDir rev-parse --verify HEAD
+if ($LASTEXITCODE -ne 0 -or $HeadCommit -ne $TagCommit) { throw "release tag checkout verification failed" }
 cargo build --manifest-path (Join-Path $SourceDir "Cargo.toml") --locked --release -p bitbygit
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 $BuiltBinary = Join-Path $SourceDir "target\release\bitbygit.exe"
@@ -213,7 +230,8 @@ if ($LASTEXITCODE -ne 0 -or $InstalledOutput -ne "bitbygit $Version") {
 }
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (($UserPath -split ";") -notcontains $InstallDir) {
-    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
+    $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
+    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
 }
 $env:Path = "$InstallDir;$env:Path"
 }

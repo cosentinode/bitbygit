@@ -13,8 +13,20 @@ permissions:
 
 jobs:
   minimum-rust:
-    name: Rust 1.85 source build
-    runs-on: ubuntu-latest
+    name: Rust 1.85 source build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
@@ -24,9 +36,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.85.0
+          targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --locked --release -p bitbygit
+        run: cargo build --locked --release -p bitbygit --target ${{ matrix.target }}
 
   rust:
     name: Rust

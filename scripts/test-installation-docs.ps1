@@ -18,13 +18,13 @@ function Get-Block([string] $Heading, [string] $Language) {
 
 function ConvertTo-IsolatedPathBlock([string] $Block) {
     $GetUserPath = 'GetEnvironmentVariable("Path", "User")'
-    $SetUserPath = 'SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")'
+    $SetUserPath = '[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")'
     if (-not $Block.Contains($GetUserPath) -or -not $Block.Contains($SetUserPath)) {
         Fail "Windows block does not contain the expected user PATH operations"
     }
 
-    $Isolated = $Block.Replace($GetUserPath, 'GetEnvironmentVariable("Path", "Process")')
-    $Isolated = $Isolated.Replace($SetUserPath, 'SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "Process")')
+    $Isolated = $Block.Replace($GetUserPath, 'GetEnvironmentVariable("BITBYGIT_TEST_USER_PATH", "Process")')
+    $Isolated = $Isolated.Replace($SetUserPath, '$script:CapturedUserPath = $NewUserPath')
     if ($Isolated.Contains('"User"')) {
         Fail "Windows block still accesses persistent user PATH"
     }
@@ -38,6 +38,10 @@ if (-not $VersionMatch.Success) { Fail "workspace version was not found" }
 $Version = $VersionMatch.Groups[1].Value
 if (-not $DocsText.Contains("`$Version = `"$Version`"")) {
     Fail "PowerShell examples do not use workspace version $Version"
+}
+$EmptyPathGuard = '$NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }'
+if ([regex]::Matches($DocsText, [regex]::Escape($EmptyPathGuard)).Count -ne 2) {
+    Fail "Windows examples do not handle empty user PATH values consistently"
 }
 
 foreach ($Match in [regex]::Matches($DocsText, '(?ms)^```powershell\r?\n(.*?)^```')) {
@@ -59,7 +63,9 @@ if (-not $InstallBlock.Contains('& $InstalledBinary --version')) {
     Fail "Windows installation does not validate the installed path"
 }
 $SourceBlock = ConvertTo-IsolatedPathBlock (Get-Block "Build from source" "powershell")
-if (-not $SourceBlock.Contains('git clone --branch "v$Version" --depth 1')) {
+if (-not $SourceBlock.Contains('git -C $SourceDir fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${Tag}:${Tag}"') -or
+    -not $SourceBlock.Contains('git -C $SourceDir checkout --detach $TagCommit') -or
+    -not $SourceBlock.Contains('$HeadCommit -ne $TagCommit')) {
     Fail "PowerShell source build is not pinned to the selected tag"
 }
 
@@ -88,6 +94,8 @@ try {
     Set-Content -Path $SuccessScript -Value $InstallBlock
     $env:LOCALAPPDATA = Join-Path $SuccessDir "local-app-data"
     $env:Path = $OriginalProcessPath
+    Remove-Item Env:BITBYGIT_TEST_USER_PATH -ErrorAction SilentlyContinue
+    $CapturedUserPath = $null
     $env:MOCK_DOWNLOAD_DIR = $Assets
     $ErrorActionPreference = "Continue"
 
@@ -107,9 +115,7 @@ try {
     $InstalledBinary = Join-Path $InstallDir "bitbygit.exe"
     if ($ErrorActionPreference -ne "Continue") { Fail "archive block changed the caller error preference" }
     if (($env:Path -split ';')[0] -ne $InstallDir) { Fail "archive block did not update the process PATH" }
-    if (([Environment]::GetEnvironmentVariable("Path", "Process") -split ';') -notcontains $InstallDir) {
-        Fail "archive block did not update its isolated PATH"
-    }
+    if ($CapturedUserPath -ne $InstallDir) { Fail "archive block malformed an empty user PATH" }
     if (-not (Test-Path $InstalledBinary)) { Fail "archive block did not install bitbygit.exe" }
     $Output = & $InstalledBinary --version
     if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
@@ -151,10 +157,35 @@ try {
     if ($env:Path -ne $OriginalProcessPath) { Fail "failed archive block changed the process PATH" }
 
     function git {
-        $CloneDir = Join-Path (Get-Location) "bitbygit"
-        $BuildDir = Join-Path $CloneDir "target/release"
-        New-Item -ItemType Directory -Path $BuildDir | Out-Null
-        Copy-Item (Join-Path $Root "target/release/bitbygit.exe") $BuildDir
+        param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments)
+
+        $ExpectedTag = "refs/tags/v$Version"
+        if ($Arguments.Count -eq 3 -and $Arguments[0] -eq "-C" -and
+            $Arguments[2] -eq "init") {
+            $BuildDir = Join-Path $Arguments[1] "target/release"
+            New-Item -ItemType Directory -Path $BuildDir | Out-Null
+            Copy-Item (Join-Path $Root "target/release/bitbygit.exe") $BuildDir
+        } elseif ($Arguments.Count -eq 7 -and $Arguments[0] -eq "-C" -and
+            $Arguments[2] -eq "fetch" -and $Arguments[3] -eq "--depth" -and
+            $Arguments[4] -eq "1" -and
+            $Arguments[5] -eq "https://github.com/cosentinode/bitbygit.git" -and
+            $Arguments[6] -eq "${ExpectedTag}:${ExpectedTag}") {
+            $script:FetchedExactTag = $true
+        } elseif ($Arguments.Count -eq 5 -and $Arguments[0] -eq "-C" -and
+            $Arguments[2] -eq "rev-parse" -and $Arguments[3] -eq "--verify" -and
+            $Arguments[4] -eq "${ExpectedTag}^{commit}" -and $script:FetchedExactTag) {
+            return "tag-commit"
+        } elseif ($Arguments.Count -eq 5 -and $Arguments[0] -eq "-C" -and
+            $Arguments[2] -eq "checkout" -and $Arguments[3] -eq "--detach" -and
+            $Arguments[4] -eq "tag-commit" -and $script:FetchedExactTag) {
+            $script:CheckedOutExactTag = $true
+        } elseif ($Arguments.Count -eq 5 -and $Arguments[0] -eq "-C" -and
+            $Arguments[2] -eq "rev-parse" -and $Arguments[3] -eq "--verify" -and
+            $Arguments[4] -eq "HEAD" -and $script:CheckedOutExactTag) {
+            return "tag-commit"
+        } else {
+            throw "unexpected git arguments: $Arguments"
+        }
         $global:LASTEXITCODE = 0
     }
 
@@ -172,6 +203,10 @@ try {
     Set-Content -Path $SourceScript -Value $SourceBlock
     $env:LOCALAPPDATA = Join-Path $SourceSuccessDir "local-app-data"
     $env:Path = $OriginalProcessPath
+    $env:BITBYGIT_TEST_USER_PATH = $OriginalProcessPath
+    $CapturedUserPath = $null
+    $FetchedExactTag = $false
+    $CheckedOutExactTag = $false
     $env:MOCK_CARGO_FAILURE = "0"
     $ErrorActionPreference = "Continue"
     Push-Location $SourceSuccessDir
@@ -188,6 +223,10 @@ try {
     $SourceInstalledBinary = Join-Path $SourceInstallDir "bitbygit.exe"
     if ($ErrorActionPreference -ne "Continue") { Fail "source block changed the caller error preference" }
     if (($env:Path -split ';')[0] -ne $SourceInstallDir) { Fail "source block did not update the process PATH" }
+    if ($CapturedUserPath -ne "$OriginalProcessPath;$SourceInstallDir") {
+        Fail "source block did not append to the existing user PATH"
+    }
+    if (-not $FetchedExactTag -or -not $CheckedOutExactTag) { Fail "source block did not check out the exact tag" }
     if (-not (Test-Path $SourceInstalledBinary)) { Fail "source block did not install bitbygit.exe" }
     $SourceOutput = & $SourceInstalledBinary --version
     if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $Version") {
@@ -200,6 +239,8 @@ try {
     Set-Content -Path $SourceFailureScript -Value $SourceBlock
     $env:LOCALAPPDATA = Join-Path $SourceFailureDir "local-app-data"
     $env:Path = $OriginalProcessPath
+    $FetchedExactTag = $false
+    $CheckedOutExactTag = $false
     $env:MOCK_CARGO_FAILURE = "1"
     $ErrorActionPreference = "Continue"
     $SourceBuildFailed = $false
