@@ -48,7 +48,9 @@ WORK_DIR="$(mktemp -d)"
 cleanup() {
   status=$?
   trap - EXIT
-  rm -rf -- "${WORK_DIR}"
+  if ! rm -rf -- "${WORK_DIR}"; then
+    printf 'Warning: failed to remove temporary directory %s\n' "${WORK_DIR}" >&2
+  fi
   exit "${status}"
 }
 trap cleanup EXIT
@@ -67,13 +69,24 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
   exit 1
 fi
 BITBYGIT_INSTALL
-export PATH="${HOME}/.local/bin:${PATH}" &&
-if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
-  bitbygit --version
+{
+install_dir="${HOME}/.local/bin"
+new_path="${install_dir}"
+IFS=: read -r -a path_entries <<< "${PATH-}"
+for entry in "${path_entries[@]}"; do
+  [[ "${entry}" == "${install_dir}" ]] || new_path+=":${entry}"
+done
+export PATH="${new_path}"
+resolved_binary="$(type -P bitbygit || true)"
+if [[ -n "${resolved_binary}" && "${resolved_binary}" -ef "${install_dir}/bitbygit" ]] &&
+  path_output="$(command bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
+  command bitbygit --version
 else
-  printf 'Expected bitbygit %s on PATH, got %s\n' "${VERSION}" "${path_output:-no output}" >&2
+  printf 'Expected %s to resolve as bitbygit %s, got %s (%s)\n' \
+    "${install_dir}/bitbygit" "${VERSION}" "${resolved_binary:-no application}" "${path_output:-no output}" >&2
   false
 fi
+}
 ```
 
 Add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file to keep
@@ -101,7 +114,9 @@ WORK_DIR="$(mktemp -d)"
 cleanup() {
   status=$?
   trap - EXIT
-  rm -rf -- "${WORK_DIR}"
+  if ! rm -rf -- "${WORK_DIR}"; then
+    printf 'Warning: failed to remove temporary directory %s\n' "${WORK_DIR}" >&2
+  fi
   exit "${status}"
 }
 trap cleanup EXIT
@@ -120,13 +135,24 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
   exit 1
 fi
 BITBYGIT_INSTALL
-export PATH="${HOME}/.local/bin:${PATH}" &&
-if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
-  bitbygit --version
+{
+install_dir="${HOME}/.local/bin"
+new_path="${install_dir}"
+IFS=: read -r -a path_entries <<< "${PATH-}"
+for entry in "${path_entries[@]}"; do
+  [[ "${entry}" == "${install_dir}" ]] || new_path+=":${entry}"
+done
+export PATH="${new_path}"
+resolved_binary="$(type -P bitbygit || true)"
+if [[ -n "${resolved_binary}" && "${resolved_binary}" -ef "${install_dir}/bitbygit" ]] &&
+  path_output="$(command bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
+  command bitbygit --version
 else
-  printf 'Expected bitbygit %s on PATH, got %s\n' "${VERSION}" "${path_output:-no output}" >&2
+  printf 'Expected %s to resolve as bitbygit %s, got %s (%s)\n' \
+    "${install_dir}/bitbygit" "${VERSION}" "${resolved_binary:-no application}" "${path_output:-no output}" >&2
   false
 fi
+}
 ```
 
 Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile` (or the startup file
@@ -182,18 +208,34 @@ $UserPathEntries = @($UserPath -split ";" | Where-Object {
     -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
 })
 $NewUserPath = (@($InstallDir) + $UserPathEntries) -join ";"
-[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
 $ProcessPathEntries = @($env:Path -split ";" | Where-Object {
     -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
 })
-$env:Path = (@($InstallDir) + $ProcessPathEntries) -join ";"
-$PathOutput = bitbygit --version
-if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
-    throw "Expected bitbygit $Version on PATH, got $PathOutput"
+$PreviousProcessPath = $env:Path
+try {
+    $env:Path = (@($InstallDir) + $ProcessPathEntries) -join ";"
+    $ResolvedCommand = Get-Command bitbygit -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $ResolvedPath = (Resolve-Path -LiteralPath $ResolvedCommand.Source).Path
+    $InstalledPath = (Resolve-Path -LiteralPath $InstalledBinary).Path
+    if (-not [string]::Equals($ResolvedPath, $InstalledPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Expected $InstalledPath on PATH, got $ResolvedPath"
+    }
+    $PathOutput = & $ResolvedPath --version
+    if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
+        throw "Expected bitbygit $Version on PATH, got $PathOutput"
+    }
+    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+} catch {
+    $env:Path = $PreviousProcessPath
+    throw
 }
-bitbygit --version
+& $ResolvedPath --version
 } finally {
-    Remove-Item -LiteralPath $WorkDir -Recurse -Force
+    try {
+        Remove-Item -LiteralPath $WorkDir -Recurse -Force
+    } catch {
+        [Console]::Error.WriteLine("Warning: failed to remove temporary directory ${WorkDir}: $($_.Exception.Message)")
+    }
 }
 }
 ```
@@ -239,7 +281,9 @@ SOURCE_DIR="${WORK_DIR}/bitbygit"
 cleanup() {
   status=$?
   trap - EXIT
-  rm -rf -- "${WORK_DIR}"
+  if ! rm -rf -- "${WORK_DIR}"; then
+    printf 'Warning: failed to remove temporary directory %s\n' "${WORK_DIR}" >&2
+  fi
   exit "${status}"
 }
 trap cleanup EXIT
@@ -265,13 +309,24 @@ if [[ "${installed_output}" != "bitbygit ${VERSION}" ]]; then
   exit 1
 fi
 BITBYGIT_INSTALL
-export PATH="${HOME}/.local/bin:${PATH}" &&
-if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
-  bitbygit --version
+{
+install_dir="${HOME}/.local/bin"
+new_path="${install_dir}"
+IFS=: read -r -a path_entries <<< "${PATH-}"
+for entry in "${path_entries[@]}"; do
+  [[ "${entry}" == "${install_dir}" ]] || new_path+=":${entry}"
+done
+export PATH="${new_path}"
+resolved_binary="$(type -P bitbygit || true)"
+if [[ -n "${resolved_binary}" && "${resolved_binary}" -ef "${install_dir}/bitbygit" ]] &&
+  path_output="$(command bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
+  command bitbygit --version
 else
-  printf 'Expected bitbygit %s on PATH, got %s\n' "${VERSION}" "${path_output:-no output}" >&2
+  printf 'Expected %s to resolve as bitbygit %s, got %s (%s)\n' \
+    "${install_dir}/bitbygit" "${VERSION}" "${resolved_binary:-no application}" "${path_output:-no output}" >&2
   false
 fi
+}
 ```
 
 On Windows, run in PowerShell:
@@ -328,18 +383,34 @@ $UserPathEntries = @($UserPath -split ";" | Where-Object {
     -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
 })
 $NewUserPath = (@($InstallDir) + $UserPathEntries) -join ";"
-[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
 $ProcessPathEntries = @($env:Path -split ";" | Where-Object {
     -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
 })
-$env:Path = (@($InstallDir) + $ProcessPathEntries) -join ";"
-$PathOutput = bitbygit --version
-if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
-    throw "Expected bitbygit $Version on PATH, got $PathOutput"
+$PreviousProcessPath = $env:Path
+try {
+    $env:Path = (@($InstallDir) + $ProcessPathEntries) -join ";"
+    $ResolvedCommand = Get-Command bitbygit -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $ResolvedPath = (Resolve-Path -LiteralPath $ResolvedCommand.Source).Path
+    $InstalledPath = (Resolve-Path -LiteralPath $InstalledBinary).Path
+    if (-not [string]::Equals($ResolvedPath, $InstalledPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Expected $InstalledPath on PATH, got $ResolvedPath"
+    }
+    $PathOutput = & $ResolvedPath --version
+    if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
+        throw "Expected bitbygit $Version on PATH, got $PathOutput"
+    }
+    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+} catch {
+    $env:Path = $PreviousProcessPath
+    throw
 }
-bitbygit --version
+& $ResolvedPath --version
 } finally {
-    Remove-Item -LiteralPath $WorkDir -Recurse -Force
+    try {
+        Remove-Item -LiteralPath $WorkDir -Recurse -Force
+    } catch {
+        [Console]::Error.WriteLine("Warning: failed to remove temporary directory ${WorkDir}: $($_.Exception.Message)")
+    }
 }
 }
 ```
@@ -353,6 +424,6 @@ Use an archive or source tag after a release is published.
 ## Verify the installation
 
 Every installation block above first runs the installed file directly, then
-updates `PATH` and finishes with `bitbygit --version`. Both checks require and
-report `bitbygit <selected-version>`, so the final check also verifies command
-resolution through the documented `PATH` setup.
+updates `PATH`, resolves an application while ignoring same-named aliases and
+functions, and verifies that it is the installed file before reporting
+`bitbygit <selected-version>`.

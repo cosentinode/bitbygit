@@ -73,13 +73,19 @@ if ([regex]::Matches($DocsText, [regex]::Escape($MachinePathLookup)).Count -ne 2
     [regex]::Matches($DocsText, [regex]::Escape('User PATH cannot override it in new shells')).Count -ne 2) {
     Fail "Windows examples do not reject machine-level PATH shadowing"
 }
-if ([regex]::Matches($DocsText, '(?m)^bitbygit --version\r?$').Count -ne 2) {
+if ([regex]::Matches($DocsText, '(?m)^& \$ResolvedPath --version\r?$').Count -ne 2) {
     Fail "Windows examples do not finish with PATH-resolved version output"
+}
+$ApplicationResolution = 'Get-Command bitbygit -CommandType Application -ErrorAction Stop'
+if ([regex]::Matches($DocsText, [regex]::Escape($ApplicationResolution)).Count -ne 2 -or
+    [regex]::Matches($DocsText, [regex]::Escape('[System.StringComparison]::OrdinalIgnoreCase')).Count -ne 2) {
+    Fail "Windows examples do not bypass aliases and functions or verify resolved path identity"
 }
 $RandomTempName = '[System.IO.Path]::GetRandomFileName()'
 if ([regex]::Matches($DocsText, [regex]::Escape($RandomTempName)).Count -ne 2 -or
     [regex]::Matches($DocsText, 'finally \{').Count -ne 2 -or
-    [regex]::Matches($DocsText, [regex]::Escape('Remove-Item -LiteralPath $WorkDir -Recurse -Force')).Count -ne 2) {
+    [regex]::Matches($DocsText, [regex]::Escape('Remove-Item -LiteralPath $WorkDir -Recurse -Force')).Count -ne 2 -or
+    [regex]::Matches($DocsText, [regex]::Escape('Warning: failed to remove temporary directory')).Count -ne 2) {
     Fail "Windows examples do not securely stage and clean up temporary work"
 }
 
@@ -169,6 +175,19 @@ try {
     $CapturedUserPath = $null
     $env:MOCK_DOWNLOAD_DIR = $Assets
     $ErrorActionPreference = "Continue"
+    $ShadowInvoked = $false
+
+    function bitbygit {
+        $script:ShadowInvoked = $true
+        return "bitbygit $SelectedVersion"
+    }
+
+    function Invoke-ShadowedBitByGit {
+        $script:ShadowInvoked = $true
+        return "bitbygit $SelectedVersion"
+    }
+
+    Set-Alias -Name bitbygit -Value Invoke-ShadowedBitByGit
 
     function Invoke-WebRequest {
         param($Uri, $OutFile)
@@ -179,7 +198,10 @@ try {
     try {
         $StartingLocation = (Get-Location).Path
         foreach ($Attempt in 1..2) {
+            $ShadowInvoked = $false
             . $SuccessScript
+            if ($ShadowInvoked) { Fail "archive block invoked a shadowing alias or function" }
+            if ($Attempt -eq 1) { Remove-Item Alias:bitbygit }
             if ((Get-Location).Path -ne $StartingLocation) {
                 Fail "archive block changed the caller working directory"
             }
@@ -190,6 +212,8 @@ try {
     } finally {
         Pop-Location
     }
+    Remove-Item Function:bitbygit
+    Remove-Item Function:Invoke-ShadowedBitByGit
 
     if ((Get-Item -Force (Join-Path $SuccessDir $Archive)).LinkType -ne "SymbolicLink" -or
         (Get-Item -Force (Join-Path $SuccessDir "SHA256SUMS")).LinkType -ne "SymbolicLink" -or
@@ -316,6 +340,36 @@ try {
     if ($ErrorActionPreference -ne "Continue") { Fail "failed archive block changed the caller error preference" }
     if ($env:Path -ne $OriginalProcessPath) { Fail "failed archive block changed the process PATH" }
 
+    $CleanupFailureBlock = $InstallBlock.Replace(
+        '        Remove-Item -LiteralPath $WorkDir -Recurse -Force',
+        '        throw "forced cleanup failure"'
+    )
+    if ($CleanupFailureBlock -eq $InstallBlock) { Fail "could not force an archive cleanup failure" }
+    $CleanupFailureScript = Join-Path $FailureDir "install-cleanup-failure.ps1"
+    Set-Content -Path $CleanupFailureScript -Value $CleanupFailureBlock
+    $CleanupErrorWriter = [System.IO.StringWriter]::new()
+    $OriginalErrorWriter = [Console]::Error
+    $CleanupPrimaryMessage = $null
+    [Console]::SetError($CleanupErrorWriter)
+    Push-Location $FailureDir
+    try {
+        try {
+            . $CleanupFailureScript
+        } catch {
+            $CleanupPrimaryMessage = $_.Exception.Message
+        }
+    } finally {
+        Pop-Location
+        [Console]::SetError($OriginalErrorWriter)
+    }
+    if ([string]::IsNullOrEmpty($CleanupPrimaryMessage) -or
+        -not $CleanupPrimaryMessage.Contains("Checksum verification failed")) {
+        Fail "archive cleanup failure masked the checksum failure: $CleanupPrimaryMessage"
+    }
+    if (-not $CleanupErrorWriter.ToString().Contains("forced cleanup failure")) {
+        Fail "archive block did not report the cleanup failure"
+    }
+
     function git {
         param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments)
 
@@ -390,13 +444,29 @@ try {
     $CheckedOutExactTag = $false
     $env:MOCK_CARGO_FAILURE = "0"
     $ErrorActionPreference = "Continue"
+    $ShadowInvoked = $false
+
+    function bitbygit {
+        $script:ShadowInvoked = $true
+        return "bitbygit $SelectedVersion"
+    }
+
+    function Invoke-ShadowedBitByGit {
+        $script:ShadowInvoked = $true
+        return "bitbygit $SelectedVersion"
+    }
+
+    Set-Alias -Name bitbygit -Value Invoke-ShadowedBitByGit
     Push-Location $SourceSuccessDir
     try {
         $StartingLocation = (Get-Location).Path
         foreach ($Attempt in 1..2) {
             $FetchedExactTag = $false
             $CheckedOutExactTag = $false
+            $ShadowInvoked = $false
             . $SourceScript
+            if ($ShadowInvoked) { Fail "source block invoked a shadowing alias or function" }
+            if ($Attempt -eq 1) { Remove-Item Alias:bitbygit }
             if ((Get-Location).Path -ne $StartingLocation) {
                 Fail "source block changed the caller working directory"
             }
@@ -407,6 +477,8 @@ try {
     } finally {
         Pop-Location
     }
+    Remove-Item Function:bitbygit
+    Remove-Item Function:Invoke-ShadowedBitByGit
     if ((Get-Item -Force (Join-Path $SourceSuccessDir "bitbygit")).LinkType -ne "SymbolicLink" -or
         (Get-Content (Join-Path $ProtectedSource "marker")) -ne "protected") {
         Fail "source block modified a pre-existing working-directory source symlink"

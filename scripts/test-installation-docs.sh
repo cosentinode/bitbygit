@@ -139,18 +139,40 @@ check_unix_success() {
     export PATH="${tmp}/mock-bin:${PATH}"
     starting_dir="${PWD}"
 
+    bitbygit() {
+      : > "${case_dir}/function-shadow-used"
+      printf 'bitbygit %s\n' "${selected_version}"
+    }
     source "${case_dir}/snippet.bash" || fail "${heading} failed a valid ${target} installation"
+    [[ ! -e "${case_dir}/function-shadow-used" ]] || fail "${heading} invoked a shadowing function"
+    unset -f bitbygit
+    shadow_bitbygit() {
+      : > "${case_dir}/alias-shadow-used"
+      printf 'bitbygit %s\n' "${selected_version}"
+    }
+    shopt -s expand_aliases
+    alias bitbygit=shadow_bitbygit
     source "${case_dir}/snippet.bash" || fail "${heading} failed when retried"
+    [[ ! -e "${case_dir}/alias-shadow-used" ]] || fail "${heading} invoked a shadowing alias"
+    unalias bitbygit
+    unset -f shadow_bitbygit
     [[ "${PWD}" == "${starting_dir}" ]] || fail "${heading} changed the caller working directory"
     [[ "$-" != *e* && "$-" != *u* ]] || fail "${heading} changed caller shell options"
     if shopt -qo pipefail; then
       fail "${heading} enabled pipefail in the caller shell"
     fi
     [[ "${PATH%%:*}" == "${HOME}/.local/bin" ]] || fail "${heading} did not update the caller PATH"
+    path_entry_count=0
+    IFS=: read -r -a path_entries <<< "${PATH}"
+    for entry in "${path_entries[@]}"; do
+      [[ "${entry}" == "${HOME}/.local/bin" ]] && path_entry_count=$((path_entry_count + 1))
+    done
+    [[ "${path_entry_count}" -eq 1 ]] || fail "${heading} duplicated the install directory on PATH"
     [[ -x "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not install the binary"
     [[ "$("${HOME}/.local/bin/bitbygit" --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} installed the wrong version"
-    [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not resolve the installed command through PATH"
-    [[ "$(bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} resolved the wrong version through PATH"
+    resolved_binary="$(type -P bitbygit)"
+    [[ "${resolved_binary}" -ef "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not resolve the installed application through PATH"
+    [[ "$(command bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} resolved the wrong version through PATH"
     if compgen -G "${TMPDIR}/*" >/dev/null; then
       fail "${heading} left temporary installation files behind"
     fi
@@ -222,14 +244,44 @@ extract_selected_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
 )
 [[ ! -e "${failure_dir}/side-effects" ]] || fail "${failure_heading} extracted or installed after checksum failure"
 
+cleanup_failure_dir="${tmp}/cleanup-failure-${failure_target}"
+mkdir -p "${cleanup_failure_dir}/home" "${cleanup_failure_dir}/temp" "${cleanup_failure_dir}/mock-bin"
+cp "${tmp}/failure-bin/"* "${cleanup_failure_dir}/mock-bin/"
+cat > "${cleanup_failure_dir}/mock-bin/rm" <<'MOCK'
+#!/usr/bin/env sh
+exit 73
+MOCK
+chmod +x "${cleanup_failure_dir}/mock-bin/rm"
+extract_selected_block "${failure_heading}" bash > "${cleanup_failure_dir}/snippet.bash"
+(
+  cd "${cleanup_failure_dir}"
+  export HOME="${cleanup_failure_dir}/home"
+  export TMPDIR="${cleanup_failure_dir}/temp"
+  export MOCK_DOWNLOAD_DIR="${tmp}/failure-assets"
+  export MOCK_SIDE_EFFECTS="${cleanup_failure_dir}/side-effects"
+  export MOCK_UNAME_MACHINE="${failure_machine}"
+  export PATH="${cleanup_failure_dir}/mock-bin:${PATH}"
+  if source "${cleanup_failure_dir}/snippet.bash" > "${cleanup_failure_dir}/output" 2>&1; then
+    fail "${failure_heading} accepted an invalid checksum when cleanup failed"
+  else
+    cleanup_status=$?
+  fi
+  [[ "${cleanup_status}" -eq 1 ]] || fail "${failure_heading} cleanup failure masked status 1 with ${cleanup_status}"
+  cleanup_output="$(<"${cleanup_failure_dir}/output")"
+  [[ "${cleanup_output}" == *"Warning: failed to remove temporary directory"* ]] || fail "${failure_heading} did not report cleanup failure"
+)
+[[ ! -e "${cleanup_failure_dir}/side-effects" ]] || fail "${failure_heading} continued after checksum and cleanup failures"
+
 [[ "${docs_text}" == *'git -C "${SOURCE_DIR}" fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${TAG}:${TAG}"'* ]] || fail "Bash source build does not fetch the exact selected tag"
 [[ "${docs_text}" == *'git -C "${SOURCE_DIR}" checkout --detach "${tag_commit}"'* ]] || fail "Bash source build does not detach at the selected tag"
 [[ "${docs_text}" == *'git -C $SourceDir fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${Tag}:${Tag}"'* ]] || fail "PowerShell source build does not fetch the exact selected tag"
 [[ "${docs_text}" == *'git -C $SourceDir checkout --detach $TagCommit'* ]] || fail "PowerShell source build does not detach at the selected tag"
 [[ "${docs_text}" == *'"${HOME}/.local/bin/bitbygit" --version'* ]] || fail "Unix installation does not validate the installed path"
 [[ "${docs_text}" == *'& $InstalledBinary --version'* ]] || fail "Windows installation does not validate the installed path"
-[[ "$(grep -c '^  bitbygit --version$' "${docs}")" -eq 3 ]] || fail "Unix installations do not finish with PATH-resolved version output"
-[[ "$(grep -c '^bitbygit --version$' "${docs}")" -eq 2 ]] || fail "Windows installations do not finish with PATH-resolved version output"
+[[ "$(grep -c 'resolved_binary="$(type -P bitbygit || true)"' "${docs}")" -eq 3 ]] || fail "Unix installations do not bypass aliases and functions during PATH resolution"
+[[ "$(grep -c -- '-ef "${install_dir}/bitbygit"' "${docs}")" -eq 3 ]] || fail "Unix installations do not verify resolved file identity"
+[[ "$(grep -c '^  command bitbygit --version$' "${docs}")" -eq 3 ]] || fail "Unix installations do not finish with PATH-resolved version output"
+[[ "$(grep -c '^& \$ResolvedPath --version$' "${docs}")" -eq 2 ]] || fail "Windows installations do not finish with PATH-resolved version output"
 
 source_remote="${tmp}/source-remote.git"
 source_seed="${tmp}/source-seed"
@@ -284,11 +336,33 @@ printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
   fi
 
   export MOCK_CARGO_FAILURE=0
+  bitbygit() {
+    : > "${source_dir}/function-shadow-used"
+    printf 'bitbygit %s\n' "${selected_version}"
+  }
   source "${source_dir}/snippet.bash" || fail "Bash source block could not retry a failed build"
+  [[ ! -e "${source_dir}/function-shadow-used" ]] || fail "Bash source block invoked a shadowing function"
+  unset -f bitbygit
+  shadow_bitbygit() {
+    : > "${source_dir}/alias-shadow-used"
+    printf 'bitbygit %s\n' "${selected_version}"
+  }
+  shopt -s expand_aliases
+  alias bitbygit=shadow_bitbygit
   source "${source_dir}/snippet.bash" || fail "Bash source block failed when retried"
+  [[ ! -e "${source_dir}/alias-shadow-used" ]] || fail "Bash source block invoked a shadowing alias"
+  unalias bitbygit
+  unset -f shadow_bitbygit
   [[ "${PWD}" == "${starting_dir}" ]] || fail "Bash source block changed the caller working directory"
-  [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "Bash source block did not resolve the installed command through PATH"
-  [[ "$(bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "Bash source block resolved the wrong version through PATH"
+  path_entry_count=0
+  IFS=: read -r -a path_entries <<< "${PATH}"
+  for entry in "${path_entries[@]}"; do
+    [[ "${entry}" == "${HOME}/.local/bin" ]] && path_entry_count=$((path_entry_count + 1))
+  done
+  [[ "${path_entry_count}" -eq 1 ]] || fail "Bash source block duplicated the install directory on PATH"
+  resolved_binary="$(type -P bitbygit)"
+  [[ "${resolved_binary}" -ef "${HOME}/.local/bin/bitbygit" ]] || fail "Bash source block did not resolve the installed application through PATH"
+  [[ "$(command bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "Bash source block resolved the wrong version through PATH"
   if compgen -G "${TMPDIR}/*" >/dev/null; then
     fail "Bash source block left temporary build files behind"
   fi
