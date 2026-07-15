@@ -34,6 +34,7 @@ const RECOVERY_METADATA_PATHS: &[&str] = &[
     "rebase-merge",
     "rebase-apply",
 ];
+const REBASE_PROGRESS_PATHS: &[&str] = &["rebase-merge/msgnum", "rebase-apply/next"];
 const MAX_RECOVERY_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECOVERY_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_FILE_BYTES_READ: u64 = 64 * 1024 * 1024;
@@ -45,7 +46,7 @@ const MAX_RECOVERY_SUBPROCESSES: usize = 12;
 const MAX_RECOVERY_GENERATION_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_GENERATION_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_GENERATION_FILE_BYTES: u64 = 1024 * 1024 * 1024;
-const RECOVERY_BACKUP_PREFIX: &str = ".bitbygit-recovery-backup-";
+const RECOVERY_BACKUP_POINTER: &str = "bitbygit-recovery-backup.pointer";
 const RECOVERY_CANDIDATE_PREFIX: &str = ".bitbygit-recovery-candidate-";
 const RECOVERY_GIT_ENVIRONMENT: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -1514,23 +1515,16 @@ struct RecoveryTransaction {
 impl RecoveryTransaction {
     fn prepare(git: &Git) -> Result<Self, GitError> {
         let root = Self::supported_root(git)?;
-        let baseline = RecoveryGeneration::capture(&root)?;
         let parent = root.parent().ok_or_else(|| {
             recovery_transaction_blocked("repository root has no parent for isolated recovery")
         })?;
         remove_previous_recovery_backup(&root)?;
-        let candidate = create_recovery_candidate(parent, &root)?;
-        let backup_pointer = recovery_backup_pointer_path(&root)?;
-        run_recovery_sidecar_hook(&backup_pointer);
-        if let Err(error) = write_new_recovery_sidecar(
-            &backup_pointer,
-            candidate.as_os_str().as_encoded_bytes(),
-            "record the retained recovery backup pointer",
-        ) {
-            let _result = fs::remove_dir(&candidate);
-            let _result = fs::remove_file(recovery_candidate_owner_path(&candidate));
-            return Err(error);
-        }
+        let baseline = RecoveryGeneration::capture(&root)?;
+        let (candidate, backup_identity) = create_recovery_candidate(parent, &root)?;
+        let backup_pointer = recovery_backup_pointer_path(&candidate)?;
+        let mut pointer_contents = candidate.as_os_str().as_encoded_bytes().to_vec();
+        pointer_contents.push(0);
+        pointer_contents.extend_from_slice(&backup_identity);
         let mut transaction = Self {
             root,
             candidate,
@@ -1547,6 +1541,12 @@ impl RecoveryTransaction {
                 "repository changed while isolated recovery state was prepared",
             ));
         }
+        run_recovery_sidecar_hook(&recovery_backup_pointer_path(&transaction.root)?);
+        write_new_recovery_sidecar(
+            &transaction.backup_pointer,
+            &pointer_contents,
+            "record the retained recovery backup pointer",
+        )?;
         Ok(transaction)
     }
 
@@ -1649,10 +1649,7 @@ impl RecoveryTransaction {
                 .unwrap_or_else(|| "ssh".to_owned());
             command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
         }
-        let output = command.output().map_err(|source| GitError::Io {
-            args: args.clone(),
-            source,
-        })?;
+        let output = run_bounded_recovery_command(&mut command, args.clone())?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
@@ -1686,10 +1683,10 @@ impl RecoveryTransaction {
         let Ok(candidate_status) = candidate_git.status() else {
             return false;
         };
-        candidate_state != *expected_state
-            && candidate_state.operation == Some(RepositoryOperation::Rebase)
+        candidate_state.operation == Some(RepositoryOperation::Rebase)
             && candidate_status.operation == Some(RepositoryOperation::Rebase)
             && !candidate_status.conflicted_files().is_empty()
+            && candidate_state.rebase_progressed_from(expected_state)
     }
 
     fn promote(
@@ -2083,7 +2080,7 @@ fn write_new_recovery_sidecar(
     Ok(())
 }
 
-fn create_recovery_candidate(parent: &Path, root: &Path) -> Result<PathBuf, GitError> {
+fn create_recovery_candidate(parent: &Path, root: &Path) -> Result<(PathBuf, Vec<u8>), GitError> {
     for attempt in 0..100_u32 {
         let candidate = parent.join(format!(
             "{RECOVERY_CANDIDATE_PREFIX}{}-{}-{attempt}",
@@ -2095,15 +2092,38 @@ fn create_recovery_candidate(parent: &Path, root: &Path) -> Result<PathBuf, GitE
         ));
         match fs::create_dir(&candidate) {
             Ok(()) => {
+                let root_identity =
+                    recovery_file_identity(&fs::symlink_metadata(root).map_err(|source| {
+                        recovery_transaction_io("identify repository generation", source)
+                    })?);
+                let candidate_identity =
+                    recovery_file_identity(&fs::symlink_metadata(&candidate).map_err(
+                        |source| recovery_transaction_io("identify isolated repository", source),
+                    )?);
+                let mut identity = Sha256::new();
+                identity.update(root.as_os_str().as_encoded_bytes());
+                identity.update(candidate.as_os_str().as_encoded_bytes());
+                for value in [
+                    root_identity.0,
+                    root_identity.1,
+                    candidate_identity.0,
+                    candidate_identity.1,
+                ] {
+                    identity.update(value.to_le_bytes());
+                }
+                let mut backup_identity = Vec::with_capacity(48);
+                backup_identity.extend_from_slice(&root_identity.0.to_le_bytes());
+                backup_identity.extend_from_slice(&root_identity.1.to_le_bytes());
+                backup_identity.extend_from_slice(&identity.finalize());
                 if let Err(error) = write_new_recovery_sidecar(
                     recovery_candidate_owner_path(&candidate),
-                    root.as_os_str().as_encoded_bytes(),
+                    &backup_identity,
                     "record isolated repository ownership",
                 ) {
                     let _result = fs::remove_dir(&candidate);
                     return Err(error);
                 }
-                return Ok(candidate);
+                return Ok((candidate, backup_identity));
             }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
@@ -2126,13 +2146,7 @@ fn recovery_candidate_owner_path(candidate: &Path) -> PathBuf {
 }
 
 fn recovery_backup_pointer_path(root: &Path) -> Result<PathBuf, GitError> {
-    let name = root.file_name().ok_or_else(|| {
-        recovery_transaction_blocked("repository root has no name for retained recovery backup")
-    })?;
-    let mut pointer = OsString::from(RECOVERY_BACKUP_PREFIX);
-    pointer.push(name);
-    pointer.push(".pointer");
-    Ok(root.with_file_name(pointer))
+    Ok(root.join(".git").join(RECOVERY_BACKUP_POINTER))
 }
 
 fn recovery_backup_from_pointer(expected_root: &Path) -> Result<Option<PathBuf>, GitError> {
@@ -2147,25 +2161,32 @@ fn recovery_backup_from_pointer(expected_root: &Path) -> Result<Option<PathBuf>,
             ));
         }
     };
-    let backup = path_from_bytes(&bytes);
+    let Some(separator) = bytes.iter().position(|byte| *byte == 0) else {
+        return Err(recovery_transaction_blocked(
+            "the retained recovery backup pointer is invalid; refusing to remove it",
+        ));
+    };
+    let backup = path_from_bytes(&bytes[..separator]);
+    let identity = &bytes[separator + 1..];
     let valid_location = backup.is_absolute()
-        && backup.parent() == expected_root.parent()
         && backup.file_name().is_some_and(|name| {
             name.as_encoded_bytes()
                 .starts_with(RECOVERY_CANDIDATE_PREFIX.as_bytes())
         });
     let backup_metadata = fs::symlink_metadata(&backup);
-    let valid_directory = backup_metadata
-        .as_ref()
-        .is_ok_and(|metadata| metadata.file_type().is_dir());
+    let valid_directory = backup_metadata.as_ref().is_ok_and(|metadata| {
+        metadata.file_type().is_dir()
+            && identity.len() >= 16
+            && recovery_file_identity(metadata).0.to_le_bytes() == identity[..8]
+            && recovery_file_identity(metadata).1.to_le_bytes() == identity[8..16]
+    });
     let missing_directory = backup_metadata
         .as_ref()
         .is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound);
     let owner = recovery_candidate_owner_path(&backup);
     let valid_owner = fs::symlink_metadata(&owner)
         .is_ok_and(|metadata| metadata.file_type().is_file())
-        && fs::read(&owner)
-            .is_ok_and(|contents| contents == expected_root.as_os_str().as_encoded_bytes());
+        && fs::read(&owner).is_ok_and(|contents| contents == identity);
     if !valid_location || (!valid_directory && !missing_directory) || !valid_owner {
         return Err(recovery_transaction_blocked(
             "the retained recovery backup pointer is invalid; refusing to remove it",
@@ -2435,81 +2456,26 @@ impl RecoveryCapture {
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never")
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|source| GitError::Io {
-            args: display_args.clone(),
-            source,
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| GitError::Io {
-            args: display_args.clone(),
-            source: std::io::Error::other("recovery guard could not capture git stdout"),
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| GitError::Io {
-            args: display_args.clone(),
-            source: std::io::Error::other("recovery guard could not capture git stderr"),
-        })?;
-        let output_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let stdout_bytes = std::sync::Arc::clone(&output_bytes);
-        let stderr_bytes = std::sync::Arc::clone(&output_bytes);
-        let stdout_reader =
-            std::thread::spawn(move || read_bounded_recovery_output(stdout, stdout_bytes));
-        let stderr_reader =
-            std::thread::spawn(move || read_bounded_recovery_output(stderr, stderr_bytes));
-        let status = loop {
-            if output_bytes.load(std::sync::atomic::Ordering::Relaxed) > MAX_RECOVERY_OUTPUT_BYTES {
-                let _ = child.kill();
-                break child.wait();
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
-                Err(source) => break Err(source),
-            }
-        }
-        .map_err(|source| GitError::Io {
-            args: display_args.clone(),
-            source,
-        })?;
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| GitError::Io {
-                args: display_args.clone(),
-                source: std::io::Error::other("recovery guard stdout reader panicked"),
-            })?
-            .map_err(|source| GitError::Io {
-                args: display_args.clone(),
-                source,
-            })?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| GitError::Io {
-                args: display_args.clone(),
-                source: std::io::Error::other("recovery guard stderr reader panicked"),
-            })?
-            .map_err(|source| GitError::Io {
-                args: display_args.clone(),
-                source,
-            })?;
-        let bytes = output_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            .args(&args);
+        let output = run_bounded_recovery_command(&mut command, display_args.clone())?;
+        let bytes = output.stdout.len().saturating_add(output.stderr.len());
         self.output_bytes = self.output_bytes.saturating_add(bytes);
-        if bytes > MAX_RECOVERY_OUTPUT_BYTES || self.output_bytes > MAX_RECOVERY_OUTPUT_BYTES {
+        if self.output_bytes > MAX_RECOVERY_OUTPUT_BYTES {
             return Err(recovery_bound_error(format!(
                 "Git output bytes exceed {MAX_RECOVERY_OUTPUT_BYTES}"
             )));
         }
-        if status.success() {
-            return Ok(Some(stdout));
+        if output.status.success() {
+            return Ok(Some(output.stdout));
         }
-        if allow_missing && status.code() == Some(1) {
+        if allow_missing && output.status.code() == Some(1) {
             return Ok(None);
         }
         Err(GitError::GitFailed {
             args: display_args,
-            status,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
 
@@ -2552,6 +2518,78 @@ impl RecoveryCapture {
         }
         self.retain(bytes.saturating_add(80), "recovery metadata")
     }
+}
+
+fn run_bounded_recovery_command(
+    command: &mut Command,
+    args: Vec<String>,
+) -> Result<RawProcessOutput, GitError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|source| GitError::Io {
+        args: args.clone(),
+        source,
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| GitError::Io {
+        args: args.clone(),
+        source: std::io::Error::other("recovery command could not capture stdout"),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| GitError::Io {
+        args: args.clone(),
+        source: std::io::Error::other("recovery command could not capture stderr"),
+    })?;
+    let output_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stdout_bytes = std::sync::Arc::clone(&output_bytes);
+    let stderr_bytes = std::sync::Arc::clone(&output_bytes);
+    let stdout_reader =
+        std::thread::spawn(move || read_bounded_recovery_output(stdout, stdout_bytes));
+    let stderr_reader =
+        std::thread::spawn(move || read_bounded_recovery_output(stderr, stderr_bytes));
+    let status = loop {
+        if output_bytes.load(std::sync::atomic::Ordering::Relaxed) > MAX_RECOVERY_OUTPUT_BYTES {
+            let _ = child.kill();
+            break child.wait();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(source) => break Err(source),
+        }
+    }
+    .map_err(|source| GitError::Io {
+        args: args.clone(),
+        source,
+    })?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| GitError::Io {
+            args: args.clone(),
+            source: std::io::Error::other("recovery stdout reader panicked"),
+        })?
+        .map_err(|source| GitError::Io {
+            args: args.clone(),
+            source,
+        })?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| GitError::Io {
+            args: args.clone(),
+            source: std::io::Error::other("recovery stderr reader panicked"),
+        })?
+        .map_err(|source| GitError::Io {
+            args: args.clone(),
+            source,
+        })?;
+    if output_bytes.load(std::sync::atomic::Ordering::Relaxed) > MAX_RECOVERY_OUTPUT_BYTES {
+        return Err(recovery_bound_error(format!(
+            "Git output bytes exceed {MAX_RECOVERY_OUTPUT_BYTES}"
+        )));
+    }
+    Ok(RawProcessOutput {
+        args,
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn read_bounded_recovery_output(
@@ -3132,6 +3170,19 @@ pub struct RecoveryState {
     refs: Vec<u8>,
 }
 
+impl RecoveryState {
+    fn rebase_progressed_from(&self, expected: &Self) -> bool {
+        self.head != expected.head
+            || REBASE_PROGRESS_PATHS.iter().any(|path| {
+                let current = recovery_metadata_file(&self.metadata, path)
+                    .and_then(parse_rebase_progress_marker);
+                let previous = recovery_metadata_file(&expected.metadata, path)
+                    .and_then(parse_rebase_progress_marker);
+                matches!((current, previous), (Some(current), Some(previous)) if current > previous)
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveryWorktreeEntry {
     path: PathBuf,
@@ -3166,6 +3217,10 @@ enum RecoveryMetadataValue {
     Directory,
     File(Vec<u8>),
     Symlink(PathBuf),
+}
+
+fn parse_rebase_progress_marker(contents: &[u8]) -> Option<u64> {
+    std::str::from_utf8(contents).ok()?.trim().parse().ok()
 }
 
 impl RecoveryAction {
@@ -4415,6 +4470,149 @@ mod tests {
     }
 
     #[test]
+    fn failed_rebase_skip_without_progress_does_not_promote() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path());
+        let lock = git.git_path("index.lock")?;
+        fs::write(&lock, "block skip before it advances\n")?;
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Rebase,
+            RecoveryAction::Skip,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let root = repo.path().canonicalize()?;
+        let before = RecoveryGeneration::capture(&root)?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Rebase, RecoveryAction::Skip, &expected)
+        else {
+            return Err("expected locked rebase skip to fail".into());
+        };
+
+        assert!(matches!(error, GitError::GitFailed { .. }), "{error}");
+        assert_eq!(git.recovery_state()?, expected);
+        assert_eq!(RecoveryGeneration::capture(&root)?, before);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        fs::remove_file(lock)?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_bounds_hook_output_without_promoting() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        fs::write(
+            &hook,
+            "#!/bin/sh\ndd if=/dev/zero bs=1048576 count=5 2>/dev/null\n",
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        )? {
+            return Ok(());
+        }
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        ) else {
+            return Err("expected noisy recovery hook to exceed the output bound".into());
+        };
+
+        assert!(error.to_string().contains("Git output bytes exceed"));
+        assert_eq!(git.recovery_state()?, expected);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_backup_follows_repository_rename() -> Result<(), Box<dyn Error>> {
+        let (mut repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+        let first_backup = recovery_backup_from_pointer(&repo.path().canonicalize()?)?
+            .ok_or("missing retained recovery backup")?;
+        let renamed = repo.path().with_extension("renamed");
+        fs::rename(repo.path(), &renamed)?;
+        repo.path = renamed;
+        repo.run_allow_failure(["merge", "other"])?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+
+        assert!(!first_backup.exists());
+        assert!(recovery_backup_from_pointer(&repo.path().canonicalize()?)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn same_path_replacement_does_not_own_retained_backup() -> Result<(), Box<dyn Error>> {
+        let (mut repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+        let root = repo.path().canonicalize()?;
+        let backup =
+            recovery_backup_from_pointer(&root)?.ok_or("missing retained recovery backup")?;
+        let former = root.with_extension("former");
+        fs::rename(&root, &former)?;
+        repo.path = former.clone();
+        let output = Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(&root)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to create replacement repository: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+
+        remove_previous_recovery_backup(&root.canonicalize()?)?;
+
+        assert!(backup.is_dir());
+        fs::remove_dir_all(&root)?;
+        fs::rename(&former, &root)?;
+        repo.path = root;
+        Ok(())
+    }
+
+    #[test]
     fn exact_recovery_fails_closed_when_platform_capabilities_are_unavailable()
     -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
@@ -4490,7 +4688,27 @@ mod tests {
         let hook_pointer = pointer.clone();
         let hook_victim = victim.clone();
         let hook: RecoveryCaptureHook = Box::new(move || {
-            let _ = symlink(hook_victim, hook_pointer);
+            let Some(root) = hook_pointer.parent().and_then(Path::parent) else {
+                return;
+            };
+            let Some(parent) = root.parent() else {
+                return;
+            };
+            let Ok(entries) = fs::read_dir(parent) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(RECOVERY_CANDIDATE_PREFIX.as_bytes())
+                {
+                    let _ = symlink(
+                        &hook_victim,
+                        entry.path().join(".git").join(RECOVERY_BACKUP_POINTER),
+                    );
+                }
+            }
         });
         RECOVERY_SIDECAR_HOOKS
             .lock()
@@ -4504,8 +4722,7 @@ mod tests {
         };
         assert!(error.to_string().contains("backup pointer"));
         assert_eq!(fs::read_to_string(&victim)?, "must remain unchanged\n");
-        assert!(fs::symlink_metadata(&pointer)?.file_type().is_symlink());
-        fs::remove_file(pointer)?;
+        assert!(!pointer.exists());
         fs::remove_file(victim)?;
         Ok(())
     }
