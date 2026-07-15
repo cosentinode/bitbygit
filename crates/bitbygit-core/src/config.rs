@@ -234,27 +234,28 @@ fn line_column(contents: &str, offset: usize) -> Option<(usize, usize)> {
 }
 
 fn valid_branch_pattern(pattern: &str) -> bool {
-    pattern
-        .strip_suffix("/*")
-        .map_or_else(|| valid_branch_name(pattern), valid_branch_name)
+    pattern.strip_suffix("/*").map_or_else(
+        || valid_branch_name(pattern),
+        |prefix| valid_branch_name(&format!("{prefix}/branch")),
+    )
 }
 
 fn valid_branch_name(branch: &str) -> bool {
     !branch.is_empty()
         && branch.trim() == branch
         && branch != "@"
+        && branch != "HEAD"
         && !branch.starts_with(['-', '/', '.'])
         && !branch.ends_with(['/', '.'])
-        && !branch.ends_with(".lock")
         && !branch.contains("..")
         && !branch.contains("//")
         && !branch.contains("@{")
         && !branch
             .chars()
             .any(|character| character.is_control() || " ~^:?*[\\".contains(character))
-        && branch
-            .split('/')
-            .all(|component| !component.is_empty() && !component.starts_with('.'))
+        && branch.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
 }
 
 #[cfg(test)]
@@ -331,5 +332,46 @@ enabled = false
             AppConfig::parse("[policy]\nadditional-protected-branches = [\"release/**\"]").is_err()
         );
         assert!(AppConfig::parse("[pull-requests]\ndefault-base-branch = \"bad branch\"").is_err());
+    }
+
+    #[test]
+    fn git_invalid_branch_name_boundaries_are_rejected() {
+        for branch in ["HEAD", "foo.lock/bar", "foo/bar.lock/baz"] {
+            assert!(
+                AppConfig::parse(&format!(
+                    "[pull-requests]\ndefault-base-branch = \"{branch}\""
+                ))
+                .is_err()
+            );
+            assert!(
+                AppConfig::parse(&format!(
+                    "[policy]\nadditional-protected-branches = [\"{branch}\"]"
+                ))
+                .is_err()
+            );
+        }
+
+        for pattern in ["foo.lock/*", "foo/bar.lock/*"] {
+            assert!(
+                AppConfig::parse(&format!(
+                    "[policy]\nadditional-protected-branches = [\"{pattern}\"]"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn git_valid_branch_name_boundaries_and_wildcards_are_accepted() -> Result<(), ConfigError> {
+        AppConfig::parse(
+            r#"
+[policy]
+additional-protected-branches = ["HEAD/*", "foo.locked/*", "foo.LOCK/bar"]
+
+[pull-requests]
+default-base-branch = "foo/HEAD"
+"#,
+        )?;
+        Ok(())
     }
 }
