@@ -38,8 +38,8 @@ coreutils (`sha256sum`, `mkdir`, and `install`) and stop before extraction or
 installation if any download or checksum check fails:
 
 ```bash
-bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 VERSION=0.1.0
+VERSION="${VERSION}" bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 TARGET=x86_64-unknown-linux-gnu
 ARCHIVE="bitbygit-${VERSION}-${TARGET}.tar.gz"
 PACKAGE="bitbygit-${VERSION}-${TARGET}"
@@ -59,10 +59,10 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
 fi
 BITBYGIT_INSTALL
 export PATH="${HOME}/.local/bin:${PATH}" &&
-if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit 0.1.0" ]]; then
+if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
   bitbygit --version
 else
-  printf 'Expected bitbygit 0.1.0 on PATH, got %s\n' "${path_output:-no output}" >&2
+  printf 'Expected bitbygit %s on PATH, got %s\n' "${VERSION}" "${path_output:-no output}" >&2
   false
 fi
 ```
@@ -78,8 +78,8 @@ macOS. The shell stops before extraction or installation if any download or
 checksum check fails:
 
 ```bash
-bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 VERSION=0.1.0
+VERSION="${VERSION}" bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 case "$(uname -m)" in
   x86_64) TARGET=x86_64-apple-darwin ;;
   arm64) TARGET=aarch64-apple-darwin ;;
@@ -103,10 +103,10 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
 fi
 BITBYGIT_INSTALL
 export PATH="${HOME}/.local/bin:${PATH}" &&
-if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit 0.1.0" ]]; then
+if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
   bitbygit --version
 else
-  printf 'Expected bitbygit 0.1.0 on PATH, got %s\n' "${path_output:-no output}" >&2
+  printf 'Expected bitbygit %s on PATH, got %s\n' "${VERSION}" "${path_output:-no output}" >&2
   false
 fi
 ```
@@ -183,8 +183,8 @@ usable only if that release appears on the Releases page.
 On Linux or macOS, run:
 
 ```bash
-bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 VERSION=0.1.0
+VERSION="${VERSION}" bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 TAG="refs/tags/v${VERSION}"
 mkdir bitbygit
 git -C bitbygit init
@@ -209,10 +209,10 @@ if [[ "${installed_output}" != "bitbygit ${VERSION}" ]]; then
 fi
 BITBYGIT_INSTALL
 export PATH="${HOME}/.local/bin:${PATH}" &&
-if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit 0.1.0" ]]; then
+if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit ${VERSION}" ]]; then
   bitbygit --version
 else
-  printf 'Expected bitbygit 0.1.0 on PATH, got %s\n' "${path_output:-no output}" >&2
+  printf 'Expected bitbygit %s on PATH, got %s\n' "${VERSION}" "${path_output:-no output}" >&2
   false
 fi
 ```

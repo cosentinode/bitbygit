@@ -34,8 +34,17 @@ workspace_version="$(perl -ne '
   if ($workspace && /^version = "([^"]+)"$/) { print $1; exit }
 ' "${root}/Cargo.toml")"
 [[ -n "${workspace_version}" ]] || fail "workspace version was not found"
+selected_version=2.3.4
+[[ "${selected_version}" != "${workspace_version}" && "${selected_version}" != "0.1.0" ]] || fail "selected validator version must differ from the documented example"
 [[ "${docs_text}" == *"VERSION=${workspace_version}"* ]] || fail "Bash examples do not use workspace version ${workspace_version}"
 [[ "${docs_text}" == *"\$Version = \"${workspace_version}\""* ]] || fail "PowerShell examples do not use workspace version ${workspace_version}"
+
+extract_selected_block() {
+  local block
+  block="$(extract_block "$1" "$2")"
+  [[ "${block}" == *"VERSION=${workspace_version}"* ]] || fail "missing selected version in $1 $2 block"
+  printf '%s' "${block/VERSION=${workspace_version}/VERSION=${selected_version}}"
+}
 
 release_artifacts=()
 while IFS= read -r artifact; do
@@ -64,9 +73,9 @@ bash -n "${tmp}/snippets.bash"
 
 mkdir -p "${tmp}/assets" "${tmp}/mock-bin"
 for target in x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-  package="bitbygit-${workspace_version}-${target}"
+  package="bitbygit-${selected_version}-${target}"
   mkdir -p "${tmp}/package/${package}"
-  printf '#!/usr/bin/env sh\nprintf '\''bitbygit %s\\n'\''\n' "${workspace_version}" > "${tmp}/package/${package}/bitbygit"
+  printf '#!/usr/bin/env sh\nprintf '\''bitbygit %s\\n'\''\n' "${selected_version}" > "${tmp}/package/${package}/bitbygit"
   chmod +x "${tmp}/package/${package}/bitbygit"
   tar -C "${tmp}/package" -czf "${tmp}/assets/${package}.tar.gz" "${package}"
   rm -rf "${tmp}/package/${package}"
@@ -108,7 +117,7 @@ check_unix_success() {
   local machine="$3"
   local case_dir="${tmp}/success-${target}"
   mkdir -p "${case_dir}/home"
-  extract_block "${heading}" bash > "${case_dir}/snippet.bash"
+  extract_selected_block "${heading}" bash > "${case_dir}/snippet.bash"
   [[ -s "${case_dir}/snippet.bash" ]] || fail "missing ${heading} Bash block"
 
   (
@@ -128,9 +137,9 @@ check_unix_success() {
     fi
     [[ "${PATH%%:*}" == "${HOME}/.local/bin" ]] || fail "${heading} did not update the caller PATH"
     [[ -x "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not install the binary"
-    [[ "$("${HOME}/.local/bin/bitbygit" --version)" == "bitbygit ${workspace_version}" ]] || fail "${heading} installed the wrong version"
+    [[ "$("${HOME}/.local/bin/bitbygit" --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} installed the wrong version"
     [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not resolve the installed command through PATH"
-    [[ "$(bitbygit --version)" == "bitbygit ${workspace_version}" ]] || fail "${heading} resolved the wrong version through PATH"
+    [[ "$(bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} resolved the wrong version through PATH"
   )
 }
 
@@ -153,8 +162,8 @@ case "${host_os}" in
 esac
 
 mkdir -p "${tmp}/failure-assets" "${tmp}/failure-bin"
-cp "${tmp}/assets/bitbygit-${workspace_version}-${failure_target}.tar.gz" "${tmp}/failure-assets/"
-printf '%064d  bitbygit-%s-%s.tar.gz\n' 0 "${workspace_version}" "${failure_target}" > "${tmp}/failure-assets/SHA256SUMS"
+cp "${tmp}/assets/bitbygit-${selected_version}-${failure_target}.tar.gz" "${tmp}/failure-assets/"
+printf '%064d  bitbygit-%s-%s.tar.gz\n' 0 "${selected_version}" "${failure_target}" > "${tmp}/failure-assets/SHA256SUMS"
 cp "${tmp}/mock-bin/curl" "${tmp}/failure-bin/curl"
 cp "${tmp}/mock-bin/uname" "${tmp}/failure-bin/uname"
 for command in tar install; do
@@ -167,7 +176,7 @@ chmod +x "${tmp}/failure-bin/"*
 
 failure_dir="${tmp}/failure-${failure_target}"
 mkdir -p "${failure_dir}/home"
-extract_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
+extract_selected_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
 (
   cd "${failure_dir}"
   set +e
@@ -206,17 +215,17 @@ git init --quiet "${source_seed}"
 git -C "${source_seed}" config user.email validator@example.invalid
 git -C "${source_seed}" config user.name "Installation validator"
 mkdir -p "${source_seed}/target/release"
-printf '#!/usr/bin/env sh\nprintf '\''bitbygit %s\\n'\''\n' "${workspace_version}" > "${source_seed}/target/release/bitbygit"
+printf '#!/usr/bin/env sh\nprintf '\''bitbygit %s\\n'\''\n' "${selected_version}" > "${source_seed}/target/release/bitbygit"
 chmod +x "${source_seed}/target/release/bitbygit"
 git -C "${source_seed}" add -f target/release/bitbygit
 git -C "${source_seed}" commit --quiet -m "tagged source"
-git -C "${source_seed}" tag -a "v${workspace_version}" -m "release ${workspace_version}"
+git -C "${source_seed}" tag -a "v${selected_version}" -m "release ${selected_version}"
 printf '#!/usr/bin/env sh\nprintf '\''bitbygit 9.9.9\\n'\''\n' > "${source_seed}/target/release/bitbygit"
 git -C "${source_seed}" commit --quiet -am "same-named branch"
-git -C "${source_seed}" branch "v${workspace_version}"
+git -C "${source_seed}" branch "v${selected_version}"
 git -C "${source_seed}" push --quiet "${source_remote}" \
-  "refs/heads/v${workspace_version}:refs/heads/v${workspace_version}" \
-  "refs/tags/v${workspace_version}:refs/tags/v${workspace_version}"
+  "refs/heads/v${selected_version}:refs/heads/v${selected_version}" \
+  "refs/tags/v${selected_version}:refs/tags/v${selected_version}"
 
 source_dir="${tmp}/source-install"
 mkdir -p "${source_dir}/home" "${source_dir}/mock-bin"
@@ -226,7 +235,7 @@ exit 0
 MOCK
 cp "${tmp}/mock-bin/bitbygit" "${source_dir}/mock-bin/bitbygit"
 chmod +x "${source_dir}/mock-bin/"*
-source_snippet="$(extract_block "Build from source" bash)"
+source_snippet="$(extract_selected_block "Build from source" bash)"
 source_snippet="${source_snippet/https:\/\/github.com\/cosentinode\/bitbygit.git/${source_remote}}"
 printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
 (
@@ -234,12 +243,12 @@ printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
   export HOME="${source_dir}/home"
   export PATH="${source_dir}/mock-bin:${PATH}"
   source "${source_dir}/snippet.bash" || fail "Bash source block failed with colliding branch and tag names"
-  tag_commit="$(git --git-dir="${source_remote}" rev-parse "refs/tags/v${workspace_version}^{commit}")"
-  branch_commit="$(git --git-dir="${source_remote}" rev-parse "refs/heads/v${workspace_version}")"
+  tag_commit="$(git --git-dir="${source_remote}" rev-parse "refs/tags/v${selected_version}^{commit}")"
+  branch_commit="$(git --git-dir="${source_remote}" rev-parse "refs/heads/v${selected_version}")"
   head_commit="$(git -C bitbygit rev-parse HEAD)"
   [[ "${head_commit}" == "${tag_commit}" && "${head_commit}" != "${branch_commit}" ]] || fail "Bash source block did not check out the exact tag object"
   [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "Bash source block did not resolve the installed command through PATH"
-  [[ "$(bitbygit --version)" == "bitbygit ${workspace_version}" ]] || fail "Bash source block resolved the wrong version through PATH"
+  [[ "$(bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "Bash source block resolved the wrong version through PATH"
 )
 
 check_links() {
