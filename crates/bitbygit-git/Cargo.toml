@@ -16,5 +16,5 @@ sha2 = "0.10"
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "0.38", features = ["fs"] }
+rustix = { version = "0.38", features = ["fs", "process"] }
 xattr = "1"
