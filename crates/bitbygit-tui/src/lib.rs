@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyModifiers;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind};
@@ -31,6 +31,7 @@ use bitbygit_store::{AuditEntry, LocalStore, RepoId, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
 const MAX_AUDIT_MESSAGE_LEN: usize = 512;
+const POLICY_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 const AUDIT_SECRET_MARKERS: &[&str] = &[
     "authorization",
     "credential",
@@ -47,8 +48,8 @@ const AUDIT_SECRET_MARKERS: &[&str] = &[
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
-    let mut app = App::with_policy(effective_policy_from_environment());
-    app.load_current_dir();
+    let mut app = App::from_startup(startup_policy_from_environment());
+    let mut last_policy_reload = Instant::now();
 
     loop {
         terminal.draw(|frame| {
@@ -63,8 +64,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        if event::poll(Duration::from_millis(100))? {
-            app.policy = effective_policy_from_environment();
+        let input_ready = event::poll(Duration::from_millis(100))?;
+        if input_ready || last_policy_reload.elapsed() >= POLICY_RELOAD_INTERVAL {
+            app.reload_policy(&AuditDestination::Environment);
+            last_policy_reload = Instant::now();
+        }
+        if input_ready {
             app.handle_event(event::read()?);
         }
     }
@@ -137,6 +142,7 @@ pub struct App {
     selected_file: usize,
     file_scroll: usize,
     details: String,
+    config_diagnostic: Option<String>,
     operation_queue: OperationQueue,
     policy: EffectivePolicy,
     should_quit: bool,
@@ -164,10 +170,28 @@ impl App {
             selected_file: 0,
             file_scroll: 0,
             details: "No repository status loaded yet.".to_owned(),
+            config_diagnostic: None,
             operation_queue: OperationQueue::default(),
             policy,
             should_quit: false,
             last_viewport: Viewport::default(),
+        }
+    }
+
+    fn from_startup(startup: StartupPolicy) -> Self {
+        let mut app = Self::with_policy(startup.policy);
+        app.config_diagnostic = startup.diagnostic;
+        app.load_current_dir();
+        app
+    }
+
+    fn reload_policy(&mut self, destination: &AuditDestination) {
+        let reload = destination.reload_policy(&self.policy);
+        let recovered = self.config_diagnostic.is_some() && reload.diagnostic.is_none();
+        self.policy = reload.policy;
+        self.config_diagnostic = reload.diagnostic;
+        if recovered {
+            self.refresh_status();
         }
     }
 
@@ -337,6 +361,10 @@ impl App {
     }
 
     fn refresh_status(&mut self) {
+        if let Some(error) = direct_read_policy_error(&self.policy, OperationKind::RefreshStatus) {
+            self.details = error;
+            return;
+        }
         match Git::new(current_dir()).status() {
             Ok(status) => {
                 self.files = status
@@ -368,6 +396,10 @@ impl App {
     }
 
     fn refresh_diff(&mut self) {
+        if let Some(error) = direct_read_policy_error(&self.policy, OperationKind::ViewDiff) {
+            self.details = error;
+            return;
+        }
         let Some(file) = self.files.get(self.selected_file) else {
             self.details = "No changed file selected.".to_owned();
             return;
@@ -396,9 +428,10 @@ impl App {
             return;
         }
         let pathspecs = file.pathspecs.clone();
-        self.submit_prepared_operation(
-            OperationPlanner::current(self.policy.clone()).plan_stage_pathspecs(pathspecs),
-        );
+        match OperationPlanner::current(self.policy.clone()).plan_stage_pathspecs(pathspecs) {
+            Ok(operation) => self.submit_prepared_operation(operation),
+            Err(error) => self.details = error,
+        }
     }
 
     fn unstage_selected_file(&mut self) {
@@ -410,9 +443,10 @@ impl App {
             return;
         }
         let pathspecs = file.pathspecs.clone();
-        self.submit_prepared_operation(
-            OperationPlanner::current(self.policy.clone()).plan_unstage_pathspecs(pathspecs),
-        );
+        match OperationPlanner::current(self.policy.clone()).plan_unstage_pathspecs(pathspecs) {
+            Ok(operation) => self.submit_prepared_operation(operation),
+            Err(error) => self.details = error,
+        }
     }
 
     fn submit_operation_request(&mut self, request: OperationRequest) {
@@ -441,7 +475,18 @@ impl App {
     }
 
     fn execute_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
-        let message = execute_typed_plan(&plan, context, self.policy.clone());
+        let executor = PlanExecutor::current(self.policy.clone());
+        self.execute_operation_with(&executor, plan, context);
+    }
+
+    fn execute_operation_with(
+        &mut self,
+        executor: &PlanExecutor,
+        plan: OperationPlan,
+        context: ExecutionContext,
+    ) {
+        let message = executor.execute(&plan, context).message();
+        self.reload_policy(&executor.audit);
         if should_refresh_status_after(&plan) {
             self.refresh_status();
         }
@@ -464,8 +509,19 @@ impl App {
         sequence: QueuedPromptSequence,
         confirmed_requirement: ConfirmationRequirement,
     ) {
-        let result = PromptSequenceExecutor::current(self.policy.clone())
-            .execute_confirmed(sequence, confirmed_requirement);
+        let executor = PromptSequenceExecutor::current(self.policy.clone());
+        self.execute_prompt_sequence_with(&executor, sequence, confirmed_requirement);
+    }
+
+    fn execute_prompt_sequence_with(
+        &mut self,
+        executor: &PromptSequenceExecutor,
+        sequence: QueuedPromptSequence,
+        confirmed_requirement: ConfirmationRequirement,
+    ) {
+        let result = executor.execute_confirmed(sequence, confirmed_requirement);
+        self.policy = result.policy().clone();
+        self.reload_policy(&executor.audit);
         if result.should_refresh_status() {
             self.refresh_status();
         }
@@ -473,6 +529,10 @@ impl App {
     }
 
     fn submit_prompt(&mut self) {
+        if !self.policy.prompt_enabled() {
+            self.details = "Prompt input is disabled by policy.".to_owned();
+            return;
+        }
         let parsed = match parse_prompt(&self.prompt) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1327,6 +1387,57 @@ fn compare_url_ref(reference: &str) -> String {
     encoded
 }
 
+fn disabled_operation_message(operation: OperationKind) -> String {
+    format!(
+        "Operation blocked: {} is disabled by policy.",
+        operation.action_label()
+    )
+}
+
+fn direct_read_policy_error(policy: &EffectivePolicy, operation: OperationKind) -> Option<String> {
+    if policy.is_operation_disabled(operation) {
+        return Some(disabled_operation_message(operation));
+    }
+    let requirement = policy
+        .evaluate_confirmation(RiskLevel::Low, operation, None)
+        .requirement;
+    match requirement {
+        ConfirmationRequirement::NormalSelection => None,
+        ConfirmationRequirement::Blocked => Some(format!(
+            "Operation blocked: {} is blocked by confirmation policy.",
+            operation.action_label()
+        )),
+        requirement => Some(format!(
+            "Operation blocked: {} requires {}; direct UI reads support normal selection only.",
+            operation.action_label(),
+            confirmation_requirement_label(requirement)
+        )),
+    }
+}
+
+fn operation_request_kind(request: &OperationRequest) -> Option<OperationKind> {
+    match request {
+        OperationRequest::RefreshStatus => Some(OperationKind::RefreshStatus),
+        OperationRequest::ViewDiff { .. } => Some(OperationKind::ViewDiff),
+        OperationRequest::Fetch => Some(OperationKind::Fetch),
+        OperationRequest::StagePaths { .. } => Some(OperationKind::StagePaths),
+        OperationRequest::UnstagePaths { .. } => Some(OperationKind::UnstagePaths),
+        OperationRequest::StageAll => Some(OperationKind::StageAll),
+        OperationRequest::UnstageAll => Some(OperationKind::UnstageAll),
+        OperationRequest::Commit { .. } => Some(OperationKind::Commit),
+        OperationRequest::Push => Some(OperationKind::PushCurrentBranch),
+        OperationRequest::Pull { rebase: false } => Some(OperationKind::PullFastForward),
+        OperationRequest::Pull { rebase: true } => Some(OperationKind::PullRebase),
+        OperationRequest::Branches => Some(OperationKind::Branches),
+        OperationRequest::Checkout { .. } => Some(OperationKind::CheckoutBranch),
+        OperationRequest::CreateBranch { .. } => Some(OperationKind::CreateBranch),
+        OperationRequest::Merge { .. } => Some(OperationKind::MergeFastForward),
+        OperationRequest::Rebase { .. } => Some(OperationKind::Rebase),
+        OperationRequest::OpenPullRequest { .. } => Some(OperationKind::OpenPullRequest),
+        OperationRequest::PromptSequence { .. } => None,
+    }
+}
+
 fn apply_policy_to_plan(policy: &EffectivePolicy, plan: &mut OperationPlan, branch: Option<&str>) {
     let evaluation = evaluate_plan_policy(policy, plan, branch);
     apply_policy_evaluation(plan, evaluation);
@@ -1861,6 +1972,9 @@ impl OperationPlanner {
     }
 
     fn plan_request(&self, request: OperationRequest) -> Result<PreparedOperation, String> {
+        if let Some(operation) = operation_request_kind(&request) {
+            self.ensure_operation_enabled(operation)?;
+        }
         if let Some(operation) = self.preflight_blocked_request(&request)? {
             return Ok(operation);
         }
@@ -1953,26 +2067,40 @@ impl OperationPlanner {
             return Err("Prompt sequence requires at least two steps.".to_owned());
         }
         for (index, request) in requests.iter().enumerate() {
-            prompt_sequence_request_preview(request).map_err(|error| {
+            let preview = prompt_sequence_request_preview(request).map_err(|error| {
                 format!("Prompt sequence step {} is blocked: {error}", index + 1)
             })?;
+            self.ensure_operation_enabled(preview.kind)
+                .map_err(|error| {
+                    format!("Prompt sequence step {} is blocked: {error}", index + 1)
+                })?;
         }
+        let git = self.git();
+        let branch = git
+            .status()
+            .ok()
+            .and_then(|status| branch_name(&status.branch).ok())
+            .or_else(|| {
+                git.head_target()
+                    .ok()
+                    .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
+            });
+        let (policy_evaluations, sequence_policy_evaluations) =
+            prompt_sequence_policy_evaluations(&self.policy, &git, &requests, branch)?;
         let first_request = requests
             .first()
             .cloned()
             .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
-        let first = self.plan_request(first_request)?;
+        let blocked = policy_evaluations
+            .iter()
+            .chain(&sequence_policy_evaluations)
+            .any(|evaluation| evaluation.requirement == ConfirmationRequirement::Blocked);
+        let first = if blocked {
+            prompt_sequence_preflight_operation(first_request)?
+        } else {
+            self.plan_request(first_request)?
+        };
         let mut plan = prompt_sequence_plan(&requests, &first)?;
-        let branch = policy_branch(&first.context)
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                self.git()
-                    .status()
-                    .ok()
-                    .and_then(|status| branch_name(&status.branch).ok())
-            });
-        let (policy_evaluations, sequence_policy_evaluations) =
-            prompt_sequence_policy_evaluations(&self.policy, &self.git(), &requests, branch)?;
         apply_policy_evaluation(
             &mut plan,
             combined_policy_evaluation(
@@ -1994,18 +2122,28 @@ impl OperationPlanner {
         ))
     }
 
-    fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
-        self.apply_policy(PreparedOperation::new(
+    fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> Result<PreparedOperation, String> {
+        self.ensure_operation_enabled(OperationKind::StagePaths)?;
+        Ok(self.apply_policy(PreparedOperation::new(
             stage_paths_plan(file_path_labels(&paths)),
             ExecutionContext::from_payload(PendingPayload::StagePaths { paths }),
-        ))
+        )))
     }
 
-    fn plan_unstage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
-        self.apply_policy(PreparedOperation::new(
+    fn plan_unstage_pathspecs(&self, paths: Vec<PathBuf>) -> Result<PreparedOperation, String> {
+        self.ensure_operation_enabled(OperationKind::UnstagePaths)?;
+        Ok(self.apply_policy(PreparedOperation::new(
             unstage_paths_plan(file_path_labels(&paths)),
             ExecutionContext::from_payload(PendingPayload::UnstagePaths { paths }),
-        ))
+        )))
+    }
+
+    fn ensure_operation_enabled(&self, operation: OperationKind) -> Result<(), String> {
+        if self.policy.is_operation_disabled(operation) {
+            Err(disabled_operation_message(operation))
+        } else {
+            Ok(())
+        }
     }
 
     fn apply_policy(&self, mut operation: PreparedOperation) -> PreparedOperation {
@@ -2482,6 +2620,25 @@ impl OperationPlanner {
     }
 }
 
+fn prompt_sequence_preflight_operation(
+    request: OperationRequest,
+) -> Result<PreparedOperation, String> {
+    let preview = prompt_sequence_request_preview(&request)?;
+    let mut step = OperationStep::new(preview.kind, preview.risk_level, preview.summary);
+    for detail in preview.details {
+        step = step.with_detail(detail);
+    }
+    Ok(PreparedOperation::new(
+        OperationPlan::new(
+            request,
+            "Prompt sequence preflight",
+            vec![step],
+            String::new(),
+        ),
+        ExecutionContext::default(),
+    ))
+}
+
 fn open_pull_request_gh_error(error: GhError) -> String {
     format!("Open pull request blocked: {error}")
 }
@@ -2799,9 +2956,21 @@ fn status_file_visible_len(area: Rect, has_operation_banner: bool) -> usize {
 }
 
 fn details_panel(app: &App) -> Paragraph<'_> {
-    Paragraph::new(app.details.clone())
+    Paragraph::new(details_text(app))
         .block(panel_block("Details", app.focus == Focus::Details))
         .wrap(Wrap { trim: true })
+}
+
+fn details_text(app: &App) -> String {
+    app.config_diagnostic.as_ref().map_or_else(
+        || app.details.clone(),
+        |diagnostic| {
+            format!(
+                "Configuration reload error: {diagnostic}\n\n{}",
+                app.details
+            )
+        },
+    )
 }
 
 fn queue_panel(app: &App) -> Paragraph<'_> {
@@ -3023,17 +3192,75 @@ fn current_dir() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_error| std::path::PathBuf::from("."))
 }
 
-fn effective_policy_from_environment() -> EffectivePolicy {
-    StorePaths::from_environment()
-        .ok()
-        .and_then(|paths| effective_policy_from_paths(&paths))
-        .unwrap_or_default()
+struct StartupPolicy {
+    policy: EffectivePolicy,
+    diagnostic: Option<String>,
 }
 
-fn effective_policy_from_paths(paths: &StorePaths) -> Option<EffectivePolicy> {
-    LocalStore::open(paths.clone())
-        .ok()
-        .map(|store| EffectivePolicy::new(&store.load_config().settings))
+fn startup_policy_from_environment() -> StartupPolicy {
+    match StorePaths::from_environment() {
+        Ok(paths) => startup_policy_from_paths(&paths),
+        Err(error) => StartupPolicy::failed(error.to_string()),
+    }
+}
+
+fn startup_policy_from_paths(paths: &StorePaths) -> StartupPolicy {
+    match LocalStore::open(paths.clone()) {
+        Ok(store) => {
+            let loaded = store.load_config();
+            StartupPolicy {
+                policy: EffectivePolicy::new(&loaded.settings),
+                diagnostic: loaded.diagnostic.map(|diagnostic| diagnostic.to_string()),
+            }
+        }
+        Err(error) => StartupPolicy::failed(error.to_string()),
+    }
+}
+
+impl StartupPolicy {
+    fn failed(error: String) -> Self {
+        Self {
+            policy: EffectivePolicy::safe_fallback(),
+            diagnostic: Some(format!(
+                "configuration could not be loaded: {error}; using the safe fallback configuration"
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PolicyReload {
+    policy: EffectivePolicy,
+    diagnostic: Option<String>,
+}
+
+fn policy_reload_from_paths(paths: &StorePaths, fallback: &EffectivePolicy) -> PolicyReload {
+    match LocalStore::open(paths.clone()) {
+        Ok(store) => {
+            let loaded = store.load_config();
+            match loaded.diagnostic {
+                Some(diagnostic) => PolicyReload {
+                    policy: fallback.clone(),
+                    diagnostic: Some(format!(
+                        "{}; retaining the last valid policy until the configuration is fixed",
+                        diagnostic
+                            .to_string()
+                            .trim_end_matches("; using the safe fallback configuration")
+                    )),
+                },
+                None => PolicyReload {
+                    policy: EffectivePolicy::new(&loaded.settings),
+                    diagnostic: None,
+                },
+            }
+        }
+        Err(error) => PolicyReload {
+            policy: fallback.clone(),
+            diagnostic: Some(format!(
+                "configuration could not be reloaded: {error}; retaining the last valid policy until the configuration is fixed"
+            )),
+        },
+    }
 }
 
 fn operation_message(action: &str, result: Result<(), String>) -> String {
@@ -3041,16 +3268,6 @@ fn operation_message(action: &str, result: Result<(), String>) -> String {
         Ok(()) => format!("{action} succeeded"),
         Err(error) => format!("{action} failed: {error}"),
     }
-}
-
-fn execute_typed_plan(
-    plan: &OperationPlan,
-    context: ExecutionContext,
-    policy: EffectivePolicy,
-) -> String {
-    PlanExecutor::current(policy)
-        .execute(plan, context)
-        .message()
 }
 
 fn should_refresh_status_after(plan: &OperationPlan) -> bool {
@@ -3176,6 +3393,13 @@ impl PlanExecutor {
         plan: &OperationPlan,
         context: &ExecutionContext,
     ) -> Result<(), String> {
+        if let Some(step) = plan
+            .steps
+            .iter()
+            .find(|step| self.policy.is_operation_disabled(step.kind))
+        {
+            return Err(disabled_operation_message(step.kind));
+        }
         if plan.confirmation.requirement == ConfirmationRequirement::Blocked {
             return Err("operation is blocked by the policy captured in the preview".to_owned());
         }
@@ -3823,7 +4047,7 @@ impl PromptSequenceExecutor {
         } = sequence;
         let mut step_results = Vec::with_capacity(total_steps);
 
-        let current_policy = self.load_policy();
+        let mut current_policy = self.load_policy(&self.policy);
         let git = Git::new(self.repo_root.clone());
         let requests = std::iter::once(first.plan.request.clone())
             .chain(remaining_requests.iter().cloned())
@@ -3844,7 +4068,11 @@ impl PromptSequenceExecutor {
                         first.plan.title.clone(),
                         format!("policy requires a new sequence preview and confirmation: {error}"),
                     ));
-                    return PromptSequenceExecutionResult::new(total_steps, step_results);
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
                 }
             };
         if !sequence_policy_confirmation_covers(
@@ -3861,7 +4089,7 @@ impl PromptSequenceExecutor {
                 first.plan.title.clone(),
                 "policy requires a new sequence preview and confirmation".to_owned(),
             ));
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         }
 
         let mut previewed_policies = policy_evaluations.into_iter();
@@ -3876,7 +4104,7 @@ impl PromptSequenceExecutor {
                 first.plan.title.clone(),
                 "sequence preview is missing policy context".to_owned(),
             ));
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         };
         let branch = policy_branch(&first.context);
         let current_evaluation = evaluate_plan_policy(&current_policy, &first.plan, branch);
@@ -3898,12 +4126,12 @@ impl PromptSequenceExecutor {
                 first.plan.title.clone(),
                 "policy requires a new sequence preview and confirmation".to_owned(),
             ));
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         }
         let executor = PlanExecutor {
             repo_root: self.repo_root.clone(),
             audit: self.audit.clone(),
-            policy: current_policy,
+            policy: current_policy.clone(),
             #[cfg(test)]
             ssh_executable: self.ssh_executable.clone(),
         };
@@ -3911,16 +4139,16 @@ impl PromptSequenceExecutor {
         let first_succeeded = first_result.succeeded;
         step_results.push(first_result);
         if !first_succeeded {
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         }
 
         for (index, request) in remaining_requests.into_iter().enumerate() {
             let step_number = index + 2;
-            let planning_policy = self.load_policy();
+            current_policy = self.load_policy(&current_policy);
             let planner = OperationPlanner {
                 repo_root: self.repo_root.clone(),
                 github_executable: self.github_executable.clone(),
-                policy: planning_policy,
+                policy: current_policy.clone(),
                 #[cfg(test)]
                 ssh_executable: self.ssh_executable.clone(),
             };
@@ -3932,7 +4160,11 @@ impl PromptSequenceExecutor {
                         prompt_sequence_request_title(&request),
                         error,
                     ));
-                    return PromptSequenceExecutionResult::new(total_steps, step_results);
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
                 }
             };
             let (Some(previewed_policy), Some(previewed_sequence_policy)) = (
@@ -3944,9 +4176,13 @@ impl PromptSequenceExecutor {
                     operation.plan.title.clone(),
                     "sequence preview is missing policy context".to_owned(),
                 ));
-                return PromptSequenceExecutionResult::new(total_steps, step_results);
+                return PromptSequenceExecutionResult::new(
+                    total_steps,
+                    step_results,
+                    current_policy,
+                );
             };
-            let current_policy = self.load_policy();
+            current_policy = self.load_policy(&current_policy);
             let branch = policy_branch(&operation.context);
             let current_evaluation = evaluate_plan_policy(&current_policy, &operation.plan, branch);
             let current_sequence_evaluation =
@@ -3967,12 +4203,16 @@ impl PromptSequenceExecutor {
                     operation.plan.title.clone(),
                     "policy requires a new sequence preview and confirmation".to_owned(),
                 ));
-                return PromptSequenceExecutionResult::new(total_steps, step_results);
+                return PromptSequenceExecutionResult::new(
+                    total_steps,
+                    step_results,
+                    current_policy,
+                );
             }
             let executor = PlanExecutor {
                 repo_root: self.repo_root.clone(),
                 audit: self.audit.clone(),
-                policy: current_policy,
+                policy: current_policy.clone(),
                 #[cfg(test)]
                 ssh_executable: self.ssh_executable.clone(),
             };
@@ -3980,15 +4220,19 @@ impl PromptSequenceExecutor {
             let succeeded = step.succeeded;
             step_results.push(step);
             if !succeeded {
-                return PromptSequenceExecutionResult::new(total_steps, step_results);
+                return PromptSequenceExecutionResult::new(
+                    total_steps,
+                    step_results,
+                    current_policy,
+                );
             }
         }
 
-        PromptSequenceExecutionResult::new(total_steps, step_results)
+        PromptSequenceExecutionResult::new(total_steps, step_results, current_policy)
     }
 
-    fn load_policy(&self) -> EffectivePolicy {
-        self.audit.load_policy(&self.policy)
+    fn load_policy(&self, fallback: &EffectivePolicy) -> EffectivePolicy {
+        self.audit.load_policy(fallback)
     }
 
     fn execute_prepared_step(
@@ -4013,14 +4257,24 @@ impl PromptSequenceExecutor {
 struct PromptSequenceExecutionResult {
     total_steps: usize,
     step_results: Vec<PromptSequenceStepResult>,
+    policy: EffectivePolicy,
 }
 
 impl PromptSequenceExecutionResult {
-    fn new(total_steps: usize, step_results: Vec<PromptSequenceStepResult>) -> Self {
+    fn new(
+        total_steps: usize,
+        step_results: Vec<PromptSequenceStepResult>,
+        policy: EffectivePolicy,
+    ) -> Self {
         Self {
             total_steps,
             step_results,
+            policy,
         }
+    }
+
+    fn policy(&self) -> &EffectivePolicy {
+        &self.policy
     }
 
     fn should_refresh_status(&self) -> bool {
@@ -4108,15 +4362,22 @@ enum AuditDestination {
 
 impl AuditDestination {
     fn load_policy(&self, fallback: &EffectivePolicy) -> EffectivePolicy {
+        self.reload_policy(fallback).policy
+    }
+
+    fn reload_policy(&self, fallback: &EffectivePolicy) -> PolicyReload {
         match self {
-            Self::Environment => StorePaths::from_environment()
-                .ok()
-                .and_then(|paths| effective_policy_from_paths(&paths))
-                .unwrap_or_else(|| fallback.clone()),
+            Self::Environment => match StorePaths::from_environment() {
+                Ok(paths) => policy_reload_from_paths(&paths, fallback),
+                Err(error) => PolicyReload {
+                    policy: fallback.clone(),
+                    diagnostic: Some(format!(
+                        "configuration paths could not be resolved: {error}; retaining the last valid policy until the configuration is fixed"
+                    )),
+                },
+            },
             #[cfg(test)]
-            Self::Paths(paths) => {
-                effective_policy_from_paths(paths).unwrap_or_else(|| fallback.clone())
-            }
+            Self::Paths(paths) => policy_reload_from_paths(paths, fallback),
         }
     }
 
@@ -4624,7 +4885,7 @@ fn sanitized_github_error(error: &GhError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitbygit_core::config::{AppConfig, ConfirmationSetting};
+    use bitbygit_core::config::{AppConfig, ConfirmationSetting, OperationFamily};
     use crossterm::event::{KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;
 
@@ -4791,6 +5052,33 @@ mod tests {
 
         app.submit_prompt();
 
+        assert!(app.details.contains("Raw Git commands are not supported"));
+        assert_eq!(app.operation_queue.pending(), None);
+    }
+
+    #[test]
+    fn disabled_prompt_cannot_bypass_operation_policy_or_parse_raw_commands() {
+        let mut config = AppConfig::default();
+        config.prompt.enabled = false;
+        config.policy.disabled_operations = vec![OperationFamily::Fetch];
+        let mut app = App::with_policy(EffectivePolicy::new(&config));
+        app.focus = Focus::Prompt;
+        app.prompt = "fetch".to_owned();
+
+        app.submit_prompt();
+
+        assert_eq!(app.details, "Prompt input is disabled by policy.");
+        assert_eq!(app.prompt, "fetch");
+        assert_eq!(app.operation_queue.pending(), None);
+
+        config.prompt.enabled = true;
+        app.policy = EffectivePolicy::new(&config);
+        app.submit_prompt();
+        assert!(app.details.contains("fetch is disabled by policy"));
+        assert_eq!(app.operation_queue.pending(), None);
+
+        app.prompt = "git fetch".to_owned();
+        app.submit_prompt();
         assert!(app.details.contains("Raw Git commands are not supported"));
         assert_eq!(app.operation_queue.pending(), None);
     }
@@ -6505,6 +6793,145 @@ mod tests {
     }
 
     #[test]
+    fn disabled_pull_family_rejects_both_variants_before_fetching() -> Result<(), Box<dyn Error>> {
+        for (name, rebase) in [("fast-forward", false), ("rebase", true)] {
+            let (repo, branch, original_tracking_oid) =
+                stale_pull_tracking_repo(&format!("disabled-pull-{name}"))?;
+            let mut config = AppConfig::default();
+            config.policy.disabled_operations = vec![OperationFamily::Pull];
+            let planner = OperationPlanner {
+                repo_root: repo.clone(),
+                github_executable: None,
+                policy: EffectivePolicy::new(&config),
+                ssh_executable: Some(test_ssh_command()?),
+            };
+
+            let error = match planner.plan_request(OperationRequest::Pull { rebase }) {
+                Ok(_operation) => {
+                    return Err(std::io::Error::other("disabled pull must be rejected").into());
+                }
+                Err(error) => error,
+            };
+
+            assert!(error.contains("pull"), "{error}");
+            assert!(error.contains("disabled by policy"), "{error}");
+            assert_eq!(
+                git_stdout(
+                    &repo,
+                    &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+                )?
+                .trim(),
+                original_tracking_oid
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_later_sequence_step_preflights_before_first_step_planning()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, branch, original_tracking_oid) =
+            stale_pull_tracking_repo("disabled-later-sequence-step")?;
+        let mut config = AppConfig::default();
+        config.policy.disabled_operations = vec![OperationFamily::Branches];
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: None,
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let error = match planner.plan_prompt_sequence(vec![
+            OperationRequest::Pull { rebase: false },
+            OperationRequest::Branches,
+        ]) {
+            Ok(_sequence) => {
+                return Err(std::io::Error::other(
+                    "disabled later step must reject the whole sequence",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains("step 2"), "{error}");
+        assert!(error.contains("disabled by policy"), "{error}");
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            original_tracking_oid
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmation_blocked_later_step_does_not_fetch_temporary_remote_object()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("blocked-later-step-remote-object")?;
+        let remote = isolated_bare_git_repo("blocked-later-step-remote-object-remote")?;
+        let updater = isolated_git_repo("blocked-later-step-remote-object-updater")?;
+        let ssh = test_ssh_command()?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &remote)?;
+        git_stdout_with_ssh(&repo, &["push", "-u", "origin", &branch], &ssh)?;
+
+        configure_git_identity(&updater)?;
+        add_github_remote(&updater, "origin", &remote)?;
+        git_stdout_with_ssh(&updater, &["fetch", "origin", &branch], &ssh)?;
+        git_stdout(&updater, &["checkout", "-b", &branch, "FETCH_HEAD"])?;
+        std::fs::write(updater.join("file.txt"), "remote update\n")?;
+        git_stdout(&updater, &["add", "file.txt"])?;
+        git_stdout(&updater, &["commit", "-m", "remote update"])?;
+        let remote_oid = git_stdout(&updater, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        git_stdout_with_ssh(&updater, &["push", "origin", &branch], &ssh)?;
+        assert!(!git_object_exists(&repo, &remote_oid)?);
+
+        let mut config = AppConfig::default();
+        config.policy.confirmation.high = ConfirmationSetting::Blocked;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: None,
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(ssh),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Pull { rebase: false },
+                OperationRequest::Rebase {
+                    base: branch.clone(),
+                },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::Blocked
+        );
+        assert!(!git_object_exists(&repo, &remote_oid)?);
+        assert!(
+            git_stdout(
+                &repo,
+                &["for-each-ref", "--format=%(refname)", "refs/bitbygit/fetch"]
+            )?
+            .trim()
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn allowed_pull_publishes_staged_tracking_ref_only_during_execution()
     -> Result<(), Box<dyn Error>> {
         let (repo, branch, original_tracking_oid) = stale_pull_tracking_repo("allowed-pull")?;
@@ -6588,8 +7015,7 @@ mod tests {
         let executor = PlanExecutor {
             repo_root: repo.clone(),
             audit: AuditDestination::Paths(paths.clone()),
-            policy: effective_policy_from_paths(&paths)
-                .ok_or_else(|| std::io::Error::other("expected changed policy"))?,
+            policy: AuditDestination::Paths(paths.clone()).load_policy(&EffectivePolicy::default()),
             ssh_executable: None,
         };
         let result = executor.execute(&operation.plan, operation.context);
@@ -7053,6 +7479,233 @@ mod tests {
     }
 
     #[test]
+    fn executor_rejects_disabled_steps_without_side_effects() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("disabled-execution")?;
+        std::fs::write(repo.join("file.txt"), "unstaged\n")?;
+        let mut config = AppConfig::default();
+        config.policy.disabled_operations = vec![OperationFamily::Stage];
+        let executor = PlanExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(isolated_store_paths("disabled-execution-audit")?),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: None,
+        };
+
+        let result = executor.execute(
+            &stage_all_plan(),
+            ExecutionContext::from_payload(PendingPayload::StageAll),
+        );
+
+        assert!(!result.succeeded());
+        assert!(
+            result.message().contains("stage all is disabled by policy"),
+            "{}",
+            result.message()
+        );
+        assert!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"])?
+                .trim()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn policy_reload_preserves_restrictive_policy_for_invalid_or_unreadable_config()
+    -> Result<(), Box<dyn Error>> {
+        let mut config = AppConfig::default();
+        config.prompt.enabled = false;
+        config.policy.disabled_operations = vec![OperationFamily::Fetch];
+        let restrictive_policy = EffectivePolicy::new(&config);
+
+        let invalid_paths = isolated_store_paths("invalid-policy-reload")?;
+        let invalid_store = LocalStore::open(invalid_paths.clone())?;
+        std::fs::write(&invalid_store.paths().config_file, "not valid toml = [")?;
+        let invalid_reload =
+            AuditDestination::Paths(invalid_paths).reload_policy(&restrictive_policy);
+        assert_eq!(invalid_reload.policy, restrictive_policy);
+        assert!(
+            invalid_reload
+                .diagnostic
+                .is_some_and(|diagnostic| diagnostic.contains("is invalid")
+                    && diagnostic.contains("retaining the last valid policy"))
+        );
+
+        let unreadable_paths = isolated_store_paths("unreadable-policy-reload")?;
+        let unreadable_store = LocalStore::open(unreadable_paths.clone())?;
+        std::fs::create_dir(&unreadable_store.paths().config_file)?;
+        let unreadable_reload =
+            AuditDestination::Paths(unreadable_paths).reload_policy(&restrictive_policy);
+        assert_eq!(unreadable_reload.policy, restrictive_policy);
+        assert!(
+            unreadable_reload
+                .diagnostic
+                .is_some_and(|diagnostic| diagnostic.contains("could not be read")
+                    && diagnostic.contains("retaining the last valid policy"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_policy_fails_closed_and_surfaces_malformed_config() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("invalid-startup-policy")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+
+        let startup = startup_policy_from_paths(&paths);
+
+        assert_eq!(startup.policy, EffectivePolicy::safe_fallback());
+        assert!(
+            startup
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("is invalid"))
+        );
+        let app = App::from_startup(startup);
+        assert!(details_text(&app).contains("safe fallback configuration"));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_policy_fails_closed_and_surfaces_unreadable_config() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("unreadable-startup-policy")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::create_dir(&store.paths().config_file)?;
+
+        let startup = startup_policy_from_paths(&paths);
+
+        assert_eq!(startup.policy, EffectivePolicy::safe_fallback());
+        assert!(
+            startup
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("could not be read"))
+        );
+        let app = App::from_startup(startup);
+        assert!(details_text(&app).contains("safe fallback configuration"));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_fail_closed_mode_recovers_after_config_is_fixed() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("startup-policy-recovery")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+        let mut app = App::from_startup(startup_policy_from_paths(&paths));
+
+        assert_eq!(app.policy, EffectivePolicy::safe_fallback());
+        assert!(app.branch.is_none());
+        assert!(app.config_diagnostic.is_some());
+
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[policy]\ndisabled-operations = [\"fetch\", \"stage\", \"unstage\", \"commit\", \"push\", \"pull\", \"checkout\", \"create-branch\", \"merge\", \"rebase\", \"open-pull-request\"]\n[prompt]\nenabled = false\n",
+        )?;
+        app.reload_policy(&AuditDestination::Paths(paths));
+
+        assert!(app.config_diagnostic.is_none());
+        assert!(app.branch.is_some(), "status should reload after recovery");
+        assert!(!app.policy.prompt_enabled());
+        assert!(app.policy.is_operation_disabled(OperationKind::Fetch));
+        assert!(
+            !app.policy
+                .is_operation_disabled(OperationKind::RefreshStatus)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_reload_diagnostic_stays_visible_until_valid_recovery() -> Result<(), Box<dyn Error>>
+    {
+        let paths = isolated_store_paths("runtime-policy-diagnostic")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[policy]\ndisabled-operations = [\"fetch\"]\n[prompt]\nenabled = false\n",
+        )?;
+        let mut app = App::from_startup(startup_policy_from_paths(&paths));
+        let restrictive_policy = app.policy.clone();
+        app.details = "latest operation detail".to_owned();
+
+        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+        app.reload_policy(&AuditDestination::Paths(paths.clone()));
+
+        assert_eq!(app.policy, restrictive_policy);
+        let visible_details = details_text(&app);
+        assert!(visible_details.contains("Configuration reload error"));
+        assert!(visible_details.contains("retaining the last valid policy"));
+        assert!(visible_details.contains("latest operation detail"));
+
+        app.branch = None;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[policy]\ndisabled-operations = [\"commit\"]\n",
+        )?;
+        app.reload_policy(&AuditDestination::Paths(paths));
+
+        assert!(app.config_diagnostic.is_none());
+        assert!(app.branch.is_some(), "valid recovery should refresh status");
+        assert!(app.policy.is_operation_disabled(OperationKind::Commit));
+        assert!(!app.policy.is_operation_disabled(OperationKind::Fetch));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_status_honors_escalated_and_blocked_low_risk_policy() {
+        for setting in [
+            ConfirmationSetting::VisiblePlan,
+            ConfirmationSetting::ExplicitConfirmation,
+            ConfirmationSetting::Blocked,
+        ] {
+            let mut config = AppConfig::default();
+            config.policy.confirmation.low = setting;
+
+            let app = App::from_startup(StartupPolicy {
+                policy: EffectivePolicy::new(&config),
+                diagnostic: None,
+            });
+
+            assert!(app.branch.is_none());
+            assert!(app.details.contains("Operation blocked: refresh status"));
+        }
+    }
+
+    #[test]
+    fn status_selection_diff_honors_blocked_confirmation_and_disabled_policy() {
+        let mut config = AppConfig::default();
+        config.policy.confirmation.low = ConfirmationSetting::Blocked;
+        let mut app = App::with_policy(EffectivePolicy::new(&config));
+        app.focus = Focus::Status;
+        app.files = ["first.txt", "second.txt"]
+            .into_iter()
+            .map(|path| FileRow {
+                path: PathBuf::from(path),
+                pathspecs: vec![PathBuf::from(path)],
+                label: path.to_owned(),
+                section: FileSection::Unstaged,
+            })
+            .collect();
+
+        app.move_selection_down();
+
+        assert_eq!(app.selected_file, 1);
+        assert_eq!(
+            app.details,
+            "Operation blocked: view diff is blocked by confirmation policy."
+        );
+
+        config.policy.confirmation.low = ConfirmationSetting::NormalSelection;
+        config.policy.disabled_operations = vec![OperationFamily::ViewDiff];
+        app.policy = EffectivePolicy::new(&config);
+        app.selected_file = 0;
+        app.move_selection_down();
+        assert_eq!(
+            app.details,
+            "Operation blocked: view diff is disabled by policy."
+        );
+    }
+
+    #[test]
     fn ordinary_queue_rejects_new_protected_reason_without_requirement_change() {
         let target = HeadTarget {
             oid: Some("1234567890abcdef".to_owned()),
@@ -7149,6 +7802,151 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("new sequence preview"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_prompt_step_stops_when_operation_is_disabled_during_sequence()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("deferred-disabled-operation")?;
+        let remote = isolated_bare_git_repo("deferred-disabled-operation-remote")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("base.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "base.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        std::fs::write(repo.join("next.txt"), "next\n")?;
+        git_stdout(&repo, &["add", "next.txt"])?;
+        add_github_remote(&repo, "origin", &remote)?;
+        let original_head = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Commit {
+                    message: "next".to_owned(),
+                },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("deferred-disabled-operation-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh = operation_disabling_ssh(
+            "deferred-disabled-operation",
+            &store.paths().config_file,
+            "commit",
+        )?;
+        let executor = PromptSequenceExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+
+        let result =
+            executor.execute_confirmed(sequence.sequence, ConfirmationRequirement::VisiblePlan);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 2."),
+            "{message}"
+        );
+        assert!(
+            message.contains("commit is disabled by policy"),
+            "{message}"
+        );
+        assert_eq!(git_stdout(&repo, &["rev-parse", "HEAD"])?, original_head);
+        assert_eq!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"])?.trim(),
+            "next.txt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn app_reloads_policy_before_ordinary_post_operation_refresh_on_success_or_failure()
+    -> Result<(), Box<dyn Error>> {
+        for (name, remote_exists, expected_outcome) in
+            [("success", true, "succeeded"), ("failure", false, "failed")]
+        {
+            let repo = isolated_git_repo(&format!("post-operation-refresh-policy-{name}"))?;
+            let remote = if remote_exists {
+                isolated_bare_git_repo(&format!("post-operation-refresh-policy-{name}-remote"))?
+            } else {
+                repo.join("missing-remote.git")
+            };
+            add_github_remote(&repo, "origin", &remote)?;
+            let paths =
+                isolated_store_paths(&format!("post-operation-refresh-policy-{name}-audit"))?;
+            let store = LocalStore::open(paths.clone())?;
+            let ssh = operation_disabling_ssh(
+                &format!("post-operation-refresh-policy-{name}"),
+                &store.paths().config_file,
+                "refresh-status",
+            )?;
+            let executor = PlanExecutor::with_audit_paths_and_ssh(&repo, paths, ssh);
+            let sentinel = FileRow {
+                path: PathBuf::from("keep.txt"),
+                pathspecs: vec![PathBuf::from("keep.txt")],
+                label: "sentinel".to_owned(),
+                section: FileSection::Unstaged,
+            };
+            let mut app = App::new();
+            app.files = vec![sentinel.clone()];
+
+            app.execute_operation_with(&executor, fetch_plan(), ExecutionContext::default());
+
+            assert!(
+                app.policy
+                    .is_operation_disabled(OperationKind::RefreshStatus)
+            );
+            assert_eq!(app.files, vec![sentinel]);
+            assert!(app.details.contains(expected_outcome), "{}", app.details);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn app_uses_reloaded_policy_for_post_sequence_status_refresh() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("post-sequence-refresh-policy")?;
+        let remote = isolated_bare_git_repo("post-sequence-refresh-policy-remote")?;
+        add_github_remote(&repo, "origin", &remote)?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Branches])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("post-sequence-refresh-policy-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh = operation_disabling_ssh(
+            "post-sequence-refresh-policy",
+            &store.paths().config_file,
+            "refresh-status",
+        )?;
+        let executor = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+        let sentinel = FileRow {
+            path: PathBuf::from("keep.txt"),
+            pathspecs: vec![PathBuf::from("keep.txt")],
+            label: "sentinel".to_owned(),
+            section: FileSection::Unstaged,
+        };
+        let mut app = App::new();
+        app.files = vec![sentinel.clone()];
+
+        app.execute_prompt_sequence_with(
+            &executor,
+            sequence.sequence,
+            ConfirmationRequirement::VisiblePlan,
+        );
+
+        assert!(
+            app.policy
+                .is_operation_disabled(OperationKind::RefreshStatus)
+        );
+        assert_eq!(app.files, vec![sentinel]);
+        assert!(app.details.contains("Prompt sequence completed 2 step(s)."));
         Ok(())
     }
 
@@ -8175,6 +8973,31 @@ mod tests {
         Ok(executable)
     }
 
+    fn operation_disabling_ssh(
+        name: &str,
+        config_file: &std::path::Path,
+        operation: &str,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let root = isolated_temp_root(&format!("{name}-ssh"))?;
+        std::fs::create_dir_all(&root)?;
+        let executable = root.join("ssh");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'schema-version = 1' '[policy]' 'disabled-operations = [\"{operation}\"]' > '{}'\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\nexec git-upload-pack \"$target\"\n",
+                config_file.display()
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&executable)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions)?;
+        }
+        Ok(executable)
+    }
+
     fn fake_gh(name: &str, existing: bool) -> Result<PathBuf, Box<dyn Error>> {
         let pull_requests = if existing {
             "[{\"number\":42,\"html_url\":\"https://github.com/octo/repo/pull/42\",\"title\":\"Existing PR\",\"base\":{\"ref\":\"main\"},\"head\":{\"ref\":\"feature/open-pr\",\"repo\":{\"full_name\":\"octo/repo\"}}}]"
@@ -8236,6 +9059,15 @@ mod tests {
             .into());
         }
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn git_object_exists(repo: &std::path::Path, object: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "-e", object])
+            .status()?
+            .success())
     }
 
     fn configure_git_identity(repo: &std::path::Path) -> Result<(), Box<dyn Error>> {

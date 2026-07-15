@@ -12,7 +12,9 @@ explain.
 - Confirm operations based on risk level.
 - Stop a multi-step operation after the first failed step unless continuation is
   explicitly safe.
-- Treat missing, invalid, or unreadable config as safe defaults.
+- Treat missing config as documented defaults; invalid or unreadable config uses
+  a complete fail-closed fallback at startup and retains the last valid policy
+  during runtime reloads.
 - Do not store GitHub tokens, Git credentials, SSH keys, or credential helper
   output.
 - Do not persist raw stdout or stderr by default. Audit entries should store
