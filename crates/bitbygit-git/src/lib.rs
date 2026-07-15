@@ -45,6 +45,19 @@ const MAX_RECOVERY_SUBPROCESSES: usize = 12;
 const MAX_RECOVERY_GENERATION_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_GENERATION_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_GENERATION_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const RECOVERY_BACKUP_PREFIX: &str = ".bitbygit-recovery-backup-";
+const RECOVERY_CANDIDATE_PREFIX: &str = ".bitbygit-recovery-candidate-";
+const RECOVERY_GIT_ENVIRONMENT: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_QUARANTINE_PATH",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
 const RECOVERY_CAPABILITY_UNAVAILABLE: &str =
     "atomic recovery is unavailable because required platform capabilities are missing";
 
@@ -292,6 +305,7 @@ impl Git {
         action: RecoveryAction,
         expected_state: &RecoveryState,
     ) -> Result<GitOutput, GitError> {
+        ensure_recovery_environment_isolated()?;
         let current_state = self.recovery_state()?;
         if current_state != *expected_state {
             return Err(GitError::Blocked {
@@ -303,18 +317,36 @@ impl Git {
             });
         }
         let mut transaction = RecoveryTransaction::prepare(self)?;
-        let output = transaction.run_recovery(
+        let result = transaction.run_recovery(
             self,
             vec![
                 operation.label().to_owned(),
                 format!("--{}", action.label()),
             ],
-        )?;
-        transaction.promote(self, &current_state)?;
-        Ok(output)
+        );
+        match result {
+            Ok(mut output) => {
+                let backup = transaction.promote(self, &current_state)?;
+                append_recovery_backup_notice(&mut output.stderr, &backup);
+                Ok(output)
+            }
+            Err(mut error)
+                if operation == RepositoryOperation::Rebase
+                    && matches!(action, RecoveryAction::Continue | RecoveryAction::Skip)
+                    && transaction.has_advanced_rebase_conflict(&current_state) =>
+            {
+                let backup = transaction.promote(self, &current_state)?;
+                if let GitError::GitFailed { stderr, .. } = &mut error {
+                    append_recovery_backup_notice(stderr, &backup);
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn ensure_recovery_supported(&self) -> Result<(), GitError> {
+        ensure_recovery_environment_isolated()?;
         RecoveryTransaction::supported_root(self).map(|_| ())
     }
 
@@ -1474,6 +1506,7 @@ impl Git {
 struct RecoveryTransaction {
     root: PathBuf,
     candidate: PathBuf,
+    backup_pointer: PathBuf,
     baseline: RecoveryGeneration,
     keep_candidate: bool,
 }
@@ -1485,10 +1518,21 @@ impl RecoveryTransaction {
         let parent = root.parent().ok_or_else(|| {
             recovery_transaction_blocked("repository root has no parent for isolated recovery")
         })?;
-        let candidate = create_recovery_candidate(parent)?;
+        remove_previous_recovery_backup(&root)?;
+        let candidate = create_recovery_candidate(parent, &root)?;
+        let backup_pointer = recovery_backup_pointer_path(&root)?;
+        if let Err(source) = fs::write(&backup_pointer, candidate.as_os_str().as_encoded_bytes()) {
+            let _result = fs::remove_dir(&candidate);
+            let _result = fs::remove_file(recovery_candidate_owner_path(&candidate));
+            return Err(recovery_transaction_io(
+                "record the retained recovery backup pointer",
+                source,
+            ));
+        }
         let mut transaction = Self {
             root,
             candidate,
+            backup_pointer,
             baseline,
             keep_candidate: false,
         };
@@ -1591,6 +1635,9 @@ impl RecoveryTransaction {
             .env("SSH_ASKPASS_REQUIRE", "never")
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true");
+        for variable in RECOVERY_GIT_ENVIRONMENT {
+            command.env_remove(variable);
+        }
         if git.ssh_executable.is_some() || env::var_os("GIT_SSH_COMMAND").is_none() {
             let ssh_executable = git
                 .ssh_executable
@@ -1628,7 +1675,25 @@ impl RecoveryTransaction {
         })
     }
 
-    fn promote(&mut self, live_git: &Git, expected_state: &RecoveryState) -> Result<(), GitError> {
+    fn has_advanced_rebase_conflict(&self, expected_state: &RecoveryState) -> bool {
+        let candidate_git = Git::new(&self.candidate);
+        let Ok(candidate_state) = candidate_git.recovery_state() else {
+            return false;
+        };
+        let Ok(candidate_status) = candidate_git.status() else {
+            return false;
+        };
+        candidate_state != *expected_state
+            && candidate_state.operation == Some(RepositoryOperation::Rebase)
+            && candidate_status.operation == Some(RepositoryOperation::Rebase)
+            && !candidate_status.conflicted_files().is_empty()
+    }
+
+    fn promote(
+        &mut self,
+        live_git: &Git,
+        expected_state: &RecoveryState,
+    ) -> Result<PathBuf, GitError> {
         if live_git.recovery_state()? != *expected_state
             || RecoveryGeneration::capture(&self.root)? != self.baseline
         {
@@ -1651,7 +1716,7 @@ impl RecoveryTransaction {
                 "repository changed during atomic recovery promotion",
             ));
         }
-        Ok(())
+        Ok(self.candidate.clone())
     }
 }
 
@@ -1659,6 +1724,8 @@ impl Drop for RecoveryTransaction {
     fn drop(&mut self) {
         if !self.keep_candidate {
             let _result = fs::remove_dir_all(&self.candidate);
+            let _result = fs::remove_file(recovery_candidate_owner_path(&self.candidate));
+            let _result = fs::remove_file(&self.backup_pointer);
         }
     }
 }
@@ -1774,10 +1841,10 @@ enum RecoveryGenerationValue {
     Symlink(PathBuf),
 }
 
-fn create_recovery_candidate(parent: &Path) -> Result<PathBuf, GitError> {
+fn create_recovery_candidate(parent: &Path, root: &Path) -> Result<PathBuf, GitError> {
     for attempt in 0..100_u32 {
         let candidate = parent.join(format!(
-            ".bitbygit-recovery-backup-{}-{}-{attempt}",
+            "{RECOVERY_CANDIDATE_PREFIX}{}-{}-{attempt}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1785,7 +1852,19 @@ fn create_recovery_candidate(parent: &Path) -> Result<PathBuf, GitError> {
                 .as_nanos()
         ));
         match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                if let Err(source) = fs::write(
+                    recovery_candidate_owner_path(&candidate),
+                    root.as_os_str().as_encoded_bytes(),
+                ) {
+                    let _result = fs::remove_dir(&candidate);
+                    return Err(recovery_transaction_io(
+                        "record isolated repository ownership",
+                        source,
+                    ));
+                }
+                return Ok(candidate);
+            }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
                 return Err(recovery_transaction_io(
@@ -1798,6 +1877,101 @@ fn create_recovery_candidate(parent: &Path) -> Result<PathBuf, GitError> {
     Err(recovery_transaction_blocked(
         "could not reserve an isolated repository path",
     ))
+}
+
+fn recovery_candidate_owner_path(candidate: &Path) -> PathBuf {
+    let mut owner = candidate.as_os_str().to_os_string();
+    owner.push(".owner");
+    PathBuf::from(owner)
+}
+
+fn recovery_backup_pointer_path(root: &Path) -> Result<PathBuf, GitError> {
+    let name = root.file_name().ok_or_else(|| {
+        recovery_transaction_blocked("repository root has no name for retained recovery backup")
+    })?;
+    let mut pointer = OsString::from(RECOVERY_BACKUP_PREFIX);
+    pointer.push(name);
+    pointer.push(".pointer");
+    Ok(root.with_file_name(pointer))
+}
+
+fn recovery_backup_from_pointer(expected_root: &Path) -> Result<Option<PathBuf>, GitError> {
+    let pointer = recovery_backup_pointer_path(expected_root)?;
+    let bytes = match fs::read(&pointer) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(recovery_transaction_io(
+                "read the retained recovery backup pointer",
+                source,
+            ));
+        }
+    };
+    let backup = path_from_bytes(&bytes);
+    let valid_location = backup.is_absolute()
+        && backup.parent() == expected_root.parent()
+        && backup.file_name().is_some_and(|name| {
+            name.as_encoded_bytes()
+                .starts_with(RECOVERY_CANDIDATE_PREFIX.as_bytes())
+        });
+    let backup_metadata = fs::symlink_metadata(&backup);
+    let valid_directory = backup_metadata
+        .as_ref()
+        .is_ok_and(|metadata| metadata.file_type().is_dir());
+    let missing_directory = backup_metadata
+        .as_ref()
+        .is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound);
+    let owner = recovery_candidate_owner_path(&backup);
+    let valid_owner = fs::symlink_metadata(&owner)
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+        && fs::read(&owner)
+            .is_ok_and(|contents| contents == expected_root.as_os_str().as_encoded_bytes());
+    if !valid_location || (!valid_directory && !missing_directory) || !valid_owner {
+        return Err(recovery_transaction_blocked(
+            "the retained recovery backup pointer is invalid; refusing to remove it",
+        ));
+    }
+    Ok(Some(backup))
+}
+
+fn remove_previous_recovery_backup(root: &Path) -> Result<(), GitError> {
+    let Some(backup) = recovery_backup_from_pointer(root)? else {
+        return Ok(());
+    };
+    if let Err(source) = fs::remove_dir_all(&backup)
+        && source.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(recovery_transaction_io(
+            "remove the previous retained recovery backup",
+            source,
+        ));
+    }
+    fs::remove_file(recovery_backup_pointer_path(root)?)
+        .map_err(|source| recovery_transaction_io("remove the previous backup pointer", source))?;
+    let _result = fs::remove_file(recovery_candidate_owner_path(&backup));
+    Ok(())
+}
+
+fn ensure_recovery_environment_isolated() -> Result<(), GitError> {
+    if let Some(variable) = RECOVERY_GIT_ENVIRONMENT
+        .iter()
+        .find(|variable| env::var_os(variable).is_some())
+    {
+        return Err(recovery_transaction_blocked(format!(
+            "atomic recovery does not support inherited {variable} repository state"
+        )));
+    }
+    Ok(())
+}
+
+fn append_recovery_backup_notice(output: &mut String, backup: &Path) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&format!(
+        "bitbygit: previous repository generation retained at {}; it will be removed before the next recovery attempt\n",
+        backup.display()
+    ));
 }
 
 #[cfg(target_os = "linux")]
@@ -3881,6 +4055,86 @@ mod tests {
     }
 
     #[test]
+    fn exact_rebase_promotes_and_reports_subsequent_conflicts() -> Result<(), Box<dyn Error>> {
+        let continue_repo = prepare_two_conflict_rebase()?;
+        continue_repo.write("first.txt", "topic first\n")?;
+        continue_repo.run(["add", "first.txt"])?;
+        let continue_git = Git::new(continue_repo.path());
+        let state = continue_git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &continue_git,
+            RepositoryOperation::Rebase,
+            RecoveryAction::Continue,
+            &state,
+        )? {
+            return Ok(());
+        }
+
+        let Err(error) = continue_git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Continue,
+            &state,
+        ) else {
+            return Err("expected exact continue to stop at the next conflict".into());
+        };
+        let GitError::GitFailed { stdout, stderr, .. } = error else {
+            return Err("expected the next conflict to remain a Git failure".into());
+        };
+        assert!(format!("{stdout}\n{stderr}").contains("second.txt"));
+        assert!(stderr.contains("previous repository generation retained at"));
+        let status = continue_git.status()?;
+        assert_eq!(status.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(
+            status.conflicted_files()[0].path,
+            PathBuf::from("second.txt")
+        );
+        let first_backup = recovery_backup_from_pointer(&continue_repo.path().canonicalize()?)?
+            .ok_or("missing retained recovery backup")?;
+        assert!(first_backup.is_dir());
+
+        continue_repo.write("second.txt", "topic second\n")?;
+        continue_repo.run(["add", "second.txt"])?;
+        let state = continue_git.recovery_state()?;
+        let output = continue_git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Continue,
+            &state,
+        )?;
+        assert_eq!(continue_git.status()?.operation, None);
+        assert!(
+            output
+                .stderr
+                .contains("previous repository generation retained at")
+        );
+        let second_backup = recovery_backup_from_pointer(&continue_repo.path().canonicalize()?)?
+            .ok_or("missing replacement recovery backup")?;
+        assert_ne!(second_backup, first_backup);
+        assert!(!first_backup.exists());
+        assert!(second_backup.is_dir());
+
+        let skip_repo = prepare_two_conflict_rebase()?;
+        let skip_git = Git::new(skip_repo.path());
+        let state = skip_git.recovery_state()?;
+        let Err(error) =
+            skip_git.recover_exact(RepositoryOperation::Rebase, RecoveryAction::Skip, &state)
+        else {
+            return Err("expected exact skip to stop at the next conflict".into());
+        };
+        let GitError::GitFailed { stdout, stderr, .. } = error else {
+            return Err("expected the conflict after skip to remain a Git failure".into());
+        };
+        assert!(format!("{stdout}\n{stderr}").contains("second.txt"));
+        assert!(stderr.contains("previous repository generation retained at"));
+        let status = skip_git.status()?;
+        assert_eq!(status.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(
+            status.conflicted_files()[0].path,
+            PathBuf::from("second.txt")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exact_recovery_fails_closed_when_platform_capabilities_are_unavailable()
     -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
@@ -3906,6 +4160,75 @@ mod tests {
         assert_eq!(RecoveryGeneration::capture(&root)?, before);
         assert_eq!(git.recovery_state()?, expected);
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_external_git_storage_paths() -> Result<(), Box<dyn Error>> {
+        if let (Some(repo), Some(variable)) = (
+            env::var_os("BITBYGIT_TEST_EXTERNAL_GIT_REPO"),
+            env::var_os("BITBYGIT_TEST_EXTERNAL_GIT_VARIABLE"),
+        ) {
+            let variable = variable.to_string_lossy();
+            let irrelevant_state = RecoveryState {
+                operation: Some(RepositoryOperation::Merge),
+                head: HeadTarget {
+                    oid: None,
+                    reference: None,
+                },
+                index: Vec::new(),
+                worktree: Vec::new(),
+                metadata: Vec::new(),
+                refs: Vec::new(),
+            };
+            let Err(error) = Git::new(repo).recover_exact(
+                RepositoryOperation::Merge,
+                RecoveryAction::Abort,
+                &irrelevant_state,
+            ) else {
+                return Err(format!("expected inherited {variable} to block recovery").into());
+            };
+            assert!(error.to_string().contains(variable.as_ref()));
+            return Ok(());
+        }
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let external_index = repo.path().with_extension("external-index");
+        fs::copy(repo.path().join(".git/index"), &external_index)?;
+        let index_before = fs::read(&external_index)?;
+        let external_objects = repo.path().with_extension("external-objects");
+        fs::create_dir(&external_objects)?;
+        fs::write(external_objects.join("sentinel"), "unchanged\n")?;
+        let objects_before = RecoveryGeneration::capture(&external_objects)?;
+
+        for (variable, external_path) in [
+            ("GIT_INDEX_FILE", external_index.as_path()),
+            ("GIT_OBJECT_DIRECTORY", external_objects.as_path()),
+        ] {
+            let output = Command::new(env::current_exe()?)
+                .args([
+                    "--exact",
+                    "tests::recovery_rejects_external_git_storage_paths",
+                    "--nocapture",
+                ])
+                .env("BITBYGIT_TEST_EXTERNAL_GIT_REPO", repo.path())
+                .env("BITBYGIT_TEST_EXTERNAL_GIT_VARIABLE", variable)
+                .env(variable, external_path)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "child test for {variable} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        assert_eq!(fs::read(external_index)?, index_before);
+        assert_eq!(
+            RecoveryGeneration::capture(&external_objects)?,
+            objects_before
+        );
+        fs::remove_file(repo.path().with_extension("external-index"))?;
+        fs::remove_dir_all(external_objects)?;
         Ok(())
     }
 
@@ -5885,6 +6208,15 @@ mod tests {
 
     impl Drop for TempRepo {
         fn drop(&mut self) {
+            if let Ok(root) = self.path.canonicalize()
+                && let Ok(Some(backup)) = recovery_backup_from_pointer(&root)
+            {
+                let _result = fs::remove_dir_all(&backup);
+                let _result = fs::remove_file(recovery_candidate_owner_path(&backup));
+                if let Ok(pointer) = recovery_backup_pointer_path(&root) {
+                    let _result = fs::remove_file(pointer);
+                }
+            }
             let _result = fs::remove_dir_all(&self.path);
         }
     }
