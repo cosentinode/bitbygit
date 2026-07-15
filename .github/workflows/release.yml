@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   validate:
     name: Validate release
@@ -215,8 +219,43 @@ jobs:
             fi
           }
 
-          verify_tag_target
+          verify_immutable_releases() {
+            if [[ "$(gh api "repos/${GH_REPO}/immutable-releases" --jq '.enabled')" != "true" ]]; then
+              echo "::error title=Immutable releases disabled::Repository immutable releases must be enabled"
+              return 1
+            fi
+          }
 
+          cleanup_draft=false
+          cleanup_draft_on_exit() {
+            status=$?
+            trap - EXIT
+
+            if [[ "${cleanup_draft}" == "true" ]] && \
+              [[ "$(gh release view "${GITHUB_REF_NAME}" --repo "${GH_REPO}" \
+                --json isDraft --jq '.isDraft' 2>/dev/null || true)" == "true" ]]; then
+              gh release delete "${GITHUB_REF_NAME}" --repo "${GH_REPO}" --yes || \
+                echo "::error title=Draft cleanup failed::Delete the incomplete ${GITHUB_REF_NAME} draft before retrying"
+            fi
+
+            exit "${status}"
+          }
+          trap cleanup_draft_on_exit EXIT
+
+          verify_tag_target
+          verify_immutable_releases
+
+          existing_draft="$(gh release view "${GITHUB_REF_NAME}" --repo "${GH_REPO}" \
+            --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+          if [[ -n "${existing_draft}" ]]; then
+            if [[ "${existing_draft}" != "true" ]]; then
+              echo "::error title=Release already published::Refusing to replace ${GITHUB_REF_NAME}"
+              exit 1
+            fi
+            gh release delete "${GITHUB_REF_NAME}" --repo "${GH_REPO}" --yes
+          fi
+
+          cleanup_draft=true
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GH_REPO}" \
             --target "${RELEASE_SHA}" \
@@ -228,14 +267,17 @@ jobs:
             dist/SHA256SUMS
 
           verify_tag_target
+          verify_immutable_releases
           gh release edit "${GITHUB_REF_NAME}" \
             --repo "${GH_REPO}" \
             --verify-tag \
             --draft=false
+          cleanup_draft=false
 
           verify_tag_target
           if [[ "$(gh release view "${GITHUB_REF_NAME}" --repo "${GH_REPO}" \
             --json isImmutable --jq '.isImmutable')" != "true" ]]; then
+            gh release delete "${GITHUB_REF_NAME}" --repo "${GH_REPO}" --yes
             echo "::error title=Mutable release::Expected ${GITHUB_REF_NAME} to be immutable"
             exit 1
           fi
