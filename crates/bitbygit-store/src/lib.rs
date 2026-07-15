@@ -75,7 +75,7 @@ impl Display for ConfigDiagnostic {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "configuration at {} {}: {}; using safe defaults",
+            "configuration at {} {}: {}; using the safe fallback configuration",
             self.path.display(),
             match self.kind {
                 ConfigDiagnosticKind::Unreadable => "could not be read",
@@ -112,7 +112,7 @@ impl LocalStore {
                     diagnostic: None,
                 },
                 Err(error) => LoadedConfig {
-                    settings: AppConfig::default(),
+                    settings: AppConfig::safe_fallback(),
                     diagnostic: Some(ConfigDiagnostic {
                         path: path.clone(),
                         kind: ConfigDiagnosticKind::Invalid,
@@ -125,7 +125,7 @@ impl LocalStore {
                 diagnostic: None,
             },
             Err(error) => LoadedConfig {
-                settings: AppConfig::default(),
+                settings: AppConfig::safe_fallback(),
                 diagnostic: Some(ConfigDiagnostic {
                     path: path.clone(),
                     kind: ConfigDiagnosticKind::Unreadable,
@@ -1322,7 +1322,7 @@ mod tests {
             .as_ref()
             .ok_or("invalid config should produce a diagnostic")?;
 
-        assert_eq!(loaded.settings, AppConfig::default());
+        assert_eq!(loaded.settings, AppConfig::safe_fallback());
         assert_eq!(diagnostic.path, store.paths().config_file);
         assert_eq!(diagnostic.kind, ConfigDiagnosticKind::Invalid);
         assert!(diagnostic.to_string().contains("line 1"));
@@ -1343,10 +1343,14 @@ mod tests {
             .as_ref()
             .ok_or("unreadable config should produce a diagnostic")?;
 
-        assert_eq!(loaded.settings, AppConfig::default());
+        assert_eq!(loaded.settings, AppConfig::safe_fallback());
         assert_eq!(diagnostic.path, store.paths().config_file);
         assert_eq!(diagnostic.kind, ConfigDiagnosticKind::Unreadable);
-        assert!(diagnostic.to_string().contains("using safe defaults"));
+        assert!(
+            diagnostic
+                .to_string()
+                .contains("using the safe fallback configuration")
+        );
         Ok(())
     }
 

@@ -39,6 +39,10 @@ high = "explicit-confirmation"
 enabled = true
 ```
 
+Setting `prompt.enabled` to `false` rejects prompt submissions. It does not
+alter operation policy, and the prompt configuration has no command, shell, or
+hook extension points; enabled prompts still produce only built-in typed plans.
+
 Protected branch entries may be exact branch names or a prefix ending in `/*`,
 such as `stable/*`. They are additive: configuration cannot remove the built-in
 protected branch rules.
@@ -70,8 +74,19 @@ documented default.
 Unknown keys, unknown operation names, unsupported schema versions, malformed
 branch names or patterns, and values that weaken confirmation defaults make the
 entire file invalid. An invalid or unreadable file produces a diagnostic with
-its path and safe error context, then `bitbygit` applies the complete default
-configuration. A missing file silently uses those defaults.
+its path and safe error context, then `bitbygit` applies a complete fail-closed
+fallback: every operation family is disabled, all confirmation levels are
+blocked, prompt input is disabled, and non-policy settings use their defaults.
+At runtime, a failed reload instead retains the last valid effective policy and
+keeps the reload diagnostic visible in the details pane. Configuration is
+reloaded before input and periodically while idle; once it is valid, the
+diagnostic clears and status is refreshed if the recovered policy permits it. A
+missing file silently uses the documented defaults above.
+
+Direct status and diff reads run only when low-risk policy permits normal
+selection. Disabled operations and confirmation settings of `visible-plan`,
+`explicit-confirmation`, or `blocked` prevent these automatic UI reads; policy
+reload remains available so the configuration can still be repaired in place.
 
 Configuration diagnostics never retain the raw file or rejected values, and
 configuration contents are never written to operation audits. Credentials and

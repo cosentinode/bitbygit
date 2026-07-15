@@ -28,6 +28,23 @@ impl AppConfig {
         Ok(config)
     }
 
+    pub fn safe_fallback() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            policy: PolicyConfig {
+                additional_protected_branches: Vec::new(),
+                confirmation: ConfirmationConfig {
+                    low: ConfirmationSetting::Blocked,
+                    medium: ConfirmationSetting::Blocked,
+                    high: ConfirmationSetting::Blocked,
+                },
+                disabled_operations: OperationFamily::ALL.to_vec(),
+            },
+            pull_requests: PullRequestConfig::default(),
+            prompt: PromptConfig { enabled: false },
+        }
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(invalid_value(
@@ -170,6 +187,25 @@ pub enum OperationFamily {
     OpenPullRequest,
 }
 
+impl OperationFamily {
+    pub const ALL: [Self; 14] = [
+        Self::RefreshStatus,
+        Self::ViewDiff,
+        Self::Fetch,
+        Self::Stage,
+        Self::Unstage,
+        Self::Commit,
+        Self::Push,
+        Self::Pull,
+        Self::Branches,
+        Self::Checkout,
+        Self::CreateBranch,
+        Self::Merge,
+        Self::Rebase,
+        Self::OpenPullRequest,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PullRequestConfig {
@@ -269,6 +305,27 @@ mod tests {
     }
 
     #[test]
+    fn failure_fallback_is_complete_and_fail_closed() {
+        let fallback = AppConfig::safe_fallback();
+
+        assert_eq!(fallback.policy.disabled_operations, OperationFamily::ALL);
+        assert_eq!(
+            fallback.policy.confirmation.low,
+            ConfirmationSetting::Blocked
+        );
+        assert_eq!(
+            fallback.policy.confirmation.medium,
+            ConfirmationSetting::Blocked
+        );
+        assert_eq!(
+            fallback.policy.confirmation.high,
+            ConfirmationSetting::Blocked
+        );
+        assert!(!fallback.prompt.enabled);
+        assert_eq!(fallback.pull_requests, PullRequestConfig::default());
+    }
+
+    #[test]
     fn valid_toml_produces_typed_settings() -> Result<(), ConfigError> {
         let config = AppConfig::parse(
             r#"
@@ -322,6 +379,7 @@ enabled = false
         assert!(!format!("{error:?}").contains("super-secret-value"));
 
         assert!(AppConfig::parse("[policy]\ndisabled-operations = [\"force-push\"]").is_err());
+        assert!(AppConfig::parse("[prompt]\ncommand = \"git status\"").is_err());
         Ok(())
     }
 
