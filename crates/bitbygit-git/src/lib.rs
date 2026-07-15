@@ -2062,6 +2062,12 @@ where
 
     if metadata.is_file() {
         hash_field(hasher, b"file");
+        let Some(file) = file.as_mut() else {
+            return Err(recovery_state_io(
+                path,
+                io::Error::other("regular recovery input has no open descriptor"),
+            ));
+        };
         let mut buffer = [0; 64 * 1024];
         loop {
             if Instant::now() >= deadline {
@@ -2104,7 +2110,7 @@ where
         }
     } else if metadata.is_dir() {
         hash_field(hasher, b"directory");
-        let mut children = recovery_directory_children(&file, path, deadline, entries)?;
+        let mut children = recovery_directory_children(file.as_ref(), path, deadline, entries)?;
         children.sort();
         for child in children {
             ensure_recovery_fingerprint_capacity(deadline, entries)?;
@@ -2122,9 +2128,12 @@ where
             )?;
         }
         after_contents(path, RecoveryPathKind::Directory)?;
-        let final_metadata = file
-            .metadata()
-            .map_err(|source| recovery_state_io(path, source))?;
+        let final_metadata = match file.as_ref() {
+            Some(file) => file
+                .metadata()
+                .map_err(|source| recovery_state_io(path, source))?,
+            None => fs::symlink_metadata(path).map_err(|source| recovery_state_io(path, source))?,
+        };
         let path_metadata = match open_recovery_file(path) {
             Ok(reopened) => reopened.metadata,
             Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
@@ -2132,7 +2141,8 @@ where
                 return Err(recovery_path_changed(path));
             }
         };
-        if !same_recovery_file(&metadata, &final_metadata)
+        if !final_metadata.is_dir()
+            || !same_recovery_file(&metadata, &final_metadata)
             || !same_recovery_file(&metadata, &path_metadata)
         {
             return Err(recovery_path_changed(path));
@@ -2172,7 +2182,7 @@ fn recovery_path_changed(path: &Path) -> GitError {
 }
 
 struct RecoveryFile {
-    file: fs::File,
+    file: Option<fs::File>,
     metadata: fs::Metadata,
 }
 
@@ -2184,13 +2194,19 @@ enum RecoveryOpenError {
 
 #[cfg(unix)]
 fn recovery_directory_children(
-    file: &fs::File,
+    file: Option<&fs::File>,
     path: &Path,
     deadline: Instant,
     entries: &usize,
 ) -> Result<Vec<OsString>, GitError> {
     use rustix::fs::Dir;
 
+    let Some(file) = file else {
+        return Err(recovery_state_io(
+            path,
+            io::Error::other("recovery directory has no open descriptor"),
+        ));
+    };
     let mut children = Vec::new();
     let directory =
         Dir::read_from(file).map_err(|source| recovery_state_io(path, io::Error::from(source)))?;
@@ -2213,7 +2229,7 @@ fn recovery_directory_children(
 
 #[cfg(not(unix))]
 fn recovery_directory_children(
-    _file: &fs::File,
+    _file: Option<&fs::File>,
     path: &Path,
     deadline: Instant,
     entries: &usize,
@@ -2250,7 +2266,10 @@ fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
     };
     let file = fs::File::from(descriptor);
     let metadata = file.metadata().map_err(RecoveryOpenError::Io)?;
-    Ok(RecoveryFile { file, metadata })
+    Ok(RecoveryFile {
+        file: Some(file),
+        metadata,
+    })
 }
 
 #[cfg(not(unix))]
@@ -2265,7 +2284,11 @@ fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
     if metadata.file_type().is_symlink() {
         return Err(RecoveryOpenError::Symlink);
     }
-    let file = fs::File::open(path).map_err(RecoveryOpenError::Io)?;
+    let file = if metadata.is_dir() {
+        None
+    } else {
+        Some(fs::File::open(path).map_err(RecoveryOpenError::Io)?)
+    };
     Ok(RecoveryFile { file, metadata })
 }
 
