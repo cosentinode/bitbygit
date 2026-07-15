@@ -58,7 +58,13 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
   exit 1
 fi
 BITBYGIT_INSTALL
-export PATH="${HOME}/.local/bin:${PATH}"
+export PATH="${HOME}/.local/bin:${PATH}" &&
+if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit 0.1.0" ]]; then
+  bitbygit --version
+else
+  printf 'Expected bitbygit 0.1.0 on PATH, got %s\n' "${path_output:-no output}" >&2
+  false
+fi
 ```
 
 Add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file to keep
@@ -96,7 +102,13 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
   exit 1
 fi
 BITBYGIT_INSTALL
-export PATH="${HOME}/.local/bin:${PATH}"
+export PATH="${HOME}/.local/bin:${PATH}" &&
+if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit 0.1.0" ]]; then
+  bitbygit --version
+else
+  printf 'Expected bitbygit 0.1.0 on PATH, got %s\n' "${path_output:-no output}" >&2
+  false
+fi
 ```
 
 Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile` (or the startup file
@@ -138,7 +150,14 @@ if (($UserPath -split ";") -notcontains $InstallDir) {
     $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
     [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
 }
-$env:Path = "$InstallDir;$env:Path"
+if (($env:Path -split ";") -notcontains $InstallDir) {
+    $env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $InstallDir } else { "$InstallDir;$env:Path" }
+}
+$PathOutput = bitbygit --version
+if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
+    throw "Expected bitbygit $Version on PATH, got $PathOutput"
+}
+bitbygit --version
 }
 ```
 
@@ -189,7 +208,13 @@ if [[ "${installed_output}" != "bitbygit ${VERSION}" ]]; then
   exit 1
 fi
 BITBYGIT_INSTALL
-export PATH="${HOME}/.local/bin:${PATH}"
+export PATH="${HOME}/.local/bin:${PATH}" &&
+if path_output="$(bitbygit --version)" && [[ "${path_output}" == "bitbygit 0.1.0" ]]; then
+  bitbygit --version
+else
+  printf 'Expected bitbygit 0.1.0 on PATH, got %s\n' "${path_output:-no output}" >&2
+  false
+fi
 ```
 
 On Windows, run in PowerShell:
@@ -233,7 +258,14 @@ if (($UserPath -split ";") -notcontains $InstallDir) {
     $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
     [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
 }
-$env:Path = "$InstallDir;$env:Path"
+if (($env:Path -split ";") -notcontains $InstallDir) {
+    $env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $InstallDir } else { "$InstallDir;$env:Path" }
+}
+$PathOutput = bitbygit --version
+if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
+    throw "Expected bitbygit $Version on PATH, got $PathOutput"
+}
+bitbygit --version
 }
 ```
 
@@ -245,6 +277,7 @@ Use an archive or source tag after a release is published.
 
 ## Verify the installation
 
-Every installation block above finishes by running the installed file directly
-with `--version` and requiring `bitbygit <selected-version>`. This avoids
-mistaking an older `bitbygit` elsewhere on `PATH` for the binary just installed.
+Every installation block above first runs the installed file directly, then
+updates `PATH` and finishes with `bitbygit --version`. Both checks require and
+report `bitbygit <selected-version>`, so the final check also verifies command
+resolution through the documented `PATH` setup.

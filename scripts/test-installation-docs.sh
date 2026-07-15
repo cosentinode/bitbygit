@@ -96,6 +96,10 @@ else
   /usr/bin/uname "$@"
 fi
 MOCK
+cat > "${tmp}/mock-bin/bitbygit" <<'MOCK'
+#!/usr/bin/env sh
+printf 'bitbygit 9.9.9\n'
+MOCK
 chmod +x "${tmp}/mock-bin/"*
 
 check_unix_success() {
@@ -125,6 +129,8 @@ check_unix_success() {
     [[ "${PATH%%:*}" == "${HOME}/.local/bin" ]] || fail "${heading} did not update the caller PATH"
     [[ -x "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not install the binary"
     [[ "$("${HOME}/.local/bin/bitbygit" --version)" == "bitbygit ${workspace_version}" ]] || fail "${heading} installed the wrong version"
+    [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not resolve the installed command through PATH"
+    [[ "$(bitbygit --version)" == "bitbygit ${workspace_version}" ]] || fail "${heading} resolved the wrong version through PATH"
   )
 }
 
@@ -190,6 +196,8 @@ extract_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
 [[ "${docs_text}" == *'git -C $SourceDir checkout --detach $TagCommit'* ]] || fail "PowerShell source build does not detach at the selected tag"
 [[ "${docs_text}" == *'"${HOME}/.local/bin/bitbygit" --version'* ]] || fail "Unix installation does not validate the installed path"
 [[ "${docs_text}" == *'& $InstalledBinary --version'* ]] || fail "Windows installation does not validate the installed path"
+[[ "$(grep -c '^  bitbygit --version$' "${docs}")" -eq 3 ]] || fail "Unix installations do not finish with PATH-resolved version output"
+[[ "$(grep -c '^bitbygit --version$' "${docs}")" -eq 2 ]] || fail "Windows installations do not finish with PATH-resolved version output"
 
 source_remote="${tmp}/source-remote.git"
 source_seed="${tmp}/source-seed"
@@ -216,7 +224,8 @@ cat > "${source_dir}/mock-bin/cargo" <<'MOCK'
 #!/usr/bin/env sh
 exit 0
 MOCK
-chmod +x "${source_dir}/mock-bin/cargo"
+cp "${tmp}/mock-bin/bitbygit" "${source_dir}/mock-bin/bitbygit"
+chmod +x "${source_dir}/mock-bin/"*
 source_snippet="$(extract_block "Build from source" bash)"
 source_snippet="${source_snippet/https:\/\/github.com\/cosentinode\/bitbygit.git/${source_remote}}"
 printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
@@ -229,6 +238,8 @@ printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
   branch_commit="$(git --git-dir="${source_remote}" rev-parse "refs/heads/v${workspace_version}")"
   head_commit="$(git -C bitbygit rev-parse HEAD)"
   [[ "${head_commit}" == "${tag_commit}" && "${head_commit}" != "${branch_commit}" ]] || fail "Bash source block did not check out the exact tag object"
+  [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "Bash source block did not resolve the installed command through PATH"
+  [[ "$(bitbygit --version)" == "bitbygit ${workspace_version}" ]] || fail "Bash source block resolved the wrong version through PATH"
 )
 
 check_links() {

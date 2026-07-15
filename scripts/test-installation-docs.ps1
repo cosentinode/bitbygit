@@ -43,6 +43,13 @@ $EmptyPathGuard = '$NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $Ins
 if ([regex]::Matches($DocsText, [regex]::Escape($EmptyPathGuard)).Count -ne 2) {
     Fail "Windows examples do not handle empty user PATH values consistently"
 }
+$ProcessPathGuard = '$env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $InstallDir } else { "$InstallDir;$env:Path" }'
+if ([regex]::Matches($DocsText, [regex]::Escape($ProcessPathGuard)).Count -ne 2) {
+    Fail "Windows examples do not handle process PATH values consistently"
+}
+if ([regex]::Matches($DocsText, '(?m)^bitbygit --version\r?$').Count -ne 2) {
+    Fail "Windows examples do not finish with PATH-resolved version output"
+}
 
 foreach ($Match in [regex]::Matches($DocsText, '(?ms)^```powershell\r?\n(.*?)^```')) {
     $Tokens = $null
@@ -93,7 +100,7 @@ try {
     $SuccessScript = Join-Path $SuccessDir "install.ps1"
     Set-Content -Path $SuccessScript -Value $InstallBlock
     $env:LOCALAPPDATA = Join-Path $SuccessDir "local-app-data"
-    $env:Path = $OriginalProcessPath
+    $env:Path = $null
     Remove-Item Env:BITBYGIT_TEST_USER_PATH -ErrorAction SilentlyContinue
     $CapturedUserPath = $null
     $env:MOCK_DOWNLOAD_DIR = $Assets
@@ -114,10 +121,12 @@ try {
     $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
     $InstalledBinary = Join-Path $InstallDir "bitbygit.exe"
     if ($ErrorActionPreference -ne "Continue") { Fail "archive block changed the caller error preference" }
-    if (($env:Path -split ';')[0] -ne $InstallDir) { Fail "archive block did not update the process PATH" }
+    if ($env:Path -ne $InstallDir) { Fail "archive block malformed an empty process PATH" }
     if ($CapturedUserPath -ne $InstallDir) { Fail "archive block malformed an empty user PATH" }
     if (-not (Test-Path $InstalledBinary)) { Fail "archive block did not install bitbygit.exe" }
-    $Output = & $InstalledBinary --version
+    $ResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
+    if ($ResolvedBinary -ne $InstalledBinary) { Fail "archive block did not resolve the installed command through PATH" }
+    $Output = bitbygit --version
     if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
         Fail "archive block installed the wrong version"
     }
@@ -202,8 +211,10 @@ try {
     $SourceScript = Join-Path $SourceSuccessDir "install-from-source.ps1"
     Set-Content -Path $SourceScript -Value $SourceBlock
     $env:LOCALAPPDATA = Join-Path $SourceSuccessDir "local-app-data"
-    $env:Path = $OriginalProcessPath
-    $env:BITBYGIT_TEST_USER_PATH = $OriginalProcessPath
+    $SourceInstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
+    $SourceStartingPath = "$SourceInstallDir;$OriginalProcessPath"
+    $env:Path = $SourceStartingPath
+    $env:BITBYGIT_TEST_USER_PATH = $SourceStartingPath
     $CapturedUserPath = $null
     $FetchedExactTag = $false
     $CheckedOutExactTag = $false
@@ -219,16 +230,16 @@ try {
     } finally {
         Pop-Location
     }
-    $SourceInstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
     $SourceInstalledBinary = Join-Path $SourceInstallDir "bitbygit.exe"
     if ($ErrorActionPreference -ne "Continue") { Fail "source block changed the caller error preference" }
-    if (($env:Path -split ';')[0] -ne $SourceInstallDir) { Fail "source block did not update the process PATH" }
-    if ($CapturedUserPath -ne "$OriginalProcessPath;$SourceInstallDir") {
-        Fail "source block did not append to the existing user PATH"
-    }
+    if ($env:Path -ne $SourceStartingPath) { Fail "source block duplicated an existing process PATH entry" }
+    if (($env:Path -split ';' | Where-Object { $_ -eq $SourceInstallDir }).Count -ne 1) { Fail "source block duplicated the process PATH entry" }
+    if ($null -ne $CapturedUserPath) { Fail "source block duplicated an existing user PATH entry" }
     if (-not $FetchedExactTag -or -not $CheckedOutExactTag) { Fail "source block did not check out the exact tag" }
     if (-not (Test-Path $SourceInstalledBinary)) { Fail "source block did not install bitbygit.exe" }
-    $SourceOutput = & $SourceInstalledBinary --version
+    $SourceResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
+    if ($SourceResolvedBinary -ne $SourceInstalledBinary) { Fail "source block did not resolve the installed command through PATH" }
+    $SourceOutput = bitbygit --version
     if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $Version") {
         Fail "source block installed the wrong version"
     }
