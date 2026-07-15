@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyModifiers;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEventKind};
@@ -31,6 +31,7 @@ use bitbygit_store::{AuditEntry, LocalStore, RepoId, StorePaths};
 
 const MAX_PROMPT_LEN: usize = 512;
 const MAX_AUDIT_MESSAGE_LEN: usize = 512;
+const POLICY_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 const AUDIT_SECRET_MARKERS: &[&str] = &[
     "authorization",
     "credential",
@@ -48,6 +49,7 @@ const AUDIT_SECRET_MARKERS: &[&str] = &[
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
     let mut app = App::from_startup(startup_policy_from_environment());
+    let mut last_policy_reload = Instant::now();
 
     loop {
         terminal.draw(|frame| {
@@ -62,8 +64,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        if event::poll(Duration::from_millis(100))? {
-            app.policy = AuditDestination::Environment.load_policy(&app.policy);
+        let input_ready = event::poll(Duration::from_millis(100))?;
+        if input_ready || last_policy_reload.elapsed() >= POLICY_RELOAD_INTERVAL {
+            app.reload_policy(&AuditDestination::Environment);
+            last_policy_reload = Instant::now();
+        }
+        if input_ready {
             app.handle_event(event::read()?);
         }
     }
@@ -136,6 +142,7 @@ pub struct App {
     selected_file: usize,
     file_scroll: usize,
     details: String,
+    config_diagnostic: Option<String>,
     operation_queue: OperationQueue,
     policy: EffectivePolicy,
     should_quit: bool,
@@ -163,6 +170,7 @@ impl App {
             selected_file: 0,
             file_scroll: 0,
             details: "No repository status loaded yet.".to_owned(),
+            config_diagnostic: None,
             operation_queue: OperationQueue::default(),
             policy,
             should_quit: false,
@@ -172,11 +180,19 @@ impl App {
 
     fn from_startup(startup: StartupPolicy) -> Self {
         let mut app = Self::with_policy(startup.policy);
+        app.config_diagnostic = startup.diagnostic;
         app.load_current_dir();
-        if let Some(diagnostic) = startup.diagnostic {
-            app.details = diagnostic;
-        }
         app
+    }
+
+    fn reload_policy(&mut self, destination: &AuditDestination) {
+        let reload = destination.reload_policy(&self.policy);
+        let recovered = self.config_diagnostic.is_some() && reload.diagnostic.is_none();
+        self.policy = reload.policy;
+        self.config_diagnostic = reload.diagnostic;
+        if recovered {
+            self.refresh_status();
+        }
     }
 
     pub fn focus(&self) -> Focus {
@@ -345,11 +361,8 @@ impl App {
     }
 
     fn refresh_status(&mut self) {
-        if self
-            .policy
-            .is_operation_disabled(OperationKind::RefreshStatus)
-        {
-            self.details = disabled_operation_message(OperationKind::RefreshStatus);
+        if let Some(error) = direct_read_policy_error(&self.policy, OperationKind::RefreshStatus) {
+            self.details = error;
             return;
         }
         match Git::new(current_dir()).status() {
@@ -383,8 +396,8 @@ impl App {
     }
 
     fn refresh_diff(&mut self) {
-        if self.policy.is_operation_disabled(OperationKind::ViewDiff) {
-            self.details = disabled_operation_message(OperationKind::ViewDiff);
+        if let Some(error) = direct_read_policy_error(&self.policy, OperationKind::ViewDiff) {
+            self.details = error;
             return;
         }
         let Some(file) = self.files.get(self.selected_file) else {
@@ -496,7 +509,8 @@ impl App {
         confirmed_requirement: ConfirmationRequirement,
     ) {
         let result = executor.execute_confirmed(sequence, confirmed_requirement);
-        self.policy = executor.load_policy(result.policy());
+        self.policy = result.policy().clone();
+        self.reload_policy(&executor.audit);
         if result.should_refresh_status() {
             self.refresh_status();
         }
@@ -1367,6 +1381,27 @@ fn disabled_operation_message(operation: OperationKind) -> String {
         "Operation blocked: {} is disabled by policy.",
         operation.action_label()
     )
+}
+
+fn direct_read_policy_error(policy: &EffectivePolicy, operation: OperationKind) -> Option<String> {
+    if policy.is_operation_disabled(operation) {
+        return Some(disabled_operation_message(operation));
+    }
+    let requirement = policy
+        .evaluate_confirmation(RiskLevel::Low, operation, None)
+        .requirement;
+    match requirement {
+        ConfirmationRequirement::NormalSelection => None,
+        ConfirmationRequirement::Blocked => Some(format!(
+            "Operation blocked: {} is blocked by confirmation policy.",
+            operation.action_label()
+        )),
+        requirement => Some(format!(
+            "Operation blocked: {} requires {}; direct UI reads support normal selection only.",
+            operation.action_label(),
+            confirmation_requirement_label(requirement)
+        )),
+    }
 }
 
 fn operation_request_kind(request: &OperationRequest) -> Option<OperationKind> {
@@ -2910,9 +2945,21 @@ fn status_file_visible_len(area: Rect, has_operation_banner: bool) -> usize {
 }
 
 fn details_panel(app: &App) -> Paragraph<'_> {
-    Paragraph::new(app.details.clone())
+    Paragraph::new(details_text(app))
         .block(panel_block("Details", app.focus == Focus::Details))
         .wrap(Wrap { trim: true })
+}
+
+fn details_text(app: &App) -> String {
+    app.config_diagnostic.as_ref().map_or_else(
+        || app.details.clone(),
+        |diagnostic| {
+            format!(
+                "Configuration reload error: {diagnostic}\n\n{}",
+                app.details
+            )
+        },
+    )
 }
 
 fn queue_panel(app: &App) -> Paragraph<'_> {
@@ -3170,14 +3217,39 @@ impl StartupPolicy {
     }
 }
 
-fn effective_policy_from_paths(paths: &StorePaths) -> Option<EffectivePolicy> {
-    LocalStore::open(paths.clone()).ok().and_then(|store| {
-        let loaded = store.load_config();
-        loaded
-            .diagnostic
-            .is_none()
-            .then(|| EffectivePolicy::new(&loaded.settings))
-    })
+#[derive(Debug)]
+struct PolicyReload {
+    policy: EffectivePolicy,
+    diagnostic: Option<String>,
+}
+
+fn policy_reload_from_paths(paths: &StorePaths, fallback: &EffectivePolicy) -> PolicyReload {
+    match LocalStore::open(paths.clone()) {
+        Ok(store) => {
+            let loaded = store.load_config();
+            match loaded.diagnostic {
+                Some(diagnostic) => PolicyReload {
+                    policy: fallback.clone(),
+                    diagnostic: Some(format!(
+                        "{}; retaining the last valid policy until the configuration is fixed",
+                        diagnostic
+                            .to_string()
+                            .trim_end_matches("; using the safe fallback configuration")
+                    )),
+                },
+                None => PolicyReload {
+                    policy: EffectivePolicy::new(&loaded.settings),
+                    diagnostic: None,
+                },
+            }
+        }
+        Err(error) => PolicyReload {
+            policy: fallback.clone(),
+            diagnostic: Some(format!(
+                "configuration could not be reloaded: {error}; retaining the last valid policy until the configuration is fixed"
+            )),
+        },
+    }
 }
 
 fn operation_message(action: &str, result: Result<(), String>) -> String {
@@ -4289,15 +4361,22 @@ enum AuditDestination {
 
 impl AuditDestination {
     fn load_policy(&self, fallback: &EffectivePolicy) -> EffectivePolicy {
+        self.reload_policy(fallback).policy
+    }
+
+    fn reload_policy(&self, fallback: &EffectivePolicy) -> PolicyReload {
         match self {
-            Self::Environment => StorePaths::from_environment()
-                .ok()
-                .and_then(|paths| effective_policy_from_paths(&paths))
-                .unwrap_or_else(|| fallback.clone()),
+            Self::Environment => match StorePaths::from_environment() {
+                Ok(paths) => policy_reload_from_paths(&paths, fallback),
+                Err(error) => PolicyReload {
+                    policy: fallback.clone(),
+                    diagnostic: Some(format!(
+                        "configuration paths could not be resolved: {error}; retaining the last valid policy until the configuration is fixed"
+                    )),
+                },
+            },
             #[cfg(test)]
-            Self::Paths(paths) => {
-                effective_policy_from_paths(paths).unwrap_or_else(|| fallback.clone())
-            }
+            Self::Paths(paths) => policy_reload_from_paths(paths, fallback),
         }
     }
 
@@ -6935,8 +7014,7 @@ mod tests {
         let executor = PlanExecutor {
             repo_root: repo.clone(),
             audit: AuditDestination::Paths(paths.clone()),
-            policy: effective_policy_from_paths(&paths)
-                .ok_or_else(|| std::io::Error::other("expected changed policy"))?,
+            policy: AuditDestination::Paths(paths.clone()).load_policy(&EffectivePolicy::default()),
             ssh_executable: None,
         };
         let result = executor.execute(&operation.plan, operation.context);
@@ -7442,17 +7520,27 @@ mod tests {
         let invalid_paths = isolated_store_paths("invalid-policy-reload")?;
         let invalid_store = LocalStore::open(invalid_paths.clone())?;
         std::fs::write(&invalid_store.paths().config_file, "not valid toml = [")?;
-        assert_eq!(
-            AuditDestination::Paths(invalid_paths).load_policy(&restrictive_policy),
-            restrictive_policy
+        let invalid_reload =
+            AuditDestination::Paths(invalid_paths).reload_policy(&restrictive_policy);
+        assert_eq!(invalid_reload.policy, restrictive_policy);
+        assert!(
+            invalid_reload
+                .diagnostic
+                .is_some_and(|diagnostic| diagnostic.contains("is invalid")
+                    && diagnostic.contains("retaining the last valid policy"))
         );
 
         let unreadable_paths = isolated_store_paths("unreadable-policy-reload")?;
         let unreadable_store = LocalStore::open(unreadable_paths.clone())?;
         std::fs::create_dir(&unreadable_store.paths().config_file)?;
-        assert_eq!(
-            AuditDestination::Paths(unreadable_paths).load_policy(&restrictive_policy),
-            restrictive_policy
+        let unreadable_reload =
+            AuditDestination::Paths(unreadable_paths).reload_policy(&restrictive_policy);
+        assert_eq!(unreadable_reload.policy, restrictive_policy);
+        assert!(
+            unreadable_reload
+                .diagnostic
+                .is_some_and(|diagnostic| diagnostic.contains("could not be read")
+                    && diagnostic.contains("retaining the last valid policy"))
         );
         Ok(())
     }
@@ -7473,7 +7561,7 @@ mod tests {
                 .is_some_and(|diagnostic| diagnostic.contains("is invalid"))
         );
         let app = App::from_startup(startup);
-        assert!(app.details.contains("safe fallback configuration"));
+        assert!(details_text(&app).contains("safe fallback configuration"));
         Ok(())
     }
 
@@ -7493,8 +7581,127 @@ mod tests {
                 .is_some_and(|diagnostic| diagnostic.contains("could not be read"))
         );
         let app = App::from_startup(startup);
-        assert!(app.details.contains("safe fallback configuration"));
+        assert!(details_text(&app).contains("safe fallback configuration"));
         Ok(())
+    }
+
+    #[test]
+    fn startup_fail_closed_mode_recovers_after_config_is_fixed() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("startup-policy-recovery")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+        let mut app = App::from_startup(startup_policy_from_paths(&paths));
+
+        assert_eq!(app.policy, EffectivePolicy::safe_fallback());
+        assert!(app.branch.is_none());
+        assert!(app.config_diagnostic.is_some());
+
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[policy]\ndisabled-operations = [\"fetch\", \"stage\", \"unstage\", \"commit\", \"push\", \"pull\", \"checkout\", \"create-branch\", \"merge\", \"rebase\", \"open-pull-request\"]\n[prompt]\nenabled = false\n",
+        )?;
+        app.reload_policy(&AuditDestination::Paths(paths));
+
+        assert!(app.config_diagnostic.is_none());
+        assert!(app.branch.is_some(), "status should reload after recovery");
+        assert!(!app.policy.prompt_enabled());
+        assert!(app.policy.is_operation_disabled(OperationKind::Fetch));
+        assert!(
+            !app.policy
+                .is_operation_disabled(OperationKind::RefreshStatus)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_reload_diagnostic_stays_visible_until_valid_recovery() -> Result<(), Box<dyn Error>>
+    {
+        let paths = isolated_store_paths("runtime-policy-diagnostic")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[policy]\ndisabled-operations = [\"fetch\"]\n[prompt]\nenabled = false\n",
+        )?;
+        let mut app = App::from_startup(startup_policy_from_paths(&paths));
+        let restrictive_policy = app.policy.clone();
+        app.details = "latest operation detail".to_owned();
+
+        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+        app.reload_policy(&AuditDestination::Paths(paths.clone()));
+
+        assert_eq!(app.policy, restrictive_policy);
+        let visible_details = details_text(&app);
+        assert!(visible_details.contains("Configuration reload error"));
+        assert!(visible_details.contains("retaining the last valid policy"));
+        assert!(visible_details.contains("latest operation detail"));
+
+        app.branch = None;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[policy]\ndisabled-operations = [\"commit\"]\n",
+        )?;
+        app.reload_policy(&AuditDestination::Paths(paths));
+
+        assert!(app.config_diagnostic.is_none());
+        assert!(app.branch.is_some(), "valid recovery should refresh status");
+        assert!(app.policy.is_operation_disabled(OperationKind::Commit));
+        assert!(!app.policy.is_operation_disabled(OperationKind::Fetch));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_status_honors_escalated_and_blocked_low_risk_policy() {
+        for setting in [
+            ConfirmationSetting::VisiblePlan,
+            ConfirmationSetting::ExplicitConfirmation,
+            ConfirmationSetting::Blocked,
+        ] {
+            let mut config = AppConfig::default();
+            config.policy.confirmation.low = setting;
+
+            let app = App::from_startup(StartupPolicy {
+                policy: EffectivePolicy::new(&config),
+                diagnostic: None,
+            });
+
+            assert!(app.branch.is_none());
+            assert!(app.details.contains("Operation blocked: refresh status"));
+        }
+    }
+
+    #[test]
+    fn status_selection_diff_honors_blocked_confirmation_and_disabled_policy() {
+        let mut config = AppConfig::default();
+        config.policy.confirmation.low = ConfirmationSetting::Blocked;
+        let mut app = App::with_policy(EffectivePolicy::new(&config));
+        app.focus = Focus::Status;
+        app.files = ["first.txt", "second.txt"]
+            .into_iter()
+            .map(|path| FileRow {
+                path: PathBuf::from(path),
+                pathspecs: vec![PathBuf::from(path)],
+                label: path.to_owned(),
+                section: FileSection::Unstaged,
+            })
+            .collect();
+
+        app.move_selection_down();
+
+        assert_eq!(app.selected_file, 1);
+        assert_eq!(
+            app.details,
+            "Operation blocked: view diff is blocked by confirmation policy."
+        );
+
+        config.policy.confirmation.low = ConfirmationSetting::NormalSelection;
+        config.policy.disabled_operations = vec![OperationFamily::ViewDiff];
+        app.policy = EffectivePolicy::new(&config);
+        app.selected_file = 0;
+        app.move_selection_down();
+        assert_eq!(
+            app.details,
+            "Operation blocked: view diff is disabled by policy."
+        );
     }
 
     #[test]
