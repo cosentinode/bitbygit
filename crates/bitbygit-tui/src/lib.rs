@@ -2007,6 +2007,16 @@ impl OperationPlanner {
         if requests.len() < 2 {
             return Err("Prompt sequence requires at least two steps.".to_owned());
         }
+        if requests
+            .iter()
+            .skip(1)
+            .any(|request| matches!(request, OperationRequest::Recover(_)))
+        {
+            return Err(
+                "Recovery sequence blocked: recovery must be the first step so its confirmed state is captured by the sequence preview."
+                    .to_owned(),
+            );
+        }
         self.ensure_conflict_mode_allowed(&requests)?;
         for (index, request) in requests.iter().enumerate() {
             prompt_sequence_request_preview(request).map_err(|error| {
@@ -5807,9 +5817,9 @@ mod tests {
             OperationRequest::Fetch,
             OperationRequest::Recover(RecoveryRequest::MergeContinue),
         ]) else {
-            return Err("fetch then blocked merge continue should fail sequence preflight".into());
+            return Err("deferred recovery should fail sequence preflight".into());
         };
-        assert!(error.contains("resolve and stage all conflicts"));
+        assert!(error.contains("recovery must be the first step"));
 
         let operation = planner
             .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
@@ -5840,12 +5850,43 @@ mod tests {
         ]) else {
             return Err("dependent recovery sequence should fail full preflight".into());
         };
-        assert!(error.contains("only one recovery action can be preflighted"));
+        assert!(error.contains("recovery must be the first step"));
         assert_eq!(git_stdout(&repo, &["rev-parse", "HEAD"])?, head_before);
         assert_eq!(
             Git::new(repo).status()?.operation,
             Some(RepositoryOperation::Merge)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_first_sequence_executes_the_state_captured_at_preview() -> Result<(), Box<dyn Error>>
+    {
+        let repo = merge_conflict_repo("recovery-sequence-preview-state")?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![
+                OperationRequest::Recover(RecoveryRequest::MergeAbort),
+                OperationRequest::Branches,
+            ])
+            .map_err(std::io::Error::other)?;
+        std::fs::write(
+            repo.join("conflict.txt"),
+            "changed after sequence preview\n",
+        )?;
+        let paths = isolated_store_paths("recovery-sequence-preview-state-audit")?;
+
+        let result = PromptSequenceExecutor::with_audit_paths(&repo, paths.clone())
+            .execute(sequence.sequence);
+
+        assert!(result.message().contains("state changed after preview"));
+        assert!(!result.message().contains("Prompt sequence completed"));
+        assert_eq!(
+            Git::new(&repo).status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.operation == "merge_abort"));
         Ok(())
     }
 

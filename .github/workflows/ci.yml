@@ -67,5 +67,5 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify fail-closed recovery execution
-        run: cargo test --locked -p bitbygit-git recovery_execution_capability
+      - name: Verify recovery platform boundary
+        run: cargo test --locked -p bitbygit-git recovery_platform_capability

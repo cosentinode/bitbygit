@@ -121,13 +121,25 @@ Conflict mode should:
 - audit conflict recovery actions
 
 Conflict recovery actions are high risk because they move repository state.
-BitByGit revalidates bounded recovery inputs immediately before invoking Git and
-surfaces Git's own operation-state failures. This narrows but does not claim to
-eliminate the cross-process scheduling window for external worktree writers.
-Recovery planning remains available on all release platforms. Recovery execution
-fails closed with a manual-command diagnostic on platforms where BitByGit cannot
-guarantee both hard output bounds and descendant process cleanup; currently,
-execution is supported on Linux.
+On Linux, BitByGit fingerprints bounded tracked, untracked, ignored, control,
+configuration, attribute, hook, and ref inputs at preview. It takes an
+identity-checked lock in the common Git directory, checks that fingerprint as the
+last operation before spawning Git, and holds the lock through execution. A
+recovery action in a prompt sequence must be first so this state is captured by
+the displayed sequence preview.
+
+The lock serializes BitByGit recovery processes for the repository. Other Git
+clients and filesystem writers do not honor an application lock; their normal
+concurrency boundary still applies, and BitByGit surfaces resulting Git failures
+rather than claiming to exclude those writers.
+
+Recovery rejects executable hooks, active external filters or merge drivers,
+fsmonitor and signing processes, and remaining rebase `exec` commands. This
+prevents those configured processes from detaching outside bounded cleanup.
+Planning also fails closed when its path, entry, ignored-data, or output limits
+are exceeded. On non-Linux platforms, both recovery planning and execution fail
+before Git is spawned, with a manual-command diagnostic, until equivalent hard
+output and descendant-process bounds are available.
 
 ## Confirmation Copy
 
