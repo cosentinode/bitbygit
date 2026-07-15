@@ -1356,20 +1356,45 @@ fn apply_policy_evaluation(plan: &mut OperationPlan, evaluation: PolicyEvaluatio
     plan.confirmation.reason =
         (!evaluation.reasons.is_empty()).then(|| evaluation.reasons.join("; "));
     if requirement != previous_requirement {
-        plan.confirmation.prompt = confirmation_prompt(requirement);
+        plan.confirmation.prompt = confirmation_prompt(plan, requirement);
     }
 }
 
-fn confirmation_prompt(requirement: ConfirmationRequirement) -> String {
+fn confirmation_prompt(plan: &OperationPlan, requirement: ConfirmationRequirement) -> String {
+    let action = confirmation_action(plan);
     match requirement {
         ConfirmationRequirement::NormalSelection => String::new(),
-        ConfirmationRequirement::VisiblePlan => "Press y to confirm or n to cancel.".to_owned(),
-        ConfirmationRequirement::ExplicitConfirmation => {
-            "Explicit confirmation required: press uppercase Y to confirm or n to cancel."
-                .to_owned()
+        ConfirmationRequirement::VisiblePlan => {
+            format!("Press y to {action} or n to cancel.")
         }
-        ConfirmationRequirement::Blocked => "Blocked by policy; press n to dismiss.".to_owned(),
+        ConfirmationRequirement::ExplicitConfirmation => {
+            format!("Explicit confirmation required: press uppercase Y to {action} or n to cancel.")
+        }
+        ConfirmationRequirement::Blocked => {
+            format!("Policy blocks this operation: {action}. Press n to dismiss.")
+        }
     }
+}
+
+fn confirmation_action(plan: &OperationPlan) -> String {
+    let prompt = plan.confirmation.prompt.as_str();
+    for prefix in [
+        "Press y to ",
+        "Explicit confirmation required: press uppercase Y to ",
+    ] {
+        if let Some(action) = prompt
+            .strip_prefix(prefix)
+            .and_then(|action| action.strip_suffix(" or n to cancel."))
+        {
+            return action.to_owned();
+        }
+    }
+    if let OperationRequest::PromptSequence { requests } = &plan.request {
+        return format!("run {} prompt steps", requests.len());
+    }
+    plan.first_step()
+        .map(|step| step.kind.action_label().to_owned())
+        .unwrap_or_else(|| "run the operation".to_owned())
 }
 
 fn confirmation_requirement_label(requirement: ConfirmationRequirement) -> &'static str {
@@ -1390,20 +1415,29 @@ fn confirmation_covers(
     plan.confirmation.requirement != ConfirmationRequirement::Blocked
         && plan.confirmation.requirement <= confirmed_requirement
         && current_policy.requirement <= previewed_policy.requirement
-        && current_policy
-            .reasons
-            .iter()
-            .filter(|reason| reason.starts_with("protected branch "))
-            .all(|reason| previewed_policy.reasons.contains(reason))
+        && protected_policy_reasons_covered(&previewed_policy.reasons, current_policy)
+}
+
+fn protected_policy_reasons_covered(
+    previewed_reasons: &[String],
+    current_policy: &PolicyEvaluation,
+) -> bool {
+    current_policy
+        .reasons
+        .iter()
+        .filter(|reason| reason.starts_with("protected branch "))
+        .all(|reason| previewed_reasons.contains(reason))
 }
 
 fn prompt_sequence_policy_evaluations(
     policy: &EffectivePolicy,
+    git: &Git,
     requests: &[OperationRequest],
     initial_branch: Option<String>,
-) -> Result<Vec<PolicyEvaluation>, String> {
+) -> Result<(Vec<PolicyEvaluation>, Vec<PolicyEvaluation>), String> {
     let mut branch = initial_branch;
     let mut evaluations = Vec::with_capacity(requests.len());
+    let mut sequence_evaluations = Vec::with_capacity(requests.len());
     for request in requests {
         let preview = prompt_sequence_request_preview(request)?;
         evaluations.push(policy.evaluate_confirmation(
@@ -1411,15 +1445,60 @@ fn prompt_sequence_policy_evaluations(
             preview.kind,
             branch.as_deref(),
         ));
+        sequence_evaluations.push(policy.evaluate_confirmation(
+            sequence_step_risk(preview.risk_level),
+            preview.kind,
+            branch.as_deref(),
+        ));
         match request {
-            OperationRequest::Checkout { branch: target }
-            | OperationRequest::CreateBranch { branch: target, .. } => {
+            OperationRequest::Checkout { branch: target } if branch.as_deref() != Some(target) => {
+                branch = Some(sequence_checkout_resulting_branch(git, target)?);
+            }
+            OperationRequest::CreateBranch { branch: target, .. } => {
                 branch = Some(target.clone());
             }
             _ => {}
         }
     }
-    Ok(evaluations)
+    Ok((evaluations, sequence_evaluations))
+}
+
+fn sequence_checkout_resulting_branch(git: &Git, target: &str) -> Result<String, String> {
+    if let Some(target) = git
+        .branch_target(target)
+        .map_err(|error| format!("Unable to resolve sequence checkout: {error}"))?
+    {
+        return checkout_resulting_branch(&target);
+    }
+    let Some((remote, branch)) = target.split_once('/') else {
+        return Ok(target.to_owned());
+    };
+    let remote_exists = git
+        .remotes()
+        .ok()
+        .is_some_and(|remotes| remotes.iter().any(|candidate| candidate.name == remote));
+    if remote_exists {
+        Ok(branch.to_owned())
+    } else {
+        Ok(target.to_owned())
+    }
+}
+
+fn checkout_resulting_branch(target: &BranchTarget) -> Result<String, String> {
+    match target.kind {
+        BranchKind::Local => Ok(target.name.clone()),
+        BranchKind::Remote => target
+            .name
+            .split_once('/')
+            .map(|(_remote, branch)| branch.to_owned())
+            .filter(|branch| !branch.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "Checkout blocked: remote branch {} has no local branch name.",
+                    target.name
+                )
+            }),
+    }
 }
 
 fn prompt_sequence_plan(
@@ -1815,11 +1894,11 @@ impl OperationPlanner {
                     .ok()
                     .and_then(|status| branch_name(&status.branch).ok())
             });
-        let policy_evaluations =
-            prompt_sequence_policy_evaluations(&self.policy, &requests, branch)?;
+        let (policy_evaluations, sequence_policy_evaluations) =
+            prompt_sequence_policy_evaluations(&self.policy, &self.git(), &requests, branch)?;
         apply_policy_evaluation(
             &mut plan,
-            combined_policy_evaluation(policy_evaluations.iter().cloned()),
+            combined_policy_evaluation(sequence_policy_evaluations),
         );
         let remaining_requests = requests.into_iter().skip(1).collect();
         Ok(PreparedPromptSequence::new(
@@ -2649,18 +2728,17 @@ fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
         ];
     };
     let plan = &operation.plan;
-    let mut lines = vec![
+    vec![
         format!(
             "Pending: {} | Risk: {}",
             plan.title,
             risk_label(plan.confirmation.risk_level)
         ),
-        format!("Steps: {}", plan_steps_summary(plan)),
-        format!("Policy: {}", policy_reason(plan)),
         format!("Accepted keys: {}", accepted_confirmation_keys(plan)),
-    ];
-    lines.push(format!("Confirm: {}", confirmation_copy(plan)));
-    lines
+        format!("Confirm: {}", confirmation_copy(plan)),
+        format!("Policy: {}", policy_reason(plan)),
+        format!("Steps: {}", plan_steps_summary(plan)),
+    ]
 }
 
 fn policy_reason(plan: &OperationPlan) -> &str {
@@ -2672,12 +2750,10 @@ fn policy_reason(plan: &OperationPlan) -> &str {
 
 fn accepted_confirmation_keys(plan: &OperationPlan) -> &'static str {
     match plan.confirmation.requirement {
-        ConfirmationRequirement::NormalSelection => "none; runs after normal selection",
-        ConfirmationRequirement::VisiblePlan => "y to confirm; n or Esc to cancel",
-        ConfirmationRequirement::ExplicitConfirmation => {
-            "uppercase Y to confirm; n or Esc to cancel"
-        }
-        ConfirmationRequirement::Blocked => "n or Esc to dismiss; confirmation is disabled",
+        ConfirmationRequirement::NormalSelection => "none; runs on selection",
+        ConfirmationRequirement::VisiblePlan => "y confirm; n/Esc cancel",
+        ConfirmationRequirement::ExplicitConfirmation => "uppercase Y confirm; n/Esc cancel",
+        ConfirmationRequirement::Blocked => "n/Esc dismiss; confirm disabled",
     }
 }
 
@@ -2698,7 +2774,10 @@ fn plan_steps_summary(plan: &OperationPlan) -> String {
 }
 
 fn confirmation_copy(plan: &OperationPlan) -> String {
-    confirmation_prompt(plan.confirmation.requirement)
+    if !plan.confirmation.prompt.is_empty() {
+        return plan.confirmation.prompt.clone();
+    }
+    confirmation_prompt(plan, plan.confirmation.requirement)
 }
 
 fn risk_label(risk: RiskLevel) -> &'static str {
@@ -2911,21 +2990,24 @@ impl PlanExecutor {
         if plan.confirmation.requirement == ConfirmationRequirement::Blocked {
             return Err("operation is blocked by the policy captured in the preview".to_owned());
         }
-        let current_requirement = plan
-            .steps
-            .iter()
-            .map(|step| {
-                self.policy
-                    .evaluate_confirmation(step.risk_level, step.kind, policy_branch(context))
-                    .requirement
-            })
-            .max()
-            .unwrap_or(ConfirmationRequirement::NormalSelection);
-        if current_requirement > plan.confirmation.requirement {
+        let current_policy = evaluate_plan_policy(&self.policy, plan, policy_branch(context));
+        if current_policy.requirement > plan.confirmation.requirement {
             return Err(format!(
                 "policy now requires {}; review the updated plan before execution",
-                confirmation_requirement_label(current_requirement)
+                confirmation_requirement_label(current_policy.requirement)
             ));
+        }
+        let previewed_reasons: Vec<String> = plan
+            .confirmation
+            .reason
+            .as_deref()
+            .map(|reasons| reasons.split("; ").map(ToOwned::to_owned).collect())
+            .unwrap_or_default();
+        if !protected_policy_reasons_covered(&previewed_reasons, &current_policy) {
+            return Err(
+                "policy now applies new protected-branch rules; review the updated plan before execution"
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -6095,10 +6177,10 @@ mod tests {
         let queue_text = queue_panel_text(app.operation_queue.pending());
         assert!(queue_text[0].contains("Stage all plan"));
         assert!(queue_text[0].contains("Risk: medium"));
-        assert!(queue_text[1].contains("stage all working tree changes"));
-        assert!(queue_text[2].contains("medium risk policy requires visible-plan"));
-        assert!(queue_text[3].contains("y to confirm; n or Esc to cancel"));
-        assert!(queue_text[4].contains("Press y to confirm"));
+        assert!(queue_text[1].contains("y confirm; n/Esc cancel"));
+        assert!(queue_text[2].contains("Press y to stage all changes"));
+        assert!(queue_text[3].contains("medium risk policy requires visible-plan"));
+        assert!(queue_text[4].contains("stage all working tree changes"));
 
         app.handle_key(key(KeyCode::Char('n')));
 
@@ -6142,6 +6224,13 @@ mod tests {
             .unwrap_or_default();
         assert!(reason.contains("protected branch production"));
         assert!(reason.contains("medium risk policy requires explicit"));
+        assert!(
+            manual
+                .plan
+                .confirmation
+                .prompt
+                .contains("uppercase Y to commit")
+        );
 
         let sequence = planner
             .plan_prompt_sequence(vec![
@@ -6162,6 +6251,70 @@ mod tests {
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("protected branch production"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn medium_explicit_policy_applies_to_low_risk_prompt_sequences() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("sequence-medium-explicit-policy")?;
+        let mut config = AppConfig::default();
+        config.policy.confirmation.medium = ConfirmationSetting::ExplicitConfirmation;
+
+        let sequence = OperationPlanner::with_policy(&repo, EffectivePolicy::new(&config))
+            .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Branches])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("medium risk policy requires explicit"))
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .prompt
+                .contains("uppercase Y to run 2 prompt steps")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn medium_blocked_policy_applies_to_low_risk_prompt_sequences() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("sequence-medium-blocked-policy")?;
+        let mut config = AppConfig::default();
+        config.policy.confirmation.medium = ConfirmationSetting::Blocked;
+
+        let sequence = OperationPlanner::with_policy(&repo, EffectivePolicy::new(&config))
+            .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Branches])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::Blocked
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("medium risk policy requires blocked"))
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .prompt
+                .contains("run 2 prompt steps")
         );
         Ok(())
     }
@@ -6213,6 +6366,24 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("protected branch production"))
         );
+
+        git_stdout(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+        let remote_to_protected = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Checkout {
+                    branch: "origin/main".to_owned(),
+                },
+                OperationRequest::Push,
+            ])
+            .map_err(std::io::Error::other)?;
+        assert!(
+            remote_to_protected
+                .plan
+                .confirmation
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("protected branch main"))
+        );
         Ok(())
     }
 
@@ -6261,6 +6432,41 @@ mod tests {
         };
         assert!(error.contains("review the updated plan"));
         Ok(())
+    }
+
+    #[test]
+    fn ordinary_queue_rejects_new_protected_reason_without_requirement_change() {
+        let target = HeadTarget {
+            oid: Some("1234567890abcdef".to_owned()),
+            reference: Some("refs/heads/production".to_owned()),
+        };
+        let context = ExecutionContext::from_payload(PendingPayload::Commit {
+            staged_items: vec!["file.txt".to_owned()],
+            staged_tree: "abcdef1234567890".to_owned(),
+            target,
+        });
+        let mut preview = commit_plan("ready", 1);
+        apply_policy_to_plan(
+            &EffectivePolicy::default(),
+            &mut preview,
+            Some("production"),
+        );
+        let mut config = AppConfig::default();
+        config.policy.additional_protected_branches = vec!["production".to_owned()];
+        let mut app = App::new();
+        app.queue_operation(preview.clone(), context);
+        app.policy = EffectivePolicy::new(&config);
+
+        assert_eq!(
+            preview.confirmation.requirement,
+            ConfirmationRequirement::VisiblePlan
+        );
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(
+            app.details.contains("new protected-branch rules"),
+            "{}",
+            app.details
+        );
     }
 
     #[test]
@@ -6669,12 +6875,43 @@ mod tests {
     }
 
     #[test]
-    fn desktop_queue_renders_accepted_confirmation_keys() -> Result<(), Box<dyn Error>> {
-        let backend = TestBackend::new(120, 40);
+    fn desktop_queue_keeps_confirmation_keys_visible_when_plan_details_wrap()
+    -> Result<(), Box<dyn Error>> {
+        let backend = TestBackend::new(50, 24);
         let mut terminal = Terminal::new(backend)?;
         let mut app = App::new();
-        app.focus = Focus::Status;
-        app.handle_key(key(KeyCode::Char('a')));
+        let mut plan = OperationPlan::new(
+            OperationRequest::PromptSequence {
+                requests: vec![
+                    OperationRequest::Checkout {
+                        branch: "feature/a-very-long-branch-name".to_owned(),
+                    },
+                    OperationRequest::Rebase {
+                        base: "origin/a-very-long-base-branch-name".to_owned(),
+                    },
+                ],
+            },
+            "Prompt sequence plan",
+            vec![
+                OperationStep::new(
+                    OperationKind::CheckoutBranch,
+                    RiskLevel::Medium,
+                    "checkout a branch whose preview wraps across multiple queue rows",
+                ),
+                OperationStep::new(
+                    OperationKind::Rebase,
+                    RiskLevel::High,
+                    "rebase onto a long remote branch after checkout succeeds",
+                ),
+            ],
+            "Explicit confirmation required: press uppercase Y to run 2 prompt steps or n to cancel.",
+        );
+        plan.confirmation.reason = Some(
+            "high risk policy requires explicit confirmation and this deliberately long policy explanation wraps"
+                .to_owned(),
+        );
+        app.operation_queue
+            .enqueue(QueuedOperation::new(plan, ExecutionContext::default()));
 
         terminal.draw(|frame| {
             let viewport = Viewport::split(frame.area());
@@ -6688,7 +6925,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Accepted keys: y to confirm; n or Esc to cancel"));
+        assert!(rendered.contains("Accepted keys: uppercase Y confirm; n/Esc cancel"));
         Ok(())
     }
 
