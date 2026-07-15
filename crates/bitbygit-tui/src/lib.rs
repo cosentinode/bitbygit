@@ -64,7 +64,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         if event::poll(Duration::from_millis(100))? {
-            app.policy = effective_policy_from_environment();
+            app.policy = AuditDestination::Environment.load_policy(&app.policy);
             app.handle_event(event::read()?);
         }
     }
@@ -477,8 +477,18 @@ impl App {
         sequence: QueuedPromptSequence,
         confirmed_requirement: ConfirmationRequirement,
     ) {
-        let result = PromptSequenceExecutor::current(self.policy.clone())
-            .execute_confirmed(sequence, confirmed_requirement);
+        let executor = PromptSequenceExecutor::current(self.policy.clone());
+        self.execute_prompt_sequence_with(&executor, sequence, confirmed_requirement);
+    }
+
+    fn execute_prompt_sequence_with(
+        &mut self,
+        executor: &PromptSequenceExecutor,
+        sequence: QueuedPromptSequence,
+        confirmed_requirement: ConfirmationRequirement,
+    ) {
+        let result = executor.execute_confirmed(sequence, confirmed_requirement);
+        self.policy = executor.load_policy(result.policy());
         if result.should_refresh_status() {
             self.refresh_status();
         }
@@ -3124,9 +3134,13 @@ fn effective_policy_from_environment() -> EffectivePolicy {
 }
 
 fn effective_policy_from_paths(paths: &StorePaths) -> Option<EffectivePolicy> {
-    LocalStore::open(paths.clone())
-        .ok()
-        .map(|store| EffectivePolicy::new(&store.load_config().settings))
+    LocalStore::open(paths.clone()).ok().and_then(|store| {
+        let loaded = store.load_config();
+        loaded
+            .diagnostic
+            .is_none()
+            .then(|| EffectivePolicy::new(&loaded.settings))
+    })
 }
 
 fn operation_message(action: &str, result: Result<(), String>) -> String {
@@ -3923,7 +3937,7 @@ impl PromptSequenceExecutor {
         } = sequence;
         let mut step_results = Vec::with_capacity(total_steps);
 
-        let current_policy = self.load_policy();
+        let mut current_policy = self.load_policy(&self.policy);
         let git = Git::new(self.repo_root.clone());
         let requests = std::iter::once(first.plan.request.clone())
             .chain(remaining_requests.iter().cloned())
@@ -3944,7 +3958,11 @@ impl PromptSequenceExecutor {
                         first.plan.title.clone(),
                         format!("policy requires a new sequence preview and confirmation: {error}"),
                     ));
-                    return PromptSequenceExecutionResult::new(total_steps, step_results);
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
                 }
             };
         if !sequence_policy_confirmation_covers(
@@ -3961,7 +3979,7 @@ impl PromptSequenceExecutor {
                 first.plan.title.clone(),
                 "policy requires a new sequence preview and confirmation".to_owned(),
             ));
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         }
 
         let mut previewed_policies = policy_evaluations.into_iter();
@@ -3976,7 +3994,7 @@ impl PromptSequenceExecutor {
                 first.plan.title.clone(),
                 "sequence preview is missing policy context".to_owned(),
             ));
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         };
         let branch = policy_branch(&first.context);
         let current_evaluation = evaluate_plan_policy(&current_policy, &first.plan, branch);
@@ -3998,12 +4016,12 @@ impl PromptSequenceExecutor {
                 first.plan.title.clone(),
                 "policy requires a new sequence preview and confirmation".to_owned(),
             ));
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         }
         let executor = PlanExecutor {
             repo_root: self.repo_root.clone(),
             audit: self.audit.clone(),
-            policy: current_policy,
+            policy: current_policy.clone(),
             #[cfg(test)]
             ssh_executable: self.ssh_executable.clone(),
         };
@@ -4011,16 +4029,16 @@ impl PromptSequenceExecutor {
         let first_succeeded = first_result.succeeded;
         step_results.push(first_result);
         if !first_succeeded {
-            return PromptSequenceExecutionResult::new(total_steps, step_results);
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
         }
 
         for (index, request) in remaining_requests.into_iter().enumerate() {
             let step_number = index + 2;
-            let planning_policy = self.load_policy();
+            current_policy = self.load_policy(&current_policy);
             let planner = OperationPlanner {
                 repo_root: self.repo_root.clone(),
                 github_executable: self.github_executable.clone(),
-                policy: planning_policy,
+                policy: current_policy.clone(),
                 #[cfg(test)]
                 ssh_executable: self.ssh_executable.clone(),
             };
@@ -4032,7 +4050,11 @@ impl PromptSequenceExecutor {
                         prompt_sequence_request_title(&request),
                         error,
                     ));
-                    return PromptSequenceExecutionResult::new(total_steps, step_results);
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
                 }
             };
             let (Some(previewed_policy), Some(previewed_sequence_policy)) = (
@@ -4044,9 +4066,13 @@ impl PromptSequenceExecutor {
                     operation.plan.title.clone(),
                     "sequence preview is missing policy context".to_owned(),
                 ));
-                return PromptSequenceExecutionResult::new(total_steps, step_results);
+                return PromptSequenceExecutionResult::new(
+                    total_steps,
+                    step_results,
+                    current_policy,
+                );
             };
-            let current_policy = self.load_policy();
+            current_policy = self.load_policy(&current_policy);
             let branch = policy_branch(&operation.context);
             let current_evaluation = evaluate_plan_policy(&current_policy, &operation.plan, branch);
             let current_sequence_evaluation =
@@ -4067,12 +4093,16 @@ impl PromptSequenceExecutor {
                     operation.plan.title.clone(),
                     "policy requires a new sequence preview and confirmation".to_owned(),
                 ));
-                return PromptSequenceExecutionResult::new(total_steps, step_results);
+                return PromptSequenceExecutionResult::new(
+                    total_steps,
+                    step_results,
+                    current_policy,
+                );
             }
             let executor = PlanExecutor {
                 repo_root: self.repo_root.clone(),
                 audit: self.audit.clone(),
-                policy: current_policy,
+                policy: current_policy.clone(),
                 #[cfg(test)]
                 ssh_executable: self.ssh_executable.clone(),
             };
@@ -4080,15 +4110,19 @@ impl PromptSequenceExecutor {
             let succeeded = step.succeeded;
             step_results.push(step);
             if !succeeded {
-                return PromptSequenceExecutionResult::new(total_steps, step_results);
+                return PromptSequenceExecutionResult::new(
+                    total_steps,
+                    step_results,
+                    current_policy,
+                );
             }
         }
 
-        PromptSequenceExecutionResult::new(total_steps, step_results)
+        PromptSequenceExecutionResult::new(total_steps, step_results, current_policy)
     }
 
-    fn load_policy(&self) -> EffectivePolicy {
-        self.audit.load_policy(&self.policy)
+    fn load_policy(&self, fallback: &EffectivePolicy) -> EffectivePolicy {
+        self.audit.load_policy(fallback)
     }
 
     fn execute_prepared_step(
@@ -4113,14 +4147,24 @@ impl PromptSequenceExecutor {
 struct PromptSequenceExecutionResult {
     total_steps: usize,
     step_results: Vec<PromptSequenceStepResult>,
+    policy: EffectivePolicy,
 }
 
 impl PromptSequenceExecutionResult {
-    fn new(total_steps: usize, step_results: Vec<PromptSequenceStepResult>) -> Self {
+    fn new(
+        total_steps: usize,
+        step_results: Vec<PromptSequenceStepResult>,
+        policy: EffectivePolicy,
+    ) -> Self {
         Self {
             total_steps,
             step_results,
+            policy,
         }
+    }
+
+    fn policy(&self) -> &EffectivePolicy {
+        &self.policy
     }
 
     fn should_refresh_status(&self) -> bool {
@@ -7351,6 +7395,32 @@ mod tests {
     }
 
     #[test]
+    fn policy_reload_preserves_restrictive_policy_for_invalid_or_unreadable_config()
+    -> Result<(), Box<dyn Error>> {
+        let mut config = AppConfig::default();
+        config.prompt.enabled = false;
+        config.policy.disabled_operations = vec![OperationFamily::Fetch];
+        let restrictive_policy = EffectivePolicy::new(&config);
+
+        let invalid_paths = isolated_store_paths("invalid-policy-reload")?;
+        let invalid_store = LocalStore::open(invalid_paths.clone())?;
+        std::fs::write(&invalid_store.paths().config_file, "not valid toml = [")?;
+        assert_eq!(
+            AuditDestination::Paths(invalid_paths).load_policy(&restrictive_policy),
+            restrictive_policy
+        );
+
+        let unreadable_paths = isolated_store_paths("unreadable-policy-reload")?;
+        let unreadable_store = LocalStore::open(unreadable_paths.clone())?;
+        std::fs::create_dir(&unreadable_store.paths().config_file)?;
+        assert_eq!(
+            AuditDestination::Paths(unreadable_paths).load_policy(&restrictive_policy),
+            restrictive_policy
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ordinary_queue_rejects_new_protected_reason_without_requirement_change() {
         let target = HeadTarget {
             oid: Some("1234567890abcdef".to_owned()),
@@ -7503,6 +7573,52 @@ mod tests {
             git_stdout(&repo, &["diff", "--cached", "--name-only"])?.trim(),
             "next.txt"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_uses_reloaded_policy_for_post_sequence_status_refresh() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("post-sequence-refresh-policy")?;
+        let remote = isolated_bare_git_repo("post-sequence-refresh-policy-remote")?;
+        add_github_remote(&repo, "origin", &remote)?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Branches])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("post-sequence-refresh-policy-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh = operation_disabling_ssh(
+            "post-sequence-refresh-policy",
+            &store.paths().config_file,
+            "refresh-status",
+        )?;
+        let executor = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+        let sentinel = FileRow {
+            path: PathBuf::from("keep.txt"),
+            pathspecs: vec![PathBuf::from("keep.txt")],
+            label: "sentinel".to_owned(),
+            section: FileSection::Unstaged,
+        };
+        let mut app = App::new();
+        app.files = vec![sentinel.clone()];
+
+        app.execute_prompt_sequence_with(
+            &executor,
+            sequence.sequence,
+            ConfirmationRequirement::VisiblePlan,
+        );
+
+        assert!(
+            app.policy
+                .is_operation_disabled(OperationKind::RefreshStatus)
+        );
+        assert_eq!(app.files, vec![sentinel]);
+        assert!(app.details.contains("Prompt sequence completed 2 step(s)."));
         Ok(())
     }
 
