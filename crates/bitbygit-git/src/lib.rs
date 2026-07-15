@@ -45,6 +45,8 @@ const MAX_RECOVERY_SUBPROCESSES: usize = 12;
 const MAX_RECOVERY_GENERATION_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_GENERATION_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_GENERATION_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const RECOVERY_CAPABILITY_UNAVAILABLE: &str =
+    "atomic recovery is unavailable because required platform capabilities are missing";
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -310,6 +312,10 @@ impl Git {
         )?;
         transaction.promote(self, &current_state)?;
         Ok(output)
+    }
+
+    pub fn ensure_recovery_supported(&self) -> Result<(), GitError> {
+        RecoveryTransaction::supported_root(self).map(|_| ())
     }
 
     pub fn push_current_branch(
@@ -1474,6 +1480,31 @@ struct RecoveryTransaction {
 
 impl RecoveryTransaction {
     fn prepare(git: &Git) -> Result<Self, GitError> {
+        let root = Self::supported_root(git)?;
+        let baseline = RecoveryGeneration::capture(&root)?;
+        let parent = root.parent().ok_or_else(|| {
+            recovery_transaction_blocked("repository root has no parent for isolated recovery")
+        })?;
+        let candidate = create_recovery_candidate(parent)?;
+        let mut transaction = Self {
+            root,
+            candidate,
+            baseline,
+            keep_candidate: false,
+        };
+        transaction.copy_repository()?;
+
+        let live_after_copy = RecoveryGeneration::capture(&transaction.root)?;
+        let copied = RecoveryGeneration::capture(&transaction.candidate)?;
+        if live_after_copy != transaction.baseline || copied != transaction.baseline {
+            return Err(recovery_transaction_blocked(
+                "repository changed while isolated recovery state was prepared",
+            ));
+        }
+        Ok(transaction)
+    }
+
+    fn supported_root(git: &Git) -> Result<PathBuf, GitError> {
         let root = git
             .repo_root()?
             .canonicalize()
@@ -1503,28 +1534,12 @@ impl RecoveryTransaction {
                 "atomic recovery does not support a shared common Git directory",
             ));
         }
-
-        let baseline = RecoveryGeneration::capture(&root)?;
         let parent = root.parent().ok_or_else(|| {
             recovery_transaction_blocked("repository root has no parent for isolated recovery")
         })?;
-        let candidate = create_recovery_candidate(parent)?;
-        let mut transaction = Self {
-            root,
-            candidate,
-            baseline,
-            keep_candidate: false,
-        };
-        transaction.copy_repository()?;
-
-        let live_after_copy = RecoveryGeneration::capture(&transaction.root)?;
-        let copied = RecoveryGeneration::capture(&transaction.candidate)?;
-        if live_after_copy != transaction.baseline || copied != transaction.baseline {
-            return Err(recovery_transaction_blocked(
-                "repository changed while isolated recovery state was prepared",
-            ));
-        }
-        Ok(transaction)
+        run_recovery_capability_hook(&root)?;
+        ensure_recovery_platform_capabilities(parent)?;
+        Ok(root)
     }
 
     fn copy_repository(&mut self) -> Result<(), GitError> {
@@ -1564,7 +1579,7 @@ impl RecoveryTransaction {
                 "--fork",
                 "sh",
                 "-c",
-                "mount --bind \"$1\" \"$2\" && cd \"$2\" && shift 2 && exec git \"$@\"",
+                "mount --bind \"$1\" \"$2\" || { printf '%s\\n' 'bitbygit: recovery namespace setup failed' >&2; exit 125; }; cd \"$2\" || { printf '%s\\n' 'bitbygit: recovery namespace setup failed' >&2; exit 125; }; shift 2; exec git \"$@\"",
                 "bitbygit-recovery",
             ])
             .arg(&self.candidate)
@@ -1591,6 +1606,14 @@ impl RecoveryTransaction {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
+            if String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+                line.starts_with("unshare: ") || line == "bitbygit: recovery namespace setup failed"
+            }) {
+                return Err(recovery_capability_unavailable(format!(
+                    "the recovery namespace could not be established: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
             return Err(GitError::GitFailed {
                 args,
                 status: output.status,
@@ -1778,6 +1801,89 @@ fn create_recovery_candidate(parent: &Path) -> Result<PathBuf, GitError> {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> {
+    let source = create_recovery_probe_directory(parent)?;
+    let target = match create_recovery_probe_directory(parent) {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_dir(&source);
+            return Err(error);
+        }
+    };
+    let result = (|| {
+        let output = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--fork",
+                "sh",
+                "-c",
+                "mount --bind \"$1\" \"$2\"",
+                "bitbygit-recovery-capability",
+            ])
+            .arg(&source)
+            .arg(&target)
+            .output()
+            .map_err(|source| {
+                recovery_capability_unavailable(format!(
+                    "the Linux user/mount namespace probe could not start: {source}"
+                ))
+            })?;
+        if !output.status.success() {
+            let detail = if output.stderr.is_empty() {
+                format!("status {}", output.status)
+            } else {
+                String::from_utf8_lossy(&output.stderr).trim().to_owned()
+            };
+            return Err(recovery_capability_unavailable(format!(
+                "the Linux user/mount namespace probe failed: {detail}"
+            )));
+        }
+        atomic_exchange_directories(&source, &target).map_err(|error| {
+            recovery_capability_unavailable(format!(
+                "same-filesystem atomic directory exchange is not available: {error}"
+            ))
+        })
+    })();
+    let _ = fs::remove_dir_all(&source);
+    let _ = fs::remove_dir_all(&target);
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_recovery_platform_capabilities(_parent: &Path) -> Result<(), GitError> {
+    Err(recovery_capability_unavailable(
+        "Linux user/mount namespaces and atomic directory exchange are required",
+    ))
+}
+
+fn create_recovery_probe_directory(parent: &Path) -> Result<PathBuf, GitError> {
+    for attempt in 0..100_u32 {
+        let candidate = parent.join(format!(
+            ".bitbygit-recovery-capability-{}-{}-{attempt}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(recovery_capability_unavailable(format!(
+                    "a same-filesystem capability probe directory could not be created: {source}"
+                )));
+            }
+        }
+    }
+    Err(recovery_capability_unavailable(
+        "a same-filesystem capability probe directory could not be reserved",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn atomic_exchange_directories(left: &Path, right: &Path) -> Result<(), GitError> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
 
@@ -1801,6 +1907,32 @@ fn recovery_transaction_blocked(message: impl Into<String>) -> GitError {
     GitError::Blocked {
         message: message.into(),
     }
+}
+
+fn recovery_capability_unavailable(detail: impl Display) -> GitError {
+    recovery_transaction_blocked(format!("{RECOVERY_CAPABILITY_UNAVAILABLE}: {detail}"))
+}
+
+#[cfg(test)]
+static RECOVERY_CAPABILITY_FAILURES: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_capability_hook(root: &Path) -> Result<(), GitError> {
+    if let Ok(mut failures) = RECOVERY_CAPABILITY_FAILURES.lock()
+        && let Some(index) = failures.iter().position(|target| target == root)
+    {
+        failures.swap_remove(index);
+        return Err(recovery_capability_unavailable(
+            "test platform capability failure",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn run_recovery_capability_hook(_root: &Path) -> Result<(), GitError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3094,6 +3226,33 @@ mod tests {
 
     static NEXT_REPO_ID: AtomicUsize = AtomicUsize::new(0);
 
+    fn recovery_capabilities_or_verify_fail_closed(
+        git: &Git,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        expected: &RecoveryState,
+    ) -> Result<bool, Box<dyn Error>> {
+        match git.ensure_recovery_supported() {
+            Ok(()) => Ok(true),
+            Err(GitError::Blocked { message })
+                if message.starts_with(RECOVERY_CAPABILITY_UNAVAILABLE) =>
+            {
+                let root = git.repo_root()?.canonicalize()?;
+                let before = RecoveryGeneration::capture(&root)?;
+                let Err(error) = git.recover_exact(operation, action, expected) else {
+                    return Err("recovery ran without its required platform capabilities".into());
+                };
+                assert!(
+                    matches!(&error, GitError::Blocked { message } if message.starts_with(RECOVERY_CAPABILITY_UNAVAILABLE)),
+                    "{error}"
+                );
+                assert_eq!(RecoveryGeneration::capture(&root)?, before);
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[test]
     fn parses_clean_status() -> Result<(), Box<dyn Error>> {
         let status = parse_status(
@@ -3670,6 +3829,14 @@ mod tests {
         merge_continue_repo.run(["add", "conflict.txt"])?;
         let git = Git::new(merge_continue_repo.path());
         let state = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &state,
+        )? {
+            return Ok(());
+        }
         git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Continue, &state)?;
         assert_eq!(git.status()?.operation, None);
 
@@ -3710,6 +3877,35 @@ mod tests {
         let state = git.recovery_state()?;
         git.recover_exact(RepositoryOperation::Rebase, RecoveryAction::Skip, &state)?;
         assert_eq!(git.status()?.operation, None);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_fails_closed_when_platform_capabilities_are_unavailable()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let root = repo.path().canonicalize()?;
+        let before = RecoveryGeneration::capture(&root)?;
+        RECOVERY_CAPABILITY_FAILURES
+            .lock()
+            .map_err(|_| "recovery capability failure lock poisoned")?
+            .push(root.clone());
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected unavailable recovery capabilities to block execution".into());
+        };
+
+        assert!(
+            matches!(&error, GitError::Blocked { message } if message.starts_with(RECOVERY_CAPABILITY_UNAVAILABLE)),
+            "{error}"
+        );
+        assert_eq!(RecoveryGeneration::capture(&root)?, before);
+        assert_eq!(git.recovery_state()?, expected);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         Ok(())
     }
 
@@ -3977,6 +4173,15 @@ mod tests {
         let expected = git.recovery_state()?;
         repo.write("notes.txt", "changed after preview\n")?;
 
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+
         git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
 
         assert_eq!(git.status()?.operation, None);
@@ -4107,6 +4312,14 @@ mod tests {
         let (repo, _original_head) = prepare_merge_conflict()?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
         let conflict = repo.path().join("conflict.txt");
         let (scanned_tx, scanned_rx) = mpsc::channel();
         let (edited_tx, edited_rx) = mpsc::channel();
@@ -4142,9 +4355,17 @@ mod tests {
     fn isolated_rebase_abort_preserves_ref_race_during_prepared_hook_without_partial_recovery()
     -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_rebase_conflict()?;
-        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let preview_head = repo.git_stdout(["rev-parse", "HEAD"])?;
         let preview_conflict = fs::read(repo.path().join("conflict.txt"))?;
         let newer_head = repo.git_stdout(["rev-parse", "main"])?.trim().to_owned();
@@ -4194,9 +4415,17 @@ mod tests {
     #[test]
     fn isolated_recovery_preserves_post_spawn_worktree_race() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_rebase_conflict()?;
-        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let worker_path = repo.path();
         let worker_state = expected.clone();
         let worker = std::thread::spawn(move || {
@@ -4241,9 +4470,17 @@ mod tests {
     #[test]
     fn isolated_recovery_preserves_post_spawn_index_race() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_rebase_conflict()?;
-        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let (signal, release) = install_recovery_prepared_barrier(&repo)?;
         let original_blob = repo
             .git_stdout(["rev-parse", "HEAD:conflict.txt"])?
             .trim()
@@ -4297,6 +4534,14 @@ mod tests {
         let (repo, _original_head) = prepare_merge_conflict()?;
         let git = Git::new(repo.path());
         let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
         let conflict = repo.path().join("conflict.txt");
         let hook: RecoveryCaptureHook = Box::new(move || {
             let _ = fs::write(conflict, "promotion race\n");
@@ -4381,6 +4626,15 @@ mod tests {
             .iter()
             .map(fs::read)
             .collect::<Result<Vec<_>, _>>()?;
+
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &state,
+        )? {
+            return Ok(());
+        }
 
         git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Continue, &state)?;
 
@@ -4471,6 +4725,14 @@ mod tests {
         let git = Git::new(repo.path());
 
         let state = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &state,
+        )? {
+            return Ok(());
+        }
         let Err(error) =
             git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Continue, &state)
         else {

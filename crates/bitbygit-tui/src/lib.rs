@@ -4167,6 +4167,18 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;
 
+    fn recovery_capabilities_available(repo: &std::path::Path) -> Result<bool, Box<dyn Error>> {
+        match Git::new(repo).ensure_recovery_supported() {
+            Ok(()) => Ok(true),
+            Err(GitError::Blocked { message })
+                if message.contains("required platform capabilities are missing") =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[test]
     fn tab_cycles_visible_focus() {
         let mut app = App::new();
@@ -5069,17 +5081,30 @@ mod tests {
             .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
             .map_err(std::io::Error::other)?;
         let paths = isolated_store_paths("recovery-audit")?;
+        let recovery_supported = recovery_capabilities_available(&repo)?;
 
         let execution = PlanExecutor::with_audit_paths(&repo, paths.clone())
             .execute(&operation.plan, operation.context);
 
-        assert!(execution.succeeded(), "{}", execution.message());
-        assert_eq!(Git::new(&repo).status()?.operation, None);
+        assert_eq!(execution.succeeded(), recovery_supported);
+        assert_eq!(
+            Git::new(&repo).status()?.operation,
+            (!recovery_supported).then_some(RepositoryOperation::Merge)
+        );
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.operation == "merge_abort"));
         assert_eq!(entries[0].message, "pending");
-        assert_eq!(entries[1].result, "ok");
+        if recovery_supported {
+            assert_eq!(entries[1].result, "ok");
+        } else {
+            assert_eq!(entries[1].result, "error");
+            assert!(
+                execution
+                    .message()
+                    .contains("required platform capabilities are missing")
+            );
+        }
         Ok(())
     }
 
@@ -5107,14 +5132,26 @@ mod tests {
                 .plan_request(OperationRequest::Recover(request))
                 .map_err(std::io::Error::other)?;
             let paths = isolated_store_paths(&format!("recovery-{request:?}"))?;
+            let recovery_supported = recovery_capabilities_available(&repo)?;
             let execution = PlanExecutor::with_audit_paths(&repo, paths)
                 .execute(&operation.plan, operation.context);
-            assert!(
+            assert_eq!(
                 execution.succeeded(),
+                recovery_supported,
                 "{request:?}: {}",
                 execution.message()
             );
-            assert_eq!(Git::new(repo).status()?.operation, None);
+            assert_eq!(
+                Git::new(repo).status()?.operation,
+                (!recovery_supported).then_some(recovery_git_operation(request))
+            );
+            if !recovery_supported {
+                assert!(
+                    execution
+                        .message()
+                        .contains("required platform capabilities are missing")
+                );
+            }
         }
         Ok(())
     }
