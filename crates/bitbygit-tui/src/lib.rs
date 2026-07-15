@@ -2011,22 +2011,32 @@ impl OperationPlanner {
                     format!("Prompt sequence step {} is blocked: {error}", index + 1)
                 })?;
         }
+        let git = self.git();
+        let branch = git
+            .status()
+            .ok()
+            .and_then(|status| branch_name(&status.branch).ok())
+            .or_else(|| {
+                git.head_target()
+                    .ok()
+                    .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
+            });
+        let (policy_evaluations, sequence_policy_evaluations) =
+            prompt_sequence_policy_evaluations(&self.policy, &git, &requests, branch)?;
         let first_request = requests
             .first()
             .cloned()
             .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
-        let first = self.plan_request(first_request)?;
+        let blocked = policy_evaluations
+            .iter()
+            .chain(&sequence_policy_evaluations)
+            .any(|evaluation| evaluation.requirement == ConfirmationRequirement::Blocked);
+        let first = if blocked {
+            prompt_sequence_preflight_operation(first_request)?
+        } else {
+            self.plan_request(first_request)?
+        };
         let mut plan = prompt_sequence_plan(&requests, &first)?;
-        let branch = policy_branch(&first.context)
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                self.git()
-                    .status()
-                    .ok()
-                    .and_then(|status| branch_name(&status.branch).ok())
-            });
-        let (policy_evaluations, sequence_policy_evaluations) =
-            prompt_sequence_policy_evaluations(&self.policy, &self.git(), &requests, branch)?;
         apply_policy_evaluation(
             &mut plan,
             combined_policy_evaluation(
@@ -2544,6 +2554,25 @@ impl OperationPlanner {
             ),
         }
     }
+}
+
+fn prompt_sequence_preflight_operation(
+    request: OperationRequest,
+) -> Result<PreparedOperation, String> {
+    let preview = prompt_sequence_request_preview(&request)?;
+    let mut step = OperationStep::new(preview.kind, preview.risk_level, preview.summary);
+    for detail in preview.details {
+        step = step.with_detail(detail);
+    }
+    Ok(PreparedOperation::new(
+        OperationPlan::new(
+            request,
+            "Prompt sequence preflight",
+            vec![step],
+            String::new(),
+        ),
+        ExecutionContext::default(),
+    ))
 }
 
 fn open_pull_request_gh_error(error: GhError) -> String {
@@ -6678,6 +6707,70 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_blocked_later_step_does_not_fetch_temporary_remote_object()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("blocked-later-step-remote-object")?;
+        let remote = isolated_bare_git_repo("blocked-later-step-remote-object-remote")?;
+        let updater = isolated_git_repo("blocked-later-step-remote-object-updater")?;
+        let ssh = test_ssh_command()?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &remote)?;
+        git_stdout_with_ssh(&repo, &["push", "-u", "origin", &branch], &ssh)?;
+
+        configure_git_identity(&updater)?;
+        add_github_remote(&updater, "origin", &remote)?;
+        git_stdout_with_ssh(&updater, &["fetch", "origin", &branch], &ssh)?;
+        git_stdout(&updater, &["checkout", "-b", &branch, "FETCH_HEAD"])?;
+        std::fs::write(updater.join("file.txt"), "remote update\n")?;
+        git_stdout(&updater, &["add", "file.txt"])?;
+        git_stdout(&updater, &["commit", "-m", "remote update"])?;
+        let remote_oid = git_stdout(&updater, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        git_stdout_with_ssh(&updater, &["push", "origin", &branch], &ssh)?;
+        assert!(!git_object_exists(&repo, &remote_oid)?);
+
+        let mut config = AppConfig::default();
+        config.policy.confirmation.high = ConfirmationSetting::Blocked;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: None,
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(ssh),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Pull { rebase: false },
+                OperationRequest::Rebase {
+                    base: branch.clone(),
+                },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::Blocked
+        );
+        assert!(!git_object_exists(&repo, &remote_oid)?);
+        assert!(
+            git_stdout(
+                &repo,
+                &["for-each-ref", "--format=%(refname)", "refs/bitbygit/fetch"]
+            )?
+            .trim()
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn allowed_pull_publishes_staged_tracking_ref_only_during_execution()
     -> Result<(), Box<dyn Error>> {
         let (repo, branch, original_tracking_oid) = stale_pull_tracking_repo("allowed-pull")?;
@@ -8522,6 +8615,15 @@ mod tests {
             .into());
         }
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn git_object_exists(repo: &std::path::Path, object: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "-e", object])
+            .status()?
+            .success())
     }
 
     fn configure_git_identity(repo: &std::path::Path) -> Result<(), Box<dyn Error>> {
