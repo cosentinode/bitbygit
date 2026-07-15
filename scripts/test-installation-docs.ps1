@@ -74,10 +74,12 @@ if ([regex]::Matches($DocsText, [regex]::Escape($MachinePathLookup)).Count -ne 2
     Fail "Windows examples do not reject machine-level PATH shadowing"
 }
 $PathExtLookup = '$env:PATHEXT -split ";"'
-$ExecutableExtensions = '@(".exe", ".com", ".bat", ".cmd")'
+$CaseInsensitivePathExtensions = '$PathExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)'
+$AddPathExtension = '[void] $PathExtensions.Add($Extension)'
 if ([regex]::Matches($DocsText, [regex]::Escape($PathExtLookup)).Count -ne 2 -or
-    [regex]::Matches($DocsText, [regex]::Escape($ExecutableExtensions)).Count -ne 2) {
-    Fail "Windows examples do not inspect every standard PATHEXT application candidate"
+    [regex]::Matches($DocsText, [regex]::Escape($CaseInsensitivePathExtensions)).Count -ne 2 -or
+    [regex]::Matches($DocsText, [regex]::Escape($AddPathExtension)).Count -ne 2) {
+    Fail "Windows examples do not inspect every PATHEXT application candidate case-insensitively"
 }
 if ([regex]::Matches($DocsText, '(?m)^& \$ResolvedPath --version\r?$').Count -ne 2) {
     Fail "Windows examples do not finish with PATH-resolved version output"
@@ -148,7 +150,8 @@ try {
     Set-Content -Path $FixtureSource -Value $FixtureSourceText
     rustc --crate-name selected_version_fixture $FixtureSource -o $FixtureBinary
     if ($LASTEXITCODE -ne 0) { Fail "selected-version fixture build failed" }
-    $env:PATHEXT = ".CoM;.EXE;.BaT;.CMD"
+    $CustomPathExtensions = @(".VbS", ".BiTbYgIt-Test")
+    $env:PATHEXT = (@(".CoM", ".EXE", ".BaT", ".CMD") + $CustomPathExtensions + @(".vbs", "", " ")) -join ";"
 
     $Target = "x86_64-pc-windows-msvc"
     $Archive = "bitbygit-$SelectedVersion-$Target.zip"
@@ -271,11 +274,12 @@ try {
     $CapturedUserPath = $null
     $env:MOCK_DOWNLOAD_DIR = $Assets
     $MachineConflictStartingPath = $env:Path
+    $MachineConflictStartingPathExt = $env:PATHEXT
     $OldMachineOutput = bitbygit --version
     if ($LASTEXITCODE -ne 0 -or $OldMachineOutput -ne "bitbygit $WorkspaceVersion") {
         Fail "older machine-level bitbygit.exe fixture reported the wrong version"
     }
-    foreach ($Extension in ".exe", ".com", ".bat", ".cmd") {
+    foreach ($Extension in (@(".exe", ".com", ".bat", ".cmd") + $CustomPathExtensions)) {
         Remove-Item (Join-Path $MachineOldBinaryDir "bitbygit.*") -Force
         Copy-Item $WorkspaceBinary (Join-Path $MachineOldBinaryDir "bitbygit$Extension")
         $MachineConflictFailed = $false
@@ -293,6 +297,7 @@ try {
         if ((Get-ChildItem -Force $MachineConflictTemp).Count -ne 0) { Fail "failed archive block left temporary installation files behind" }
         if ($null -ne $CapturedUserPath) { Fail "machine-level conflict changed persistent user PATH" }
         if ($env:Path -ne $MachineConflictStartingPath) { Fail "machine-level conflict changed process PATH" }
+        if ($env:PATHEXT -ne $MachineConflictStartingPathExt) { Fail "machine-level conflict changed PATHEXT" }
         $ConflictInstalledBinary = Join-Path $env:LOCALAPPDATA "Programs\bitbygit\bitbygit.exe"
         $ConflictOutput = & $ConflictInstalledBinary --version
         if ($LASTEXITCODE -ne 0 -or $ConflictOutput -ne "bitbygit $SelectedVersion") {

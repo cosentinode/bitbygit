@@ -197,10 +197,13 @@ $Output = & $InstalledBinary --version
 if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $Output"
 }
-$PathExtensions = @($env:PATHEXT -split ";" | ForEach-Object {
-    $Extension = $_.Trim().ToLowerInvariant()
-    if ($Extension -in @(".exe", ".com", ".bat", ".cmd")) { $Extension }
-} | Select-Object -Unique)
+$PathExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$env:PATHEXT -split ";" | ForEach-Object {
+    $Extension = $_.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($Extension)) {
+        [void] $PathExtensions.Add($Extension)
+    }
+}
 $MachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
 $MachineCommand = $MachinePath -split ";" | ForEach-Object {
     $Entry = [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"'))
@@ -252,8 +255,8 @@ try {
 
 Windows places machine `PATH` entries before user entries in new processes. The
 block therefore refuses to update user `PATH` when a machine entry already
-contains a `bitbygit` application with a standard executable extension enabled
-by `PATHEXT` (`.exe`, `.com`, `.bat`, or `.cmd`); otherwise an older
+contains a `bitbygit` application with any non-empty executable extension
+enabled by `PATHEXT`, matched case-insensitively; otherwise an older
 machine-level installation could silently win after restarting PowerShell.
 Remove or update that machine-level installation and rerun the block. The
 selected file is still available through the unambiguous explicit invocation:
@@ -381,10 +384,13 @@ $InstalledOutput = & $InstalledBinary --version
 if ($LASTEXITCODE -ne 0 -or $InstalledOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $InstalledOutput"
 }
-$PathExtensions = @($env:PATHEXT -split ";" | ForEach-Object {
-    $Extension = $_.Trim().ToLowerInvariant()
-    if ($Extension -in @(".exe", ".com", ".bat", ".cmd")) { $Extension }
-} | Select-Object -Unique)
+$PathExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$env:PATHEXT -split ";" | ForEach-Object {
+    $Extension = $_.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($Extension)) {
+        [void] $PathExtensions.Add($Extension)
+    }
+}
 $MachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
 $MachineCommand = $MachinePath -split ";" | ForEach-Object {
     $Entry = [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"'))
