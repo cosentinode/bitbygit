@@ -257,6 +257,12 @@ try {
     $SourceExpectedPath = (@($SourceInstallDir) + $SourceExpectedEntries) -join ";"
     $env:Path = $SourceStartingPath
     $env:BITBYGIT_TEST_USER_PATH = $SourceStartingPath
+    $OldResolvedBinary = (Get-Command bitbygit -CommandType Application | Select-Object -First 1).Source
+    if ($OldResolvedBinary -ne (Join-Path $OldBinaryDir "bitbygit.exe")) { Fail "older bitbygit.exe fixture was not first on PATH" }
+    $OldOutput = bitbygit --version
+    if ($LASTEXITCODE -ne 0 -or $OldOutput -ne "bitbygit $WorkspaceVersion") {
+        Fail "older bitbygit.exe fixture reported the wrong version"
+    }
     $CapturedUserPath = $null
     $FetchedExactTag = $false
     $CheckedOutExactTag = $false
@@ -280,14 +286,14 @@ try {
     if (($CapturedUserPath -split ';' | Where-Object { $_ -eq $SourceInstallDir }).Count -ne 1) { Fail "source block duplicated the user PATH entry" }
     if (-not $FetchedExactTag -or -not $CheckedOutExactTag) { Fail "source block did not check out the exact tag" }
     if (-not (Test-Path $SourceInstalledBinary)) { Fail "source block did not install bitbygit.exe" }
-    $SourceResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
+    $SourceResolvedBinary = (Get-Command bitbygit -CommandType Application | Select-Object -First 1).Source
     if ($SourceResolvedBinary -ne $SourceInstalledBinary) { Fail "source block did not resolve the installed command through PATH" }
     $SourceOutput = bitbygit --version
     if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $SelectedVersion") {
         Fail "source block installed the wrong version"
     }
     $env:Path = $CapturedUserPath
-    $NewShellResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
+    $NewShellResolvedBinary = (Get-Command bitbygit -CommandType Application | Select-Object -First 1).Source
     if ($NewShellResolvedBinary -ne $SourceInstalledBinary) { Fail "new shell PATH resolved the older bitbygit.exe" }
     $NewShellOutput = bitbygit --version
     if ($LASTEXITCODE -ne 0 -or $NewShellOutput -ne "bitbygit $SelectedVersion") {
