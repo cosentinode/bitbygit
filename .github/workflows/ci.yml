@@ -12,6 +12,22 @@ permissions:
   contents: read
 
 jobs:
+  minimum-rust:
+    name: Rust 1.85 source build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+
+      - name: Build release binary
+        run: cargo build --locked --release -p bitbygit
+
   rust:
     name: Rust
     runs-on: ubuntu-latest

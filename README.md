@@ -68,9 +68,10 @@ cargo build --locked --workspace
 ```
 
 The Bash installation validator runs on Linux and macOS without PowerShell.
-Windows contributors can run the platform-specific archive validation with
+Windows contributors can run the platform-specific installation validation with
 `pwsh -NoProfile -File scripts/test-installation-docs.ps1`; CI runs that command
-on a Windows runner.
+on a Windows runner. The validator uses temporary process-scoped PATH state and
+never changes the persistent user PATH.
 
 Or run:
 

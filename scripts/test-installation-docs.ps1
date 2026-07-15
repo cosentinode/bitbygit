@@ -16,6 +16,21 @@ function Get-Block([string] $Heading, [string] $Language) {
     return $Match.Groups[1].Value
 }
 
+function ConvertTo-IsolatedPathBlock([string] $Block) {
+    $GetUserPath = 'GetEnvironmentVariable("Path", "User")'
+    $SetUserPath = 'SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")'
+    if (-not $Block.Contains($GetUserPath) -or -not $Block.Contains($SetUserPath)) {
+        Fail "Windows block does not contain the expected user PATH operations"
+    }
+
+    $Isolated = $Block.Replace($GetUserPath, 'GetEnvironmentVariable("Path", "Process")')
+    $Isolated = $Isolated.Replace($SetUserPath, 'SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "Process")')
+    if ($Isolated.Contains('"User"')) {
+        Fail "Windows block still accesses persistent user PATH"
+    }
+    return $Isolated
+}
+
 $DocsText = Get-Content -Raw $DocsPath
 $CargoText = Get-Content -Raw $CargoPath
 $VersionMatch = [regex]::Match($CargoText, '(?ms)^\[workspace\.package\]\r?\n.*?^version = "([^"]+)"')
@@ -36,21 +51,21 @@ foreach ($Match in [regex]::Matches($DocsText, '(?ms)^```powershell\r?\n(.*?)^``
     if ($Errors.Count -ne 0) { Fail "PowerShell snippet has syntax errors: $($Errors -join '; ')" }
 }
 
-$InstallBlock = Get-Block "Windows x86-64 archive" "powershell"
+$InstallBlock = ConvertTo-IsolatedPathBlock (Get-Block "Windows x86-64 archive" "powershell")
 if (-not $InstallBlock.Contains('$Package = "bitbygit-$Version-$Target"')) {
     Fail "Windows package directory does not match the release layout"
 }
 if (-not $InstallBlock.Contains('& $InstalledBinary --version')) {
     Fail "Windows installation does not validate the installed path"
 }
-if (-not $DocsText.Contains('git clone --branch "v$Version" --depth 1')) {
+$SourceBlock = ConvertTo-IsolatedPathBlock (Get-Block "Build from source" "powershell")
+if (-not $SourceBlock.Contains('git clone --branch "v$Version" --depth 1')) {
     Fail "PowerShell source build is not pinned to the selected tag"
 }
 
 New-Item -ItemType Directory -Path $Temp | Out-Null
 $OriginalLocalAppData = $env:LOCALAPPDATA
 $OriginalProcessPath = $env:Path
-$OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 
 try {
     cargo build --locked --release -p bitbygit
@@ -92,8 +107,8 @@ try {
     $InstalledBinary = Join-Path $InstallDir "bitbygit.exe"
     if ($ErrorActionPreference -ne "Continue") { Fail "archive block changed the caller error preference" }
     if (($env:Path -split ';')[0] -ne $InstallDir) { Fail "archive block did not update the process PATH" }
-    if (([Environment]::GetEnvironmentVariable("Path", "User") -split ';') -notcontains $InstallDir) {
-        Fail "archive block did not update the user PATH"
+    if (([Environment]::GetEnvironmentVariable("Path", "Process") -split ';') -notcontains $InstallDir) {
+        Fail "archive block did not update its isolated PATH"
     }
     if (-not (Test-Path $InstalledBinary)) { Fail "archive block did not install bitbygit.exe" }
     $Output = & $InstalledBinary --version
@@ -135,10 +150,80 @@ try {
     if ($ErrorActionPreference -ne "Continue") { Fail "failed archive block changed the caller error preference" }
     if ($env:Path -ne $OriginalProcessPath) { Fail "failed archive block changed the process PATH" }
 
+    function git {
+        $CloneDir = Join-Path (Get-Location) "bitbygit"
+        $BuildDir = Join-Path $CloneDir "target/release"
+        New-Item -ItemType Directory -Path $BuildDir | Out-Null
+        Copy-Item (Join-Path $Root "target/release/bitbygit.exe") $BuildDir
+        $global:LASTEXITCODE = 0
+    }
+
+    function cargo {
+        if ($env:MOCK_CARGO_FAILURE -eq "1") {
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
+
+    $SourceSuccessDir = Join-Path $Temp "source-success"
+    New-Item -ItemType Directory -Path $SourceSuccessDir | Out-Null
+    $SourceScript = Join-Path $SourceSuccessDir "install-from-source.ps1"
+    Set-Content -Path $SourceScript -Value $SourceBlock
+    $env:LOCALAPPDATA = Join-Path $SourceSuccessDir "local-app-data"
+    $env:Path = $OriginalProcessPath
+    $env:MOCK_CARGO_FAILURE = "0"
+    $ErrorActionPreference = "Continue"
+    Push-Location $SourceSuccessDir
+    try {
+        $StartingLocation = (Get-Location).Path
+        . $SourceScript
+        if ((Get-Location).Path -ne $StartingLocation) {
+            Fail "source block changed the caller working directory"
+        }
+    } finally {
+        Pop-Location
+    }
+    $SourceInstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
+    $SourceInstalledBinary = Join-Path $SourceInstallDir "bitbygit.exe"
+    if ($ErrorActionPreference -ne "Continue") { Fail "source block changed the caller error preference" }
+    if (($env:Path -split ';')[0] -ne $SourceInstallDir) { Fail "source block did not update the process PATH" }
+    if (-not (Test-Path $SourceInstalledBinary)) { Fail "source block did not install bitbygit.exe" }
+    $SourceOutput = & $SourceInstalledBinary --version
+    if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $Version") {
+        Fail "source block installed the wrong version"
+    }
+
+    $SourceFailureDir = Join-Path $Temp "source-failure"
+    New-Item -ItemType Directory -Path $SourceFailureDir | Out-Null
+    $SourceFailureScript = Join-Path $SourceFailureDir "install-from-source.ps1"
+    Set-Content -Path $SourceFailureScript -Value $SourceBlock
+    $env:LOCALAPPDATA = Join-Path $SourceFailureDir "local-app-data"
+    $env:Path = $OriginalProcessPath
+    $env:MOCK_CARGO_FAILURE = "1"
+    $ErrorActionPreference = "Continue"
+    $SourceBuildFailed = $false
+    Push-Location $SourceFailureDir
+    try {
+        $StartingLocation = (Get-Location).Path
+        try {
+            . $SourceFailureScript
+        } catch {
+            $SourceBuildFailed = $true
+        }
+        if ((Get-Location).Path -ne $StartingLocation) {
+            Fail "failed source block changed the caller working directory"
+        }
+    } finally {
+        Pop-Location
+    }
+    if (-not $SourceBuildFailed) { Fail "source block continued after a failed build" }
+    if ($ErrorActionPreference -ne "Continue") { Fail "failed source block changed the caller error preference" }
+    if ($env:Path -ne $OriginalProcessPath) { Fail "failed source block changed the process PATH" }
+
     Write-Output "installation docs validation passed on Windows"
 } finally {
     $env:LOCALAPPDATA = $OriginalLocalAppData
     $env:Path = $OriginalProcessPath
-    [Environment]::SetEnvironmentVariable("Path", $OriginalUserPath, "User")
     Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
 }

@@ -192,19 +192,20 @@ On Windows, run in PowerShell:
 $ErrorActionPreference = "Stop"
 
 $Version = "0.1.0"
-git clone --branch "v$Version" --depth 1 https://github.com/cosentinode/bitbygit.git
+$SourceDir = Join-Path (Get-Location) "bitbygit"
+git clone --branch "v$Version" --depth 1 https://github.com/cosentinode/bitbygit.git $SourceDir
 if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
-Set-Location bitbygit
-cargo build --locked --release -p bitbygit
+cargo build --manifest-path (Join-Path $SourceDir "Cargo.toml") --locked --release -p bitbygit
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-$BuiltOutput = & "target\release\bitbygit.exe" --version
+$BuiltBinary = Join-Path $SourceDir "target\release\bitbygit.exe"
+$BuiltOutput = & $BuiltBinary --version
 if ($LASTEXITCODE -ne 0 -or $BuiltOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $BuiltOutput"
 }
 
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item "target\release\bitbygit.exe" $InstallDir
+Copy-Item $BuiltBinary $InstallDir
 $InstalledBinary = Join-Path $InstallDir "bitbygit.exe"
 $InstalledOutput = & $InstalledBinary --version
 if ($LASTEXITCODE -ne 0 -or $InstalledOutput -ne "bitbygit $Version") {
