@@ -4,7 +4,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::string::FromUtf8Error;
@@ -1521,13 +1521,15 @@ impl RecoveryTransaction {
         remove_previous_recovery_backup(&root)?;
         let candidate = create_recovery_candidate(parent, &root)?;
         let backup_pointer = recovery_backup_pointer_path(&root)?;
-        if let Err(source) = fs::write(&backup_pointer, candidate.as_os_str().as_encoded_bytes()) {
+        run_recovery_sidecar_hook(&backup_pointer);
+        if let Err(error) = write_new_recovery_sidecar(
+            &backup_pointer,
+            candidate.as_os_str().as_encoded_bytes(),
+            "record the retained recovery backup pointer",
+        ) {
             let _result = fs::remove_dir(&candidate);
             let _result = fs::remove_file(recovery_candidate_owner_path(&candidate));
-            return Err(recovery_transaction_io(
-                "record the retained recovery backup pointer",
-                source,
-            ));
+            return Err(error);
         }
         let mut transaction = Self {
             root,
@@ -1578,6 +1580,7 @@ impl RecoveryTransaction {
                 "atomic recovery does not support a shared common Git directory",
             ));
         }
+        ensure_recovery_git_storage_isolated(&root)?;
         let parent = root.parent().ok_or_else(|| {
             recovery_transaction_blocked("repository root has no parent for isolated recovery")
         })?;
@@ -1705,16 +1708,20 @@ impl RecoveryTransaction {
         run_recovery_promotion_hook(&self.root);
         atomic_exchange_directories(&self.root, &self.candidate)?;
         self.keep_candidate = true;
-        if RecoveryGeneration::capture(&self.candidate)? != self.baseline {
+        let old_generation = RecoveryGeneration::capture(&self.candidate);
+        if !matches!(&old_generation, Ok(generation) if generation == &self.baseline) {
             if let Err(error) = atomic_exchange_directories(&self.root, &self.candidate) {
                 return Err(recovery_transaction_blocked(format!(
                     "repository changed during atomic recovery promotion and rollback failed; both complete generations were retained: {error}"
                 )));
             }
             self.keep_candidate = false;
-            return Err(recovery_transaction_blocked(
-                "repository changed during atomic recovery promotion",
-            ));
+            return Err(recovery_transaction_blocked(match old_generation {
+                Ok(_) => "repository changed during atomic recovery promotion".to_owned(),
+                Err(error) => {
+                    format!("repository metadata changed during atomic recovery promotion: {error}")
+                }
+            }));
         }
         Ok(self.candidate.clone())
     }
@@ -1732,11 +1739,20 @@ impl Drop for RecoveryTransaction {
 
 #[derive(Debug, PartialEq, Eq)]
 struct RecoveryGeneration {
+    root: RecoveryFilesystemMetadata,
     entries: Vec<RecoveryGenerationEntry>,
 }
 
 impl RecoveryGeneration {
     fn capture(root: &Path) -> Result<Self, GitError> {
+        let root_metadata = fs::symlink_metadata(root)
+            .map_err(|source| recovery_transaction_io("inspect repository root", source))?;
+        if !root_metadata.file_type().is_dir() {
+            return Err(recovery_transaction_blocked(
+                "repository root changed while its generation was captured",
+            ));
+        }
+        let root_value = recovery_filesystem_metadata(root, Path::new("."), &root_metadata, None)?;
         let mut entries = Vec::new();
         let mut pending = vec![PathBuf::new()];
         let mut path_bytes = 0_usize;
@@ -1767,44 +1783,79 @@ impl RecoveryGeneration {
                 let value = if file_type.is_dir() {
                     pending.push(relative.clone());
                     RecoveryGenerationValue::Directory {
-                        mode: recovery_file_mode(&metadata),
+                        metadata: recovery_filesystem_metadata(&path, &relative, &metadata, None)?,
                     }
                 } else if file_type.is_file() {
-                    file_bytes = file_bytes.saturating_add(metadata.len());
+                    let (mut file, opened_metadata) =
+                        open_recovery_regular_file(&path, &relative, &metadata)?;
+                    file_bytes = file_bytes.saturating_add(opened_metadata.len());
                     if file_bytes > MAX_RECOVERY_GENERATION_FILE_BYTES {
                         return Err(recovery_transaction_blocked(
                             "repository generation exceeds atomic recovery content bound",
                         ));
                     }
-                    let identity = recovery_file_identity(&metadata);
-                    let mut file = BufReader::new(fs::File::open(&path).map_err(|source| {
-                        recovery_transaction_io("open repository generation file", source)
-                    })?);
+                    let file_metadata = recovery_filesystem_metadata(
+                        &path,
+                        &relative,
+                        &opened_metadata,
+                        Some(&file),
+                    )?;
+                    run_recovery_generation_file_read_hook(&path);
                     let mut hasher = Sha256::new();
-                    std::io::copy(&mut file, &mut hasher).map_err(|source| {
-                        recovery_transaction_io("hash repository generation file", source)
-                    })?;
+                    {
+                        let mut reader = (&mut file).take(opened_metadata.len().saturating_add(1));
+                        let mut buffer = [0_u8; 64 * 1024];
+                        let mut bytes_read = 0_u64;
+                        loop {
+                            let read = reader.read(&mut buffer).map_err(|source| {
+                                recovery_transaction_io("hash repository generation file", source)
+                            })?;
+                            if read == 0 {
+                                break;
+                            }
+                            bytes_read = bytes_read.saturating_add(read as u64);
+                            if bytes_read > opened_metadata.len() {
+                                return Err(recovery_transaction_blocked(format!(
+                                    "repository generation file {} grew while it was captured",
+                                    relative.display()
+                                )));
+                            }
+                            hasher.update(&buffer[..read]);
+                        }
+                    }
                     let current = fs::symlink_metadata(&path).map_err(|source| {
                         recovery_transaction_io("recheck repository generation file", source)
                     })?;
-                    if !current.is_file()
-                        || current.len() != metadata.len()
-                        || recovery_file_mode(&current) != recovery_file_mode(&metadata)
-                        || recovery_file_identity(&current) != identity
-                    {
+                    if !current.is_file() || current.len() != opened_metadata.len() {
+                        return Err(recovery_transaction_blocked(
+                            "repository generation changed while it was captured",
+                        ));
+                    }
+                    let current_metadata =
+                        recovery_filesystem_metadata(&path, &relative, &current, Some(&file))?;
+                    if current_metadata != file_metadata {
                         return Err(recovery_transaction_blocked(
                             "repository generation changed while it was captured",
                         ));
                     }
                     RecoveryGenerationValue::File {
-                        mode: recovery_file_mode(&metadata),
-                        size: metadata.len(),
+                        metadata: file_metadata,
+                        size: opened_metadata.len(),
                         digest: hasher.finalize().into(),
                     }
                 } else if file_type.is_symlink() {
-                    RecoveryGenerationValue::Symlink(fs::read_link(&path).map_err(|source| {
-                        recovery_transaction_io("read repository generation symlink", source)
-                    })?)
+                    if relative.starts_with(".git") {
+                        return Err(recovery_transaction_blocked(format!(
+                            "atomic recovery does not support symlinked Git storage {}",
+                            relative.display()
+                        )));
+                    }
+                    RecoveryGenerationValue::Symlink {
+                        metadata: recovery_filesystem_metadata(&path, &relative, &metadata, None)?,
+                        target: fs::read_link(&path).map_err(|source| {
+                            recovery_transaction_io("read repository generation symlink", source)
+                        })?,
+                    }
                 } else {
                     return Err(recovery_transaction_blocked(format!(
                         "atomic recovery does not support special filesystem entry {}",
@@ -1818,7 +1869,19 @@ impl RecoveryGeneration {
             }
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(Self { entries })
+        let current_root = fs::symlink_metadata(root)
+            .map_err(|source| recovery_transaction_io("recheck repository root", source))?;
+        let current_root_value =
+            recovery_filesystem_metadata(root, Path::new("."), &current_root, None)?;
+        if current_root_value != root_value {
+            return Err(recovery_transaction_blocked(
+                "repository root changed while its generation was captured",
+            ));
+        }
+        Ok(Self {
+            root: root_value,
+            entries,
+        })
     }
 }
 
@@ -1831,14 +1894,193 @@ struct RecoveryGenerationEntry {
 #[derive(Debug, PartialEq, Eq)]
 enum RecoveryGenerationValue {
     Directory {
-        mode: u32,
+        metadata: RecoveryFilesystemMetadata,
     },
     File {
-        mode: u32,
+        metadata: RecoveryFilesystemMetadata,
         size: u64,
         digest: [u8; 32],
     },
-    Symlink(PathBuf),
+    Symlink {
+        metadata: RecoveryFilesystemMetadata,
+        target: PathBuf,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryFilesystemMetadata {
+    mode: u32,
+    owner: (u32, u32),
+    modified: (i64, i64),
+    inode_flags: u32,
+}
+
+fn recovery_filesystem_metadata(
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+    opened: Option<&fs::File>,
+) -> Result<RecoveryFilesystemMetadata, GitError> {
+    ensure_no_recovery_extended_attributes(path, relative)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.file_type().is_file() && metadata.nlink() != 1 {
+            return Err(recovery_transaction_blocked(format!(
+                "atomic recovery does not support hard-linked file {}",
+                relative.display()
+            )));
+        }
+        Ok(RecoveryFilesystemMetadata {
+            mode: recovery_file_mode(metadata),
+            owner: (metadata.uid(), metadata.gid()),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            inode_flags: recovery_inode_flags(path, relative, metadata, opened)?,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, relative, opened);
+        Ok(RecoveryFilesystemMetadata {
+            mode: recovery_file_mode(metadata),
+            owner: (0, 0),
+            modified: (0, 0),
+            inode_flags: 0,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_inode_flags(
+    path: &Path,
+    relative: &Path,
+    expected: &fs::Metadata,
+    opened: Option<&fs::File>,
+) -> Result<u32, GitError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let owned;
+    let file = if let Some(file) = opened {
+        file
+    } else if expected.file_type().is_symlink() {
+        return Ok(0);
+    } else {
+        owned = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|source| {
+                recovery_transaction_blocked(format!(
+                    "repository metadata {} changed while it was opened: {source}",
+                    relative.display()
+                ))
+            })?;
+        let current = owned.metadata().map_err(|source| {
+            recovery_transaction_io("inspect opened repository metadata", source)
+        })?;
+        if recovery_file_identity(&current) != recovery_file_identity(expected)
+            || current.file_type() != expected.file_type()
+        {
+            return Err(recovery_transaction_blocked(format!(
+                "repository metadata {} changed while it was opened",
+                relative.display()
+            )));
+        }
+        &owned
+    };
+    Ok(rustix::fs::ioctl_getflags(file)
+        .map(|flags| flags.bits() & rustix::fs::IFlags::all().bits())
+        .unwrap_or(0))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn recovery_inode_flags(
+    _path: &Path,
+    _relative: &Path,
+    _expected: &fs::Metadata,
+    _opened: Option<&fs::File>,
+) -> Result<u32, GitError> {
+    Ok(0)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_recovery_extended_attributes(path: &Path, relative: &Path) -> Result<(), GitError> {
+    let mut attributes = xattr::list(path).map_err(|source| {
+        recovery_transaction_io("inspect repository extended attributes", source)
+    })?;
+    if attributes.next().is_some() {
+        return Err(recovery_transaction_blocked(format!(
+            "atomic recovery does not support extended attributes or ACLs on {}",
+            relative.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_no_recovery_extended_attributes(_path: &Path, _relative: &Path) -> Result<(), GitError> {
+    Ok(())
+}
+
+fn ensure_recovery_git_storage_isolated(root: &Path) -> Result<(), GitError> {
+    let git_dir = root.join(".git");
+    let mut pending = vec![git_dir];
+    let mut entries = 0_usize;
+    let mut path_bytes = 0_usize;
+    while let Some(directory) = pending.pop() {
+        for child in fs::read_dir(&directory)
+            .map_err(|source| recovery_transaction_io("inspect Git storage", source))?
+        {
+            let child =
+                child.map_err(|source| recovery_transaction_io("inspect Git storage", source))?;
+            let path = child.path();
+            entries = entries.saturating_add(1);
+            path_bytes = path_bytes.saturating_add(path.as_os_str().as_encoded_bytes().len());
+            if entries > MAX_RECOVERY_GENERATION_ENTRIES
+                || path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
+            {
+                return Err(recovery_transaction_blocked(
+                    "Git storage exceeds atomic recovery entry or path bounds",
+                ));
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| recovery_transaction_io("inspect Git storage", source))?;
+            if metadata.file_type().is_symlink() {
+                return Err(recovery_transaction_blocked(format!(
+                    "atomic recovery does not support symlinked Git storage {}",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                )));
+            }
+            if metadata.file_type().is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_new_recovery_sidecar(
+    path: impl AsRef<Path>,
+    contents: &[u8],
+    action: &str,
+) -> Result<(), GitError> {
+    let path = path.as_ref();
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| recovery_transaction_io(action, source))?;
+    if let Err(source) = file.write_all(contents) {
+        let _ = fs::remove_file(path);
+        return Err(recovery_transaction_io(action, source));
+    }
+    Ok(())
 }
 
 fn create_recovery_candidate(parent: &Path, root: &Path) -> Result<PathBuf, GitError> {
@@ -1853,15 +2095,13 @@ fn create_recovery_candidate(parent: &Path, root: &Path) -> Result<PathBuf, GitE
         ));
         match fs::create_dir(&candidate) {
             Ok(()) => {
-                if let Err(source) = fs::write(
+                if let Err(error) = write_new_recovery_sidecar(
                     recovery_candidate_owner_path(&candidate),
                     root.as_os_str().as_encoded_bytes(),
+                    "record isolated repository ownership",
                 ) {
                     let _result = fs::remove_dir(&candidate);
-                    return Err(recovery_transaction_io(
-                        "record isolated repository ownership",
-                        source,
-                    ));
+                    return Err(error);
                 }
                 return Ok(candidate);
             }
@@ -2125,6 +2365,23 @@ fn run_recovery_promotion_hook(root: &Path) {
 
 #[cfg(not(test))]
 fn run_recovery_promotion_hook(_root: &Path) {}
+
+#[cfg(test)]
+static RECOVERY_SIDECAR_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_sidecar_hook(path: &Path) {
+    if let Ok(mut hooks) = RECOVERY_SIDECAR_HOOKS.lock()
+        && let Some(index) = hooks.iter().position(|(target, _)| target == path)
+    {
+        let (_, hook) = hooks.swap_remove(index);
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_sidecar_hook(_path: &Path) {}
 
 #[derive(Default)]
 struct RecoveryCapture {
@@ -2506,6 +2763,23 @@ fn run_recovery_file_open_hook(path: &Path) {
 
 #[cfg(not(test))]
 fn run_recovery_file_open_hook(_path: &Path) {}
+
+#[cfg(test)]
+static RECOVERY_GENERATION_FILE_READ_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_generation_file_read_hook(path: &Path) {
+    if let Ok(mut hooks) = RECOVERY_GENERATION_FILE_READ_HOOKS.lock()
+        && let Some(index) = hooks.iter().position(|(target, _)| target == path)
+    {
+        let (_, hook) = hooks.swap_remove(index);
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_generation_file_read_hook(_path: &Path) {}
 
 fn recovery_metadata_file<'a>(
     metadata: &'a [RecoveryMetadataEntry],
@@ -3411,6 +3685,12 @@ mod tests {
             Err(GitError::Blocked { message })
                 if message.starts_with(RECOVERY_CAPABILITY_UNAVAILABLE) =>
             {
+                if env::var_os("BITBYGIT_REQUIRE_RECOVERY_SUCCESS").is_some() {
+                    return Err(format!(
+                        "production recovery capabilities are required for this test: {message}"
+                    )
+                    .into());
+                }
                 let root = git.repo_root()?.canonicalize()?;
                 let before = RecoveryGeneration::capture(&root)?;
                 let Err(error) = git.recover_exact(operation, action, expected) else {
@@ -4160,6 +4440,217 @@ mod tests {
         assert_eq!(RecoveryGeneration::capture(&root)?, before);
         assert_eq!(git.recovery_state()?, expected);
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_symlinked_mutable_git_storage() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        for relative in ["objects", "refs", "index"] {
+            let (repo, _original_head) = prepare_merge_conflict()?;
+            let storage = repo.path().join(".git").join(relative);
+            let external = repo.path().with_extension(format!("external-{relative}"));
+            fs::rename(&storage, &external)?;
+            symlink(&external, &storage)?;
+
+            let Err(error) = Git::new(repo.path()).ensure_recovery_supported() else {
+                return Err(format!("expected symlinked .git/{relative} to block recovery").into());
+            };
+            assert!(error.to_string().contains("symlinked Git storage"));
+            assert!(external.exists());
+
+            fs::remove_file(&storage)?;
+            fs::rename(&external, &storage)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_pointer_race_cannot_overwrite_symlink_target() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let root = repo.path().canonicalize()?;
+        let pointer = recovery_backup_pointer_path(&root)?;
+        let victim = repo.path().with_extension("pointer-victim");
+        fs::write(&victim, "must remain unchanged\n")?;
+        let hook_pointer = pointer.clone();
+        let hook_victim = victim.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _ = symlink(hook_victim, hook_pointer);
+        });
+        RECOVERY_SIDECAR_HOOKS
+            .lock()
+            .map_err(|_| "recovery sidecar hook lock poisoned")?
+            .push((pointer.clone(), hook));
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected hostile backup pointer to block recovery".into());
+        };
+        assert!(error.to_string().contains("backup pointer"));
+        assert_eq!(fs::read_to_string(&victim)?, "must remain unchanged\n");
+        assert!(fs::symlink_metadata(&pointer)?.file_type().is_symlink());
+        fs::remove_file(pointer)?;
+        fs::remove_file(victim)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_owner_sidecar_cannot_overwrite_symlink_target() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let repo = initialized_repo()?;
+        let owner = repo.path().with_extension("candidate.owner");
+        let victim = repo.path().with_extension("owner-victim");
+        fs::write(&victim, "must remain unchanged\n")?;
+        symlink(&victim, &owner)?;
+
+        let Err(error) = write_new_recovery_sidecar(&owner, b"replacement", "record owner") else {
+            return Err("expected hostile owner sidecar to be rejected".into());
+        };
+        assert!(error.to_string().contains("record owner"));
+        assert_eq!(fs::read_to_string(&victim)?, "must remain unchanged\n");
+        fs::remove_file(owner)?;
+        fs::remove_file(victim)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_generation_does_not_open_fifo_or_symlink_replacements() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::{FileTypeExt, symlink};
+
+        for replacement_kind in ["fifo", "symlink"] {
+            let repo = initialized_repo()?;
+            let path = repo.path().join("tracked.txt");
+            fs::write(&path, "tracked\n")?;
+            let replacement = repo.path().join(format!("replacement-{replacement_kind}"));
+            if replacement_kind == "fifo" {
+                if !Command::new("mkfifo").arg(&replacement).status()?.success() {
+                    return Err("mkfifo failed".into());
+                }
+            } else {
+                symlink(repo.path().join(".git/config"), &replacement)?;
+            }
+            let destination = path.clone();
+            let hook: RecoveryCaptureHook = Box::new(move || {
+                let _ = fs::rename(replacement, destination);
+            });
+            RECOVERY_FILE_OPEN_HOOKS
+                .lock()
+                .map_err(|_| "recovery file-open hook lock poisoned")?
+                .push((path.clone(), hook));
+
+            let Err(error) = RecoveryGeneration::capture(&repo.path()) else {
+                return Err(
+                    format!("expected {replacement_kind} replacement to be rejected").into(),
+                );
+            };
+            assert!(matches!(error, GitError::Blocked { .. }));
+            let file_type = fs::symlink_metadata(path)?.file_type();
+            assert!(if replacement_kind == "fifo" {
+                file_type.is_fifo()
+            } else {
+                file_type.is_symlink()
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_generation_bounds_file_growth_after_open() -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        let path = repo.path().join("growing.txt");
+        fs::write(&path, "before\n")?;
+        let growing = path.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            if let Ok(mut file) = fs::OpenOptions::new().append(true).open(growing) {
+                let _ = file.write_all(b"after\n");
+            }
+        });
+        RECOVERY_GENERATION_FILE_READ_HOOKS
+            .lock()
+            .map_err(|_| "recovery generation read hook lock poisoned")?
+            .push((path, hook));
+
+        let Err(error) = RecoveryGeneration::capture(&repo.path()) else {
+            return Err("expected file growth during generation capture to be rejected".into());
+        };
+        assert!(error.to_string().contains("grew while it was captured"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_generation_rejects_hard_links() -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        let original = repo.path().join("original.txt");
+        fs::write(&original, "linked\n")?;
+        fs::hard_link(&original, repo.path().join("linked.txt"))?;
+
+        let Err(error) = RecoveryGeneration::capture(&repo.path()) else {
+            return Err("expected hard-linked files to block atomic recovery".into());
+        };
+        assert!(error.to_string().contains("hard-linked file"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_promotion_rolls_back_concurrent_xattr_change() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let conflict = repo.path().join("conflict.txt");
+        let changed = conflict.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _ = xattr::set(changed, "user.bitbygit-test", b"changed");
+        });
+        RECOVERY_PROMOTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery promotion hook lock poisoned")?
+            .push((repo.path().canonicalize()?, hook));
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected concurrent xattr change to roll back recovery".into());
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("metadata changed during atomic recovery promotion")
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(
+            xattr::get(conflict, "user.bitbygit-test")?,
+            Some(b"changed".to_vec())
+        );
         Ok(())
     }
 

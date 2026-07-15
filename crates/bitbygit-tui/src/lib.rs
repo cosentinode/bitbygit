@@ -432,7 +432,18 @@ impl App {
     }
 
     fn execute_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
-        let message = execute_typed_plan(&plan, context);
+        let recovery_cwd = matches!(&plan.request, OperationRequest::Recover(_)).then(|| {
+            let cwd = current_dir();
+            Git::new(&cwd).repo_root().unwrap_or(cwd)
+        });
+        let mut message = execute_typed_plan(&plan, context);
+        if let Some(cwd) = recovery_cwd
+            && let Err(error) = std::env::set_current_dir(cwd)
+        {
+            message.push_str(&format!(
+                "\nUnable to reattach the TUI to the recovered repository: {error}"
+            ));
+        }
         if should_refresh_status_after(&plan) {
             self.refresh_status();
         }
@@ -451,11 +462,24 @@ impl App {
     }
 
     fn execute_prompt_sequence(&mut self, sequence: QueuedPromptSequence) {
+        let has_recovery = std::iter::once(&sequence.first.plan.request)
+            .chain(sequence.remaining_requests.iter())
+            .any(|request| matches!(request, OperationRequest::Recover(_)));
+        let recovery_cwd = has_recovery.then(|| {
+            let cwd = current_dir();
+            Git::new(&cwd).repo_root().unwrap_or(cwd)
+        });
         let result = PromptSequenceExecutor::current().execute(sequence);
+        let reattach_error = recovery_cwd.and_then(|cwd| std::env::set_current_dir(cwd).err());
         if result.should_refresh_status() {
             self.refresh_status();
         }
         self.details = result.message();
+        if let Some(error) = reattach_error {
+            self.details.push_str(&format!(
+                "\nUnable to reattach the TUI to the recovered repository: {error}"
+            ));
+        }
     }
 
     fn submit_prompt(&mut self) {
@@ -4173,6 +4197,12 @@ mod tests {
             Err(GitError::Blocked { message })
                 if message.contains("required platform capabilities are missing") =>
             {
+                if std::env::var_os("BITBYGIT_REQUIRE_RECOVERY_SUCCESS").is_some() {
+                    return Err(format!(
+                        "production recovery capabilities are required for this test: {message}"
+                    )
+                    .into());
+                }
                 Ok(false)
             }
             Err(error) => Err(error.into()),
@@ -5105,6 +5135,50 @@ mod tests {
                     .contains("required platform capabilities are missing")
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tui_reattaches_to_promoted_repository_after_recovery() -> Result<(), Box<dyn Error>> {
+        if let Some(repo) = std::env::var_os("BITBYGIT_TEST_CWD_RECOVERY_REPO") {
+            let repo = PathBuf::from(repo);
+            let mut app = App::new();
+            app.load_current_dir();
+            app.submit_operation_request(OperationRequest::Recover(RecoveryRequest::MergeAbort));
+            app.handle_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE));
+
+            assert_eq!(app.repository_operation, None, "{}", app.details);
+            assert_eq!(current_dir().canonicalize()?, repo.canonicalize()?);
+            std::fs::write(repo.join("after-recovery.txt"), "promoted generation\n")?;
+            app.submit_operation_request(OperationRequest::StageAll);
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            let status = Git::new(&repo).status()?;
+            assert!(status.staged_files().iter().any(|entry| {
+                entry.path == std::path::Path::new("after-recovery.txt")
+                    && entry.index == ChangeKind::Added
+            }));
+            return Ok(());
+        }
+
+        let repo = merge_conflict_repo("cwd-recovery")?;
+        if !recovery_capabilities_available(&repo)? {
+            return Ok(());
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::tui_reattaches_to_promoted_repository_after_recovery",
+                "--nocapture",
+            ])
+            .current_dir(&repo)
+            .env("BITBYGIT_TEST_CWD_RECOVERY_REPO", &repo)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "cwd recovery child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(())
     }
 
