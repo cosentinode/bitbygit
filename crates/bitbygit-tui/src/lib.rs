@@ -854,6 +854,15 @@ fn render(app: &App, frame: &mut ratatui::Frame<'_>, areas: &Viewport) {
     frame.render_widget(details_panel(app), areas.details);
     if areas.queue.area() > 0 {
         frame.render_widget(queue_panel(app), areas.queue);
+    } else if app.operation_queue.has_pending() {
+        let area = Rect::new(
+            areas.repos.x,
+            areas.repos.y,
+            areas.prompt.width,
+            areas.prompt.y.saturating_sub(areas.repos.y),
+        );
+        frame.render_widget(Clear, area);
+        frame.render_widget(compact_queue_panel(app, area.width), area);
     }
     frame.render_widget(prompt_panel(app), areas.prompt);
 }
@@ -1850,6 +1859,9 @@ impl OperationPlanner {
     }
 
     fn plan_request(&self, request: OperationRequest) -> Result<PreparedOperation, String> {
+        if let Some(operation) = self.preflight_blocked_request(&request)? {
+            return Ok(operation);
+        }
         let operation = match request {
             OperationRequest::RefreshStatus => {
                 return Err("Refresh status is handled directly by the UI.".to_owned());
@@ -1898,6 +1910,37 @@ impl OperationPlanner {
             }
         };
         Ok(self.apply_policy(operation))
+    }
+
+    fn preflight_blocked_request(
+        &self,
+        request: &OperationRequest,
+    ) -> Result<Option<PreparedOperation>, String> {
+        let OperationRequest::Pull { rebase } = request else {
+            return Ok(None);
+        };
+        let status = self
+            .git()
+            .status()
+            .map_err(|error| format!("Unable to prepare pull plan: {error}"))?;
+        let local_branch = branch_name(&status.branch)?;
+        let preview = prompt_sequence_request_preview(request)?;
+        let evaluation = self.policy.evaluate_confirmation(
+            preview.risk_level,
+            preview.kind,
+            Some(&local_branch),
+        );
+        if evaluation.requirement != ConfirmationRequirement::Blocked {
+            return Ok(None);
+        }
+
+        let upstream = status.branch.upstream.as_deref().unwrap_or("no upstream");
+        let mut plan = pull_plan(*rebase, upstream, status.branch.behind);
+        apply_policy_evaluation(&mut plan, evaluation);
+        Ok(Some(PreparedOperation::new(
+            plan,
+            ExecutionContext::default(),
+        )))
     }
 
     fn plan_prompt_sequence(
@@ -2760,6 +2803,27 @@ fn queue_panel(app: &App) -> Paragraph<'_> {
     Paragraph::new(text).block(panel_block("Queue", app.focus == Focus::Queue))
 }
 
+fn compact_queue_panel(app: &App, width: u16) -> Paragraph<'_> {
+    let text = app
+        .operation_queue
+        .pending()
+        .map(|operation| {
+            let plan = &operation.plan;
+            vec![
+                Line::from(format!(
+                    "Keys: {}",
+                    compact_accepted_confirmation_keys(plan, width)
+                )),
+                Line::from(format!("Policy: {}", compact_policy_reason(plan))),
+                Line::from(format!("Confirm: {}", confirmation_action(plan))),
+            ]
+        })
+        .unwrap_or_default();
+    Paragraph::new(text)
+        .block(panel_block("Pending confirmation", false))
+        .wrap(Wrap { trim: true })
+}
+
 fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
     let Some(operation) = pending else {
         return vec![
@@ -2806,6 +2870,41 @@ fn policy_reason(plan: &OperationPlan) -> String {
         }
     });
     reasons.join("; ")
+}
+
+fn compact_policy_reason(plan: &OperationPlan) -> String {
+    let reason = policy_reason(plan);
+    let controlling = reason.split("; ").next().unwrap_or(reason.as_str());
+    if let Some((risk, requirement)) = controlling.split_once(" risk policy requires ") {
+        return format!(
+            "{risk} risk: {}",
+            requirement.trim_end_matches(" confirmation")
+        );
+    }
+    if controlling.starts_with("protected branch ") {
+        return controlling
+            .split_once(':')
+            .map_or(controlling, |(branch, _detail)| branch)
+            .to_owned();
+    }
+    controlling.to_owned()
+}
+
+fn compact_accepted_confirmation_keys(plan: &OperationPlan, width: u16) -> &'static str {
+    if width < 30 {
+        return match plan.confirmation.requirement {
+            ConfirmationRequirement::NormalSelection => "none",
+            ConfirmationRequirement::VisiblePlan => "y/n/Esc",
+            ConfirmationRequirement::ExplicitConfirmation => "Y/n/Esc",
+            ConfirmationRequirement::Blocked => "n/Esc only",
+        };
+    }
+    match plan.confirmation.requirement {
+        ConfirmationRequirement::NormalSelection => "none; runs on selection",
+        ConfirmationRequirement::VisiblePlan => "y confirm; n/Esc cancel",
+        ConfirmationRequirement::ExplicitConfirmation => "Y confirm; n/Esc cancel",
+        ConfirmationRequirement::Blocked => "n/Esc dismiss; confirm disabled",
+    }
 }
 
 fn accepted_confirmation_keys(plan: &OperationPlan) -> &'static str {
@@ -6310,6 +6409,119 @@ mod tests {
     }
 
     #[test]
+    fn blocked_pull_planning_does_not_fetch_remote_tracking_refs() -> Result<(), Box<dyn Error>> {
+        for (name, rebase) in [("fast-forward", false), ("rebase", true)] {
+            let (repo, branch, original_tracking_oid) =
+                stale_pull_tracking_repo(&format!("blocked-pull-{name}"))?;
+            let mut config = AppConfig::default();
+            if rebase {
+                config.policy.confirmation.high = ConfirmationSetting::Blocked;
+            } else {
+                config.policy.confirmation.medium = ConfirmationSetting::Blocked;
+            }
+            let planner = OperationPlanner {
+                repo_root: repo.clone(),
+                github_executable: None,
+                policy: EffectivePolicy::new(&config),
+                ssh_executable: Some(test_ssh_command()?),
+            };
+
+            let operation = planner
+                .plan_request(OperationRequest::Pull { rebase })
+                .map_err(std::io::Error::other)?;
+
+            assert_eq!(
+                operation.plan.confirmation.requirement,
+                ConfirmationRequirement::Blocked
+            );
+            assert!(operation.plan.confirmation.prompt.contains(if rebase {
+                "rebase"
+            } else {
+                "pull"
+            }));
+            assert_eq!(
+                git_stdout(
+                    &repo,
+                    &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+                )?
+                .trim(),
+                original_tracking_oid
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_blocked_pull_does_not_fetch_remote_tracking_ref() -> Result<(), Box<dyn Error>> {
+        let (repo, branch, original_tracking_oid) =
+            stale_pull_tracking_repo("deferred-blocked-pull")?;
+        git_stdout(
+            &repo,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/trigger:refs/remotes/origin/trigger",
+            ],
+        )?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Pull { rebase: false },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("deferred-blocked-pull-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh_root = isolated_temp_root("deferred-blocked-pull-ssh")?;
+        std::fs::create_dir_all(&ssh_root)?;
+        let ssh = ssh_root.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'schema-version = 1' '[policy.confirmation]' 'medium = \"blocked\"' > '{}'\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\nexec git-upload-pack \"$target\"\n",
+                store.paths().config_file.display()
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ssh)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ssh, permissions)?;
+        }
+        let executor = PromptSequenceExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+
+        let result =
+            executor.execute_confirmed(sequence.sequence, ConfirmationRequirement::VisiblePlan);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 2."),
+            "{message}"
+        );
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            original_tracking_oid
+        );
+        Ok(())
+    }
+
+    #[test]
     fn custom_policy_is_shared_by_manual_prompt_and_deferred_plans() -> Result<(), Box<dyn Error>> {
         let repo = isolated_git_repo("custom-policy-planners")?;
         configure_git_identity(&repo)?;
@@ -7346,6 +7558,109 @@ mod tests {
     }
 
     #[test]
+    fn compact_queue_renders_confirmation_keys_policy_and_action() -> Result<(), Box<dyn Error>> {
+        for (name, requirement, reason, keys, policy) in [
+            (
+                "explicit-protected",
+                ConfirmationRequirement::ExplicitConfirmation,
+                "protected branch production: rebase requires at least explicit confirmation",
+                "Keys: Y confirm; n/Esc cancel",
+                "Policy: protected branch production",
+            ),
+            (
+                "blocked-medium",
+                ConfirmationRequirement::Blocked,
+                "medium risk policy requires blocked confirmation",
+                "Keys: n/Esc dismiss; confirm disabled",
+                "Policy: medium risk: blocked",
+            ),
+        ] {
+            let mut plan = OperationPlan::new(
+                OperationRequest::PromptSequence {
+                    requests: vec![OperationRequest::Fetch, OperationRequest::Branches],
+                },
+                "Prompt sequence plan",
+                vec![
+                    OperationStep::new(OperationKind::Fetch, RiskLevel::Medium, "fetch"),
+                    OperationStep::new(OperationKind::Branches, RiskLevel::Medium, "branches"),
+                ],
+                "Press y to run 2 prompt steps or n to cancel.",
+            );
+            plan.confirmation.requirement = requirement;
+            plan.confirmation.reason = Some(reason.to_owned());
+            plan.confirmation.prompt = confirmation_prompt(&plan, requirement);
+            let mut app = App::new();
+            app.operation_queue
+                .enqueue(QueuedOperation::new(plan, ExecutionContext::default()));
+            let backend = TestBackend::new(40, 12);
+            let mut terminal = Terminal::new(backend)?;
+
+            terminal.draw(|frame| {
+                let viewport = Viewport::split(frame.area());
+                render(&app, frame, &viewport);
+            })?;
+
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains(keys), "{name}: {rendered}");
+            assert!(rendered.contains(policy), "{name}: {rendered}");
+            assert!(
+                rendered.contains("Confirm: run 2 prompt steps"),
+                "{name}: {rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_queue_renders_compact_confirmation_keys_and_policy_reason() -> Result<(), Box<dyn Error>>
+    {
+        let mut plan = OperationPlan::new(
+            OperationRequest::PromptSequence {
+                requests: vec![OperationRequest::Fetch, OperationRequest::Branches],
+            },
+            "Prompt sequence plan",
+            vec![OperationStep::new(
+                OperationKind::Fetch,
+                RiskLevel::High,
+                "fetch",
+            )],
+            "Explicit confirmation required: press uppercase Y to run 2 prompt steps or n to cancel.",
+        );
+        plan.confirmation.reason = Some(
+            "protected branch production: rebase requires at least explicit confirmation"
+                .to_owned(),
+        );
+        let mut app = App::new();
+        app.operation_queue
+            .enqueue(QueuedOperation::new(plan, ExecutionContext::default()));
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend)?;
+
+        terminal.draw(|frame| {
+            let viewport = Viewport::split(frame.area());
+            render(&app, frame, &viewport);
+        })?;
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Keys: Y/n/Esc"), "{rendered}");
+        assert!(rendered.contains("Policy: protected"), "{rendered}");
+        assert!(rendered.contains("branch production"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
     fn renders_compact_viewport() -> Result<(), Box<dyn Error>> {
         render_with_test_backend(40, 12)
     }
@@ -7510,6 +7825,39 @@ mod tests {
             &test_ssh_command()?,
         )?;
         Ok(repo)
+    }
+
+    fn stale_pull_tracking_repo(name: &str) -> Result<(PathBuf, String, String), Box<dyn Error>> {
+        let repo = isolated_git_repo(name)?;
+        let remote = isolated_bare_git_repo(&format!("{name}-remote"))?;
+        let ssh = test_ssh_command()?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        let original_oid = git_stdout(&repo, &["rev-parse", "HEAD"])?.trim().to_owned();
+        add_github_remote(&repo, "origin", &remote)?;
+        git_stdout_with_ssh(&repo, &["push", "-u", "origin", &branch], &ssh)?;
+        git_stdout_with_ssh(&repo, &["push", "origin", "HEAD:trigger"], &ssh)?;
+        std::fs::write(repo.join("file.txt"), "remote update\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "remote update"])?;
+        git_stdout_with_ssh(&repo, &["push", "origin", &branch], &ssh)?;
+        git_stdout(&repo, &["switch", "--detach", &original_oid])?;
+        git_stdout(&repo, &["branch", "-f", &branch, &original_oid])?;
+        git_stdout(&repo, &["switch", &branch])?;
+        git_stdout(
+            &repo,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                &original_oid,
+            ],
+        )?;
+        Ok((repo, branch, original_oid))
     }
 
     fn add_github_remote(
