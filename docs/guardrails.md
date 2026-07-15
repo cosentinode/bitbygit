@@ -121,12 +121,6 @@ Conflict mode should:
 - audit conflict recovery actions
 
 Conflict recovery actions are high risk because they move repository state.
-Atomic conflict recovery remains blocked on current platforms. User and mount
-namespaces do not prevent another process with the same host identity from
-writing a speculative repository, and Linux directory exchange cannot be
-conditioned on inode identity. Recovery stays unavailable until both guarantees
-can be enforced; capability probes are bounded and fail before a candidate is
-created or repository state changes.
 
 ## Confirmation Copy
 

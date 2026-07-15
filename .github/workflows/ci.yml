@@ -47,10 +47,5 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
-      - name: Test fail-closed recovery capabilities
-        run: |
-          cargo test --locked -p bitbygit-git tests::exact_recovery_fails_closed_before_creating_candidate -- --exact
-          cargo test --locked -p bitbygit-git tests::capability_probe_enforces_deadline_and_output_bounds -- --exact
-
       - name: Build
         run: cargo build --locked --workspace
