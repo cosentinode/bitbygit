@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 sha2 = "0.10"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "0.38", features = ["fs", "process"] }

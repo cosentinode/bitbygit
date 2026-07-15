@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::string::FromUtf8Error;
@@ -23,6 +23,11 @@ use std::os::unix::process::CommandExt;
 
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, kill_process_group};
+#[cfg(unix)]
+use rustix::{
+    fs::{Mode, OFlags, open},
+    io::Errno,
+};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -54,6 +59,8 @@ const RECOVERY_CONTROL_PATHS: &[&str] = &[
     "rebase-apply",
     "rebase-merge",
     "sequencer",
+    "info/attributes",
+    "info/sparse-checkout",
 ];
 static NEXT_STAGED_FETCH_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -319,17 +326,17 @@ impl Git {
         operation: RepositoryOperation,
         action: RecoveryAction,
         expected_state: &RecoveryState,
-        before_final_check: F,
+        before_spawn_check: F,
     ) -> Result<GitOutput, GitError>
     where
         F: FnOnce() -> Result<(), GitError>,
     {
         self.validate_recovery_action(operation, action)?;
         let deadline = Instant::now() + self.recovery_execution_timeout;
-        self.ensure_recovery_state(expected_state, operation, action, deadline)?;
-        before_final_check()?;
-        self.ensure_recovery_state(expected_state, operation, action, deadline)?;
-        self.run_recovery_args_until(operation, action, deadline)
+        self.run_recovery_args_until_with(operation, action, deadline, || {
+            before_spawn_check()?;
+            self.ensure_recovery_state(expected_state, operation, action, deadline)
+        })
     }
 
     fn ensure_recovery_state(
@@ -1211,6 +1218,29 @@ impl Git {
         }
         let hooks = self.recovery_hooks_path_until(deadline)?;
         hash_recovery_path(&mut hasher, b"hooks", &hooks, deadline, &mut entries)?;
+        for variable in ["GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"] {
+            if let Some(path) = self.git_var_path_until(variable, deadline)? {
+                hash_recovery_path(
+                    &mut hasher,
+                    variable.as_bytes(),
+                    &path,
+                    deadline,
+                    &mut entries,
+                )?;
+            }
+        }
+        let root = self.repo_root_until(deadline)?;
+        for relative in self.worktree_attributes_until(deadline)? {
+            let mut label = b"worktree-attributes/".to_vec();
+            label.extend_from_slice(relative.as_os_str().as_encoded_bytes());
+            hash_recovery_path(
+                &mut hasher,
+                &label,
+                &root.join(relative),
+                deadline,
+                &mut entries,
+            )?;
+        }
 
         Ok(RecoveryState {
             fingerprint: hasher.finalize().into(),
@@ -1300,6 +1330,76 @@ impl Git {
         Err(output.git_error(args))
     }
 
+    fn git_var_path_until(
+        &self,
+        variable: &str,
+        deadline: Instant,
+    ) -> Result<Option<PathBuf>, GitError> {
+        let args = vec!["var".to_owned(), variable.to_owned()];
+        let output = self.run_bounded_git(args.clone(), deadline, true)?;
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        if !output.status.success() {
+            return Err(output.git_error(args));
+        }
+        if output.stdout.truncated {
+            return Err(GitError::Blocked {
+                message: format!("recovery planning is blocked because {variable} is too long"),
+            });
+        }
+        let path = path_from_bytes(strip_byte_line_ending(&output.stdout.bytes));
+        if !path.is_absolute() {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "recovery planning is blocked because {variable} is not an absolute path"
+                ),
+            });
+        }
+        Ok(Some(path))
+    }
+
+    fn worktree_attributes_until(&self, deadline: Instant) -> Result<Vec<PathBuf>, GitError> {
+        let args = vec![
+            "ls-files".to_owned(),
+            "--cached".to_owned(),
+            "--others".to_owned(),
+            "--ignored".to_owned(),
+            "--exclude-standard".to_owned(),
+            "-z".to_owned(),
+            "--".to_owned(),
+            ":(glob)**/.gitattributes".to_owned(),
+        ];
+        let output = self.run_bounded_git(args.clone(), deadline, true)?;
+        if !output.status.success() {
+            return Err(output.git_error(args));
+        }
+        if output.stdout.truncated {
+            return Err(GitError::Blocked {
+                message: "recovery planning is blocked because attribute paths exceed the bounded output limit"
+                    .to_owned(),
+            });
+        }
+        let mut paths = BTreeSet::new();
+        for path in output.stdout.bytes.split(|byte| *byte == 0) {
+            if path.is_empty() {
+                continue;
+            }
+            let path = path_from_bytes(path);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(GitError::Blocked {
+                    message: "recovery planning is blocked by an invalid attribute path".to_owned(),
+                });
+            }
+            paths.insert(path);
+        }
+        Ok(paths.into_iter().collect())
+    }
+
     fn repo_root_until(&self, deadline: Instant) -> Result<PathBuf, GitError> {
         let args = vec!["rev-parse".to_owned(), "--show-toplevel".to_owned()];
         let output = self.run_bounded_git(args.clone(), deadline, true)?;
@@ -1327,11 +1427,24 @@ impl Git {
         action: RecoveryAction,
         deadline: Instant,
     ) -> Result<GitOutput, GitError> {
+        self.run_recovery_args_until_with(operation, action, deadline, || Ok(()))
+    }
+
+    fn run_recovery_args_until_with<F>(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        deadline: Instant,
+        before_spawn: F,
+    ) -> Result<GitOutput, GitError>
+    where
+        F: FnOnce() -> Result<(), GitError>,
+    {
         let args = vec![
             operation.label().to_owned(),
             format!("--{}", action.label()),
         ];
-        let output = self.run_bounded_git(args.clone(), deadline, false)?;
+        let output = self.run_bounded_git_with(args.clone(), deadline, false, before_spawn)?;
         let stdout = output.stdout.lossy_text();
         let stderr = output.stderr.lossy_text();
         if !output.status.success() {
@@ -1355,6 +1468,19 @@ impl Git {
         deadline: Instant,
         optional_locks: bool,
     ) -> Result<BoundedCommandOutput, GitError> {
+        self.run_bounded_git_with(args, deadline, optional_locks, || Ok(()))
+    }
+
+    fn run_bounded_git_with<F>(
+        &self,
+        args: Vec<String>,
+        deadline: Instant,
+        optional_locks: bool,
+        before_spawn: F,
+    ) -> Result<BoundedCommandOutput, GitError>
+    where
+        F: FnOnce() -> Result<(), GitError>,
+    {
         let mut command = Command::new("git");
         command
             .current_dir(&self.cwd)
@@ -1364,8 +1490,6 @@ impl Git {
             .env("SSH_ASKPASS_REQUIRE", "never")
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .args(&args);
         if optional_locks {
             command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -1384,7 +1508,14 @@ impl Git {
         } else {
             self.recovery_output_limit
         };
-        run_bounded_command(command, args, deadline, output_limit)
+        run_bounded_command(
+            command,
+            args,
+            deadline,
+            output_limit,
+            optional_locks,
+            before_spawn,
+        )
     }
 
     fn run_args_with_editor(
@@ -1595,12 +1726,43 @@ impl Git {
     }
 }
 
-fn run_bounded_command(
+fn run_bounded_command<F>(
     mut command: Command,
     args: Vec<String>,
     deadline: Instant,
     output_limit: usize,
-) -> Result<BoundedCommandOutput, GitError> {
+    digest_all_output: bool,
+    before_spawn: F,
+) -> Result<BoundedCommandOutput, GitError>
+where
+    F: FnOnce() -> Result<(), GitError>,
+{
+    if Instant::now() >= deadline {
+        return Err(GitError::TimedOut { args });
+    }
+    let mut stdout = tempfile::tempfile().map_err(|source| GitError::Io {
+        args: args.clone(),
+        source,
+    })?;
+    let mut stderr = tempfile::tempfile().map_err(|source| GitError::Io {
+        args: args.clone(),
+        source,
+    })?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
+            GitError::Io {
+                args: args.clone(),
+                source,
+            }
+        })?))
+        .stderr(Stdio::from(stderr.try_clone().map_err(|source| {
+            GitError::Io {
+                args: args.clone(),
+                source,
+            }
+        })?));
+    before_spawn()?;
     if Instant::now() >= deadline {
         return Err(GitError::TimedOut { args });
     }
@@ -1608,16 +1770,6 @@ fn run_bounded_command(
         args: args.clone(),
         source,
     })?;
-    let stdout = child.stdout.take().ok_or_else(|| GitError::Io {
-        args: args.clone(),
-        source: io::Error::other("failed to capture git stdout"),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| GitError::Io {
-        args: args.clone(),
-        source: io::Error::other("failed to capture git stderr"),
-    })?;
-    let stdout_reader = thread::spawn(move || read_captured_stream(stdout, output_limit));
-    let stderr_reader = thread::spawn(move || read_captured_stream(stderr, output_limit));
 
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|source| GitError::Io {
@@ -1630,57 +1782,87 @@ fn run_bounded_command(
         if now >= deadline {
             kill_process_tree(&mut child);
             let _result = child.wait();
-            let _stdout = join_captured_stream(stdout_reader, &args);
-            let _stderr = join_captured_stream(stderr_reader, &args);
             return Err(GitError::TimedOut { args });
         }
         thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
     };
+    // Hooks may leave background children behind. End the command's process group
+    // before reading finite file snapshots; detached children cannot hold these
+    // captures open as they could inherited pipes.
+    kill_process_tree(&mut child);
 
     Ok(BoundedCommandOutput {
         status,
-        stdout: join_captured_stream(stdout_reader, &args)?,
-        stderr: join_captured_stream(stderr_reader, &args)?,
+        stdout: read_captured_file(
+            &mut stdout,
+            output_limit,
+            digest_all_output,
+            deadline,
+            &args,
+        )?,
+        stderr: read_captured_file(
+            &mut stderr,
+            output_limit,
+            digest_all_output,
+            deadline,
+            &args,
+        )?,
     })
 }
 
-fn read_captured_stream(mut stream: impl Read, output_limit: usize) -> io::Result<CapturedStream> {
+fn read_captured_file(
+    file: &mut fs::File,
+    output_limit: usize,
+    digest_all_output: bool,
+    deadline: Instant,
+    args: &[String],
+) -> Result<CapturedStream, GitError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| recovery_output_io(args, source))?;
+    let snapshot_len = file
+        .metadata()
+        .map_err(|source| recovery_output_io(args, source))?
+        .len();
+    let read_limit = if digest_all_output {
+        snapshot_len
+    } else {
+        snapshot_len.min(output_limit.saturating_add(1) as u64)
+    };
     let mut hasher = Sha256::new();
     let mut bytes = Vec::with_capacity(output_limit.min(8192));
-    let mut truncated = false;
+    let mut remaining = read_limit;
     let mut buffer = [0; 8192];
-    loop {
-        let count = stream.read(&mut buffer)?;
+    while remaining > 0 {
+        if Instant::now() >= deadline {
+            return Err(GitError::TimedOut {
+                args: args.to_vec(),
+            });
+        }
+        let requested = buffer.len().min(remaining as usize);
+        let count = file
+            .read(&mut buffer[..requested])
+            .map_err(|source| recovery_output_io(args, source))?;
         if count == 0 {
             break;
         }
+        remaining -= count as u64;
         hasher.update(&buffer[..count]);
         let remaining = output_limit.saturating_sub(bytes.len());
         let retained = remaining.min(count);
         bytes.extend_from_slice(&buffer[..retained]);
-        truncated |= retained < count;
     }
     Ok(CapturedStream {
         bytes,
         digest: hasher.finalize().into(),
-        truncated,
+        truncated: snapshot_len > output_limit as u64,
     })
 }
 
-fn join_captured_stream(
-    reader: thread::JoinHandle<io::Result<CapturedStream>>,
-    args: &[String],
-) -> Result<CapturedStream, GitError> {
-    reader
-        .join()
-        .map_err(|_| GitError::Io {
-            args: args.to_vec(),
-            source: io::Error::other("git output reader stopped unexpectedly"),
-        })?
-        .map_err(|source| GitError::Io {
-            args: args.to_vec(),
-            source,
-        })
+fn recovery_output_io(args: &[String], source: io::Error) -> GitError {
+    GitError::Io {
+        args: args.to_vec(),
+        source,
+    }
 }
 
 #[cfg(unix)]
@@ -1711,16 +1893,57 @@ fn hash_recovery_path(
     deadline: Instant,
     entries: &mut usize,
 ) -> Result<(), GitError> {
+    hash_recovery_path_inner(hasher, label, path, deadline, entries, 0)
+}
+
+fn hash_recovery_path_inner(
+    hasher: &mut Sha256,
+    label: &[u8],
+    path: &Path,
+    deadline: Instant,
+    entries: &mut usize,
+    symlink_depth: usize,
+) -> Result<(), GitError> {
     ensure_recovery_fingerprint_capacity(deadline, entries)?;
     hash_field(hasher, label);
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let opened = match open_recovery_file(path) {
+        Ok(opened) => opened,
+        Err(RecoveryOpenError::Missing) => {
             hash_field(hasher, b"missing");
             return Ok(());
         }
-        Err(source) => return Err(recovery_state_io(path, source)),
+        Err(RecoveryOpenError::Symlink) => {
+            if symlink_depth >= 16 {
+                return Err(GitError::Blocked {
+                    message: format!(
+                        "recovery planning is blocked because {} has too many symlink levels",
+                        path.display()
+                    ),
+                });
+            }
+            *entries += 1;
+            hash_field(hasher, b"symlink");
+            let target = fs::read_link(path).map_err(|source| recovery_state_io(path, source))?;
+            hash_field(hasher, target.as_os_str().as_encoded_bytes());
+            ensure_recovery_fingerprint_capacity(deadline, entries)?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+            };
+            return hash_recovery_path_inner(
+                hasher,
+                label,
+                &target,
+                deadline,
+                entries,
+                symlink_depth + 1,
+            );
+        }
+        Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
     };
+    let mut file = opened.file;
+    let metadata = opened.metadata;
     *entries += 1;
     hash_field(hasher, &metadata.len().to_le_bytes());
     #[cfg(unix)]
@@ -1728,13 +1951,8 @@ fn hash_recovery_path(
     #[cfg(not(unix))]
     hash_field(hasher, &[u8::from(metadata.permissions().readonly())]);
 
-    if metadata.file_type().is_symlink() {
-        hash_field(hasher, b"symlink");
-        let target = fs::read_link(path).map_err(|source| recovery_state_io(path, source))?;
-        hash_field(hasher, target.as_os_str().as_encoded_bytes());
-    } else if metadata.is_file() {
+    if metadata.is_file() {
         hash_field(hasher, b"file");
-        let mut file = fs::File::open(path).map_err(|source| recovery_state_io(path, source))?;
         let mut buffer = [0; 64 * 1024];
         loop {
             if Instant::now() >= deadline {
@@ -1750,31 +1968,187 @@ fn hash_recovery_path(
             }
             hasher.update(&buffer[..count]);
         }
-    } else if metadata.is_dir() {
-        hash_field(hasher, b"directory");
-        let mut children = Vec::new();
-        for child in fs::read_dir(path).map_err(|source| recovery_state_io(path, source))? {
-            ensure_recovery_fingerprint_capacity(deadline, entries)?;
-            if children.len() + *entries >= RECOVERY_STATE_ENTRY_LIMIT {
+        let final_metadata = file
+            .metadata()
+            .map_err(|source| recovery_state_io(path, source))?;
+        let path_metadata = match open_recovery_file(path) {
+            Ok(reopened) => reopened.metadata,
+            Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
+            Err(RecoveryOpenError::Missing | RecoveryOpenError::Symlink) => {
                 return Err(GitError::Blocked {
-                    message:
-                        "recovery planning is blocked because recovery state has too many entries"
-                            .to_owned(),
+                    message: format!(
+                        "recovery planning is blocked because {} changed while it was fingerprinted",
+                        path.display()
+                    ),
                 });
             }
-            children.push(child.map_err(|source| recovery_state_io(path, source))?);
+        };
+        if !same_recovery_file(&metadata, &final_metadata)
+            || !same_recovery_file(&metadata, &path_metadata)
+        {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "recovery planning is blocked because {} changed while it was fingerprinted",
+                    path.display()
+                ),
+            });
         }
-        children.sort_by_key(fs::DirEntry::file_name);
+    } else if metadata.is_dir() {
+        hash_field(hasher, b"directory");
+        let mut children = recovery_directory_children(&file, path, deadline, entries)?;
+        children.sort();
         for child in children {
+            ensure_recovery_fingerprint_capacity(deadline, entries)?;
             let mut child_label = label.to_vec();
             child_label.push(b'/');
-            child_label.extend_from_slice(child.file_name().as_encoded_bytes());
-            hash_recovery_path(hasher, &child_label, &child.path(), deadline, entries)?;
+            child_label.extend_from_slice(child.as_encoded_bytes());
+            hash_recovery_path_inner(
+                hasher,
+                &child_label,
+                &path.join(child),
+                deadline,
+                entries,
+                symlink_depth,
+            )?;
+        }
+        let final_metadata = file
+            .metadata()
+            .map_err(|source| recovery_state_io(path, source))?;
+        if !same_recovery_file(&metadata, &final_metadata) {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "recovery planning is blocked because {} changed while it was fingerprinted",
+                    path.display()
+                ),
+            });
         }
     } else {
-        hash_field(hasher, b"special");
+        return Err(GitError::Blocked {
+            message: format!(
+                "recovery planning is blocked because {} is not a regular file or directory",
+                path.display()
+            ),
+        });
     }
     Ok(())
+}
+
+struct RecoveryFile {
+    file: fs::File,
+    metadata: fs::Metadata,
+}
+
+enum RecoveryOpenError {
+    Missing,
+    Symlink,
+    Io(io::Error),
+}
+
+#[cfg(unix)]
+fn recovery_directory_children(
+    file: &fs::File,
+    path: &Path,
+    deadline: Instant,
+    entries: &usize,
+) -> Result<Vec<OsString>, GitError> {
+    use rustix::fs::Dir;
+
+    let mut children = Vec::new();
+    let directory =
+        Dir::read_from(file).map_err(|source| recovery_state_io(path, io::Error::from(source)))?;
+    for child in directory {
+        ensure_recovery_fingerprint_capacity(deadline, entries)?;
+        if children.len() + *entries >= RECOVERY_STATE_ENTRY_LIMIT {
+            return Err(GitError::Blocked {
+                message: "recovery planning is blocked because recovery state has too many entries"
+                    .to_owned(),
+            });
+        }
+        let child = child.map_err(|source| recovery_state_io(path, io::Error::from(source)))?;
+        let name = child.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            children.push(OsString::from_vec(name.to_vec()));
+        }
+    }
+    Ok(children)
+}
+
+#[cfg(not(unix))]
+fn recovery_directory_children(
+    _file: &fs::File,
+    path: &Path,
+    deadline: Instant,
+    entries: &usize,
+) -> Result<Vec<OsString>, GitError> {
+    let mut children = Vec::new();
+    for child in fs::read_dir(path).map_err(|source| recovery_state_io(path, source))? {
+        ensure_recovery_fingerprint_capacity(deadline, entries)?;
+        if children.len() + *entries >= RECOVERY_STATE_ENTRY_LIMIT {
+            return Err(GitError::Blocked {
+                message: "recovery planning is blocked because recovery state has too many entries"
+                    .to_owned(),
+            });
+        }
+        children.push(
+            child
+                .map_err(|source| recovery_state_io(path, source))?
+                .file_name(),
+        );
+    }
+    Ok(children)
+}
+
+#[cfg(unix)]
+fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
+    let descriptor = match open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::NOENT) => return Err(RecoveryOpenError::Missing),
+        Err(Errno::LOOP) => return Err(RecoveryOpenError::Symlink),
+        Err(source) => return Err(RecoveryOpenError::Io(source.into())),
+    };
+    let file = fs::File::from(descriptor);
+    let metadata = file.metadata().map_err(RecoveryOpenError::Io)?;
+    Ok(RecoveryFile { file, metadata })
+}
+
+#[cfg(not(unix))]
+fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(RecoveryOpenError::Missing);
+        }
+        Err(source) => return Err(RecoveryOpenError::Io(source)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(RecoveryOpenError::Symlink);
+    }
+    let file = fs::File::open(path).map_err(RecoveryOpenError::Io)?;
+    Ok(RecoveryFile { file, metadata })
+}
+
+#[cfg(unix)]
+fn same_recovery_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.mode() == right.mode()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_recovery_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.is_file() == right.is_file()
+        && left.len() == right.len()
+        && left.permissions().readonly() == right.permissions().readonly()
+        && left.modified().ok() == right.modified().ok()
 }
 
 fn ensure_recovery_fingerprint_capacity(
@@ -3249,6 +3623,100 @@ mod tests {
     }
 
     #[test]
+    fn recovery_fingerprint_tracks_attributes_and_sparse_checkout_inputs()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let external = TempRepo::new()?;
+        let external_attributes = external.path().join("attributes");
+        fs::write(&external_attributes, "*.txt text\n")?;
+        repo.run_args(&[
+            "config",
+            "core.attributesFile",
+            &external_attributes.to_string_lossy(),
+        ])?;
+        repo.write(".gitattributes", "*.txt text\n")?;
+        let git = Git::new(repo.path());
+        let info_attributes = git.git_path("info/attributes")?;
+        let sparse_checkout = git.git_path("info/sparse-checkout")?;
+        fs::write(&info_attributes, "*.md text\n")?;
+        fs::write(&sparse_checkout, "/*\n")?;
+        let baseline = git.recovery_state()?;
+
+        for (path, changed, original) in [
+            (
+                repo.path().join(".gitattributes"),
+                "*.txt binary\n",
+                "*.txt text\n",
+            ),
+            (info_attributes.clone(), "*.md binary\n", "*.md text\n"),
+            (sparse_checkout.clone(), "/src/\n", "/*\n"),
+            (
+                external_attributes.clone(),
+                "*.txt binary\n",
+                "*.txt text\n",
+            ),
+        ] {
+            fs::write(&path, changed)?;
+            assert_ne!(git.recovery_state()?, baseline, "{}", path.display());
+            fs::write(path, original)?;
+            assert_eq!(git.recovery_state()?, baseline);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fingerprint_tracks_symlinked_hook_target_contents() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let external = TempRepo::new()?;
+        let target = external.path().join("commit-msg-target");
+        fs::write(&target, "#!/bin/sh\nexit 0\n")?;
+        let mut permissions = fs::metadata(&target)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&target, permissions)?;
+        symlink(&target, repo.path().join(".git/hooks/commit-msg"))?;
+        let git = Git::new(repo.path());
+        let baseline = git.recovery_state()?;
+
+        fs::write(&target, "#!/bin/sh\nexit 1\n")?;
+
+        assert_ne!(git.recovery_state()?, baseline);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fingerprint_rejects_fifo_without_blocking() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        let fifo = repo.path().join("attributes.fifo");
+        let status = Command::new("mkfifo").arg(&fifo).status()?;
+        assert!(status.success());
+        let mut hasher = Sha256::new();
+        let mut entries = 0;
+        let started = Instant::now();
+
+        let Err(error) = hash_recovery_path(
+            &mut hasher,
+            b"fifo",
+            &fifo,
+            Instant::now() + Duration::from_millis(200),
+            &mut entries,
+        ) else {
+            return Err("expected FIFO recovery input to be rejected".into());
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("not a regular file or directory")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
     fn exact_recovery_rejects_changed_merge_control_input() -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_merge_conflict()?;
         repo.write("conflict.txt", "resolved\n")?;
@@ -3437,6 +3905,52 @@ mod tests {
         assert!(matches!(error, GitError::TimedOut { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_not_wait_for_background_hook_pipe_holders() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let background_pid = repo.path().join("background.pid");
+        let detached_pid = repo.path().join("detached.pid");
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s' $! > '{}'\nsetsid sleep 30 &\nprintf '%s' $! > '{}'\n",
+                background_pid.display(),
+                detached_pid.display()
+            ),
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::with_recovery_limits(
+            repo.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            4096,
+        );
+        let started = Instant::now();
+
+        let result = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue);
+
+        for pid_file in [&background_pid, &detached_pid] {
+            if let Ok(pid) = fs::read_to_string(pid_file) {
+                let _status = Command::new("kill")
+                    .args(["-KILL", pid.trim()])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+        result?;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(git.status()?.operation, None);
         Ok(())
     }
 
