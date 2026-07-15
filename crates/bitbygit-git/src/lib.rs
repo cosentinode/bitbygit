@@ -10,6 +10,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::string::FromUtf8Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -74,6 +75,7 @@ const RECOVERY_CONFIG_ENVIRONMENT: &[&str] = &[
 ];
 const RECOVERY_CAPABILITY_UNAVAILABLE: &str =
     "atomic recovery is unavailable because required platform capabilities are missing";
+static NEXT_STAGED_FETCH_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -574,6 +576,78 @@ impl Git {
         branch: &str,
     ) -> Result<Option<String>, GitError> {
         self.ref_oid(&remote_tracking_ref(remote, branch))
+    }
+
+    pub fn fetch_remote_branch_for_plan(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<String, GitError> {
+        let fetch_id = NEXT_STAGED_FETCH_ID.fetch_add(1, Ordering::Relaxed);
+        let staged_ref = format!("refs/bitbygit/fetch/{}-{fetch_id}", std::process::id());
+        let fetch = self.run_args(vec![
+            "fetch".to_owned(),
+            "--no-write-fetch-head".to_owned(),
+            "--no-tags".to_owned(),
+            "--refmap=".to_owned(),
+            "--".to_owned(),
+            remote.to_owned(),
+            format!("+refs/heads/{branch}:{staged_ref}"),
+        ]);
+        if let Err(error) = fetch {
+            let _cleanup =
+                self.run_args(vec!["update-ref".to_owned(), "-d".to_owned(), staged_ref]);
+            return Err(error);
+        }
+
+        let oid = self.ref_oid(&staged_ref).and_then(|oid| {
+            oid.ok_or_else(|| GitError::Parse {
+                message: "staged fetch did not produce a branch target".to_owned(),
+            })
+        });
+        self.run_args(vec!["update-ref".to_owned(), "-d".to_owned(), staged_ref])?;
+        oid
+    }
+
+    pub fn ahead_behind(&self, local: &str, upstream: &str) -> Result<(u32, u32), GitError> {
+        let output = self.run_args(vec![
+            "rev-list".to_owned(),
+            "--left-right".to_owned(),
+            "--count".to_owned(),
+            format!("{local}...{upstream}"),
+        ])?;
+        let mut counts = output.stdout.split_whitespace();
+        let ahead = counts
+            .next()
+            .ok_or_else(|| parse_error("missing ahead count"))?
+            .parse()
+            .map_err(|_| parse_error("ahead count is not a number"))?;
+        let behind = counts
+            .next()
+            .ok_or_else(|| parse_error("missing behind count"))?
+            .parse()
+            .map_err(|_| parse_error("behind count is not a number"))?;
+        if counts.next().is_some() {
+            return Err(parse_error("unexpected extra ahead/behind count"));
+        }
+        Ok((ahead, behind))
+    }
+
+    pub fn publish_remote_tracking(
+        &self,
+        remote: &str,
+        branch: &str,
+        oid: &str,
+        expected_oid: Option<&str>,
+    ) -> Result<GitOutput, GitError> {
+        self.run_args(vec![
+            "update-ref".to_owned(),
+            "-m".to_owned(),
+            "bitbygit pull".to_owned(),
+            remote_tracking_ref(remote, branch),
+            oid.to_owned(),
+            expected_oid.unwrap_or(ZERO_OID).to_owned(),
+        ])
     }
 
     pub fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<GitOutput, GitError> {

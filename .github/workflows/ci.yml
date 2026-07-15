@@ -25,6 +25,19 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Validate release workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="${RUNNER_TEMP}/actionlint"
+          archive="actionlint_1.7.12_linux_amd64.tar.gz"
+          mkdir -p "${tool_dir}"
+          curl -fsSLo "${tool_dir}/${archive}" "https://github.com/rhysd/actionlint/releases/download/v1.7.12/${archive}"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${tool_dir}/${archive}" | sha256sum -c -
+          tar -C "${tool_dir}" -xzf "${tool_dir}/${archive}" actionlint
+          "${tool_dir}/actionlint"
+          bash scripts/test-release-workflow.sh
+
       - name: Format
         run: cargo fmt --all --check
 

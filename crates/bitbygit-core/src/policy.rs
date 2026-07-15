@@ -13,6 +13,12 @@ pub struct EffectivePolicy {
     prompt_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluation {
+    pub requirement: ConfirmationRequirement,
+    pub reasons: Vec<String>,
+}
+
 impl EffectivePolicy {
     pub fn new(config: &AppConfig) -> Self {
         Self {
@@ -52,6 +58,37 @@ impl EffectivePolicy {
             RiskLevel::BlockedByDefault => ConfirmationSetting::Blocked,
         };
         confirmation_requirement(setting)
+    }
+
+    pub fn evaluate_confirmation(
+        &self,
+        risk_level: RiskLevel,
+        operation: OperationKind,
+        branch: Option<&str>,
+    ) -> PolicyEvaluation {
+        let mut requirement = self.confirmation_requirement(risk_level);
+        let mut reasons = vec![format!(
+            "{} risk policy requires {} confirmation",
+            risk_label(risk_level),
+            confirmation_label(requirement)
+        )];
+
+        if let Some(branch) = branch
+            && self.is_protected_branch(branch)
+            && let Some(minimum) = protected_branch_requirement(operation)
+        {
+            requirement = requirement.max(minimum);
+            reasons.push(format!(
+                "protected branch {branch}: {} requires at least {} confirmation",
+                operation.action_label(),
+                confirmation_label(minimum)
+            ));
+        }
+
+        PolicyEvaluation {
+            requirement,
+            reasons,
+        }
     }
 
     pub fn is_operation_disabled(&self, operation: OperationKind) -> bool {
@@ -100,6 +137,52 @@ const fn confirmation_requirement(setting: ConfirmationSetting) -> ConfirmationR
         ConfirmationSetting::VisiblePlan => ConfirmationRequirement::VisiblePlan,
         ConfirmationSetting::ExplicitConfirmation => ConfirmationRequirement::ExplicitConfirmation,
         ConfirmationSetting::Blocked => ConfirmationRequirement::Blocked,
+    }
+}
+
+const fn protected_branch_requirement(operation: OperationKind) -> Option<ConfirmationRequirement> {
+    match operation {
+        OperationKind::Commit
+        | OperationKind::PushCurrentBranch
+        | OperationKind::PushSetUpstream => Some(ConfirmationRequirement::VisiblePlan),
+        OperationKind::PullRebase
+        | OperationKind::Rebase
+        | OperationKind::MergeContinue
+        | OperationKind::MergeAbort
+        | OperationKind::RebaseContinue
+        | OperationKind::RebaseAbort
+        | OperationKind::RebaseSkip => Some(ConfirmationRequirement::ExplicitConfirmation),
+        OperationKind::RefreshStatus
+        | OperationKind::ViewDiff
+        | OperationKind::Fetch
+        | OperationKind::StagePaths
+        | OperationKind::UnstagePaths
+        | OperationKind::StageAll
+        | OperationKind::UnstageAll
+        | OperationKind::PullFastForward
+        | OperationKind::Branches
+        | OperationKind::CheckoutBranch
+        | OperationKind::CreateBranch
+        | OperationKind::MergeFastForward
+        | OperationKind::OpenPullRequest => None,
+    }
+}
+
+const fn risk_label(risk_level: RiskLevel) -> &'static str {
+    match risk_level {
+        RiskLevel::Low => "low",
+        RiskLevel::Medium => "medium",
+        RiskLevel::High => "high",
+        RiskLevel::BlockedByDefault => "blocked-by-default",
+    }
+}
+
+const fn confirmation_label(requirement: ConfirmationRequirement) -> &'static str {
+    match requirement {
+        ConfirmationRequirement::NormalSelection => "normal-selection",
+        ConfirmationRequirement::VisiblePlan => "visible-plan",
+        ConfirmationRequirement::ExplicitConfirmation => "explicit",
+        ConfirmationRequirement::Blocked => "blocked",
     }
 }
 
@@ -191,6 +274,42 @@ mod tests {
             policy.confirmation_requirement(RiskLevel::BlockedByDefault),
             ConfirmationRequirement::Blocked
         );
+    }
+
+    #[test]
+    fn protected_branches_add_operation_specific_reasons_and_minimums() {
+        let mut config = AppConfig::default();
+        config.policy.additional_protected_branches = vec!["production".to_owned()];
+        let policy = EffectivePolicy::new(&config);
+
+        for branch in ["main", "production"] {
+            let commit =
+                policy.evaluate_confirmation(RiskLevel::Low, OperationKind::Commit, Some(branch));
+            assert_eq!(commit.requirement, ConfirmationRequirement::VisiblePlan);
+            assert!(commit.reasons.iter().any(|reason| reason.contains(branch)));
+
+            let rebase = policy.evaluate_confirmation(
+                RiskLevel::Medium,
+                OperationKind::Rebase,
+                Some(branch),
+            );
+            assert_eq!(
+                rebase.requirement,
+                ConfirmationRequirement::ExplicitConfirmation
+            );
+            assert!(rebase.reasons.iter().any(|reason| reason.contains(branch)));
+        }
+
+        let feature = policy.evaluate_confirmation(
+            RiskLevel::Low,
+            OperationKind::Commit,
+            Some("feature/policy"),
+        );
+        assert_eq!(
+            feature.requirement,
+            ConfirmationRequirement::NormalSelection
+        );
+        assert_eq!(feature.reasons.len(), 1);
     }
 
     #[test]

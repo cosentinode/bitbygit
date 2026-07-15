@@ -9,9 +9,54 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Read release metadata
+        id: release
+        shell: bash
+        run: |
+          version="$(cargo pkgid --locked -p bitbygit)"
+          version="${version##*#}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate release tag
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_TAG: v${{ steps.release.outputs.version }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Invalid release tag::Expected a vX.Y.Z tag, got ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "::error title=Release tag mismatch::Expected ${EXPECTED_TAG}, got ${RELEASE_TAG}"
+            exit 1
+          fi
+
   build:
     name: ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -45,26 +90,15 @@ jobs:
         id: release
         shell: bash
         run: |
-          version="$(cargo pkgid --locked -p bitbygit)"
-          version="${version##*#}"
+          version="${{ needs.validate.outputs.version }}"
           package="bitbygit-${version}-${{ matrix.target }}"
           archive="${package}.${{ matrix.archive_extension }}"
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "package=${package}" >> "${GITHUB_OUTPUT}"
-          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
-
-      - name: Validate release tag
-        if: github.event_name == 'push'
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          EXPECTED_TAG: v${{ steps.release.outputs.version }}
-        run: |
-          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
-            echo "::error title=Release tag mismatch::Expected ${EXPECTED_TAG}, got ${RELEASE_TAG}"
-            exit 1
-          fi
+          {
+            echo "version=${version}"
+            echo "package=${package}"
+            echo "archive=${archive}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Build
         run: cargo build --locked --release -p bitbygit --target ${{ matrix.target }}
@@ -119,3 +153,133 @@ jobs:
           name: ${{ steps.release.outputs.archive }}
           path: dist/${{ steps.release.outputs.archive }}
           if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bitbygit-${{ needs.validate.outputs.version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify and publish release assets
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          archives=(
+            "bitbygit-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "bitbygit-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "bitbygit-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "bitbygit-${VERSION}-x86_64-pc-windows-msvc.zip"
+          )
+          assets=()
+
+          for archive in "${archives[@]}"; do
+            asset="dist/${archive}"
+            if [[ ! -f "${asset}" ]]; then
+              echo "::error title=Missing release archive::Expected ${archive}"
+              exit 1
+            fi
+            assets+=("${asset}")
+          done
+
+          (
+            cd dist
+            sha256sum "${archives[@]}" > SHA256SUMS
+          )
+
+          verify_tag_target() {
+            tag_target="$(gh api "repos/${GH_REPO}/git/ref/tags/${GITHUB_REF_NAME}" \
+              --jq '.object | [.type, .sha] | @tsv')"
+            read -r target_type target_sha <<< "${tag_target}"
+
+            while [[ "${target_type}" == "tag" ]]; do
+              tag_target="$(gh api "repos/${GH_REPO}/git/tags/${target_sha}" \
+                --jq '.object | [.type, .sha] | @tsv')"
+              read -r target_type target_sha <<< "${tag_target}"
+            done
+
+            if [[ "${target_type}" != "commit" || "${target_sha}" != "${RELEASE_SHA}" ]]; then
+              echo "::error title=Release tag moved::Expected ${GITHUB_REF_NAME} to target ${RELEASE_SHA}, got ${target_type} ${target_sha}"
+              exit 1
+            fi
+          }
+
+          verify_immutable_releases() {
+            if [[ "$(gh api "repos/${GH_REPO}/immutable-releases" --jq '.enabled')" != "true" ]]; then
+              echo "::error title=Immutable releases disabled::Repository immutable releases must be enabled"
+              return 1
+            fi
+          }
+
+          cleanup_draft=false
+          cleanup_draft_on_exit() {
+            status=$?
+            trap - EXIT
+
+            if [[ "${cleanup_draft}" == "true" ]] && \
+              [[ "$(gh release view "${GITHUB_REF_NAME}" --repo "${GH_REPO}" \
+                --json isDraft --jq '.isDraft' 2>/dev/null || true)" == "true" ]]; then
+              gh release delete "${GITHUB_REF_NAME}" --repo "${GH_REPO}" --yes || \
+                echo "::error title=Draft cleanup failed::Delete the incomplete ${GITHUB_REF_NAME} draft before retrying"
+            fi
+
+            exit "${status}"
+          }
+          trap cleanup_draft_on_exit EXIT
+
+          verify_tag_target
+          verify_immutable_releases
+
+          existing_draft="$(gh release view "${GITHUB_REF_NAME}" --repo "${GH_REPO}" \
+            --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+          if [[ -n "${existing_draft}" ]]; then
+            if [[ "${existing_draft}" != "true" ]]; then
+              echo "::error title=Release already published::Refusing to replace ${GITHUB_REF_NAME}"
+              exit 1
+            fi
+            gh release delete "${GITHUB_REF_NAME}" --repo "${GH_REPO}" --yes
+          fi
+
+          cleanup_draft=true
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GH_REPO}" \
+            --target "${RELEASE_SHA}" \
+            --verify-tag \
+            --draft \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "${assets[@]}" \
+            dist/SHA256SUMS
+
+          verify_tag_target
+          verify_immutable_releases
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GH_REPO}" \
+            --verify-tag \
+            --draft=false
+          cleanup_draft=false
+
+          verify_tag_target
+          if [[ "$(gh release view "${GITHUB_REF_NAME}" --repo "${GH_REPO}" \
+            --json isImmutable --jq '.isImmutable')" != "true" ]]; then
+            gh release delete "${GITHUB_REF_NAME}" --repo "${GH_REPO}" --yes
+            echo "::error title=Mutable release::Expected ${GITHUB_REF_NAME} to be immutable"
+            exit 1
+          fi
