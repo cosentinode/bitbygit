@@ -34,7 +34,7 @@ workspace_version="$(perl -ne '
   if ($workspace && /^version = "([^"]+)"$/) { print $1; exit }
 ' "${root}/Cargo.toml")"
 [[ -n "${workspace_version}" ]] || fail "workspace version was not found"
-validator_host_target="$(rustc -vV | perl -ne 'if (/^host: (.+)$/) { print $1; exit }')"
+validator_host_target="$(rustc -vV | perl -ne 'print $1 if /^host: (.+)$/')"
 [[ -n "${validator_host_target}" ]] || fail "rustc host target was not found"
 selected_version=2.3.4
 [[ "${selected_version}" != "${workspace_version}" && "${selected_version}" != "0.1.0" ]] || fail "selected validator version must differ from the documented example"
