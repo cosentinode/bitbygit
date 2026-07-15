@@ -36,6 +36,12 @@ prompts. Pull request creation from `open pr` remains Phase 11 work in
 [#13](https://github.com/cosentinode/bitbygit/issues/13). See
 [`docs/mvp-phases.md`](docs/mvp-phases.md) for the implementation roadmap.
 
+## Configuration
+
+User policy is defined in `config.toml`; see
+[`docs/configuration.md`](docs/configuration.md) for path resolution, the strict
+schema, and safe fallback behavior.
+
 ## Development
 
 Prerequisites:

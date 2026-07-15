@@ -1,3 +1,4 @@
+pub mod config;
 pub mod prompt_parser;
 
 pub const APP_NAME: &str = "bitbygit";

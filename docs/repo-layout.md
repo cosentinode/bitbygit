@@ -29,6 +29,7 @@ bitbygit/
       0001-system-git-first.md
     architecture.md
     command-planner.md
+    configuration.md
     guardrails.md
     mvp-phases.md
     repo-layout.md
