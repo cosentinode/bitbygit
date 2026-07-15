@@ -696,6 +696,7 @@ enum PendingPayload {
         upstream: String,
         remote: String,
         upstream_branch: String,
+        tracking_oid: Option<String>,
         upstream_oid: Option<String>,
     },
     PullRebase {
@@ -704,6 +705,7 @@ enum PendingPayload {
         upstream: String,
         remote: String,
         upstream_branch: String,
+        tracking_oid: Option<String>,
         upstream_oid: Option<String>,
     },
     Commit {
@@ -2134,7 +2136,11 @@ impl OperationPlanner {
                 "Pull blocked: upstream config does not match {upstream}."
             ));
         }
-        git.fetch_remote_branch(&remote, &upstream_branch)
+        let tracking_oid = git
+            .remote_tracking_oid(&remote, &upstream_branch)
+            .map_err(|error| format!("Unable to snapshot pull tracking ref: {error}"))?;
+        let upstream_oid = git
+            .fetch_remote_branch_for_plan(&remote, &upstream_branch)
             .map_err(|error| format!("Unable to fetch pull target: {error}"))?;
         let status = git
             .status()
@@ -2145,16 +2151,20 @@ impl OperationPlanner {
         if status.branch.upstream.as_deref() != Some(upstream.as_str()) {
             return Err("Pull blocked: upstream changed during fetch.".to_owned());
         }
-        if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
+        let local_oid = head_target
+            .oid
+            .as_deref()
+            .ok_or_else(|| "Pull blocked: current branch has no commit.".to_owned())?;
+        let (ahead, behind) = git
+            .ahead_behind(local_oid, &upstream_oid)
+            .map_err(|error| format!("Unable to compare pull target: {error}"))?;
+        if ahead > 0 && behind > 0 && !rebase {
             return Err("Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned());
         }
         if rebase && !status.is_clean() {
             return Err("Pull rebase blocked: working tree must be clean.".to_owned());
         }
-        let upstream_oid = git
-            .remote_tracking_oid(&remote, &upstream_branch)
-            .map_err(|error| format!("Unable to snapshot pull upstream: {error}"))?;
-        let plan = pull_plan(rebase, &upstream, status.branch.behind);
+        let plan = pull_plan(rebase, &upstream, behind);
         let payload = if rebase {
             PendingPayload::PullRebase {
                 local_branch,
@@ -2162,7 +2172,8 @@ impl OperationPlanner {
                 upstream,
                 remote,
                 upstream_branch,
-                upstream_oid,
+                tracking_oid,
+                upstream_oid: Some(upstream_oid),
             }
         } else {
             PendingPayload::Pull {
@@ -2171,7 +2182,8 @@ impl OperationPlanner {
                 upstream,
                 remote,
                 upstream_branch,
-                upstream_oid,
+                tracking_oid,
+                upstream_oid: Some(upstream_oid),
             }
         };
         Ok(PreparedOperation::new(
@@ -2723,9 +2735,6 @@ fn validate_pull_plan(
     if status.branch.upstream.as_deref() != Some(expected_upstream) {
         return Err("Pull blocked: upstream changed since the plan was shown.".to_owned());
     }
-    if status.branch.ahead > 0 && status.branch.behind > 0 && !rebase {
-        return Err("Pull blocked: branch has diverged. Use `pull --rebase` explicitly or resolve manually.".to_owned());
-    }
     if rebase && !status.is_clean() {
         return Err("Pull rebase blocked: working tree must be clean.".to_owned());
     }
@@ -2809,19 +2818,28 @@ fn compact_queue_panel(app: &App, width: u16) -> Paragraph<'_> {
         .pending()
         .map(|operation| {
             let plan = &operation.plan;
-            vec![
-                Line::from(format!(
-                    "Keys: {}",
-                    compact_accepted_confirmation_keys(plan, width)
-                )),
-                Line::from(format!("Policy: {}", compact_policy_reason(plan))),
-                Line::from(format!("Confirm: {}", confirmation_action(plan))),
-            ]
+            if width < 30 {
+                vec![
+                    Line::from(format!(
+                        "Keys: {}",
+                        compact_accepted_confirmation_keys(plan, width)
+                    )),
+                    Line::from(tiny_policy_reason(plan)),
+                    Line::from(confirmation_action(plan)),
+                ]
+            } else {
+                vec![
+                    Line::from(format!(
+                        "Keys: {}",
+                        compact_accepted_confirmation_keys(plan, width)
+                    )),
+                    Line::from(format!("Policy: {}", compact_policy_reason(plan))),
+                    Line::from(format!("Confirm: {}", confirmation_action(plan))),
+                ]
+            }
         })
         .unwrap_or_default();
-    Paragraph::new(text)
-        .block(panel_block("Pending confirmation", false))
-        .wrap(Wrap { trim: true })
+    Paragraph::new(text).block(panel_block("Pending confirmation", false))
 }
 
 fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
@@ -2888,6 +2906,17 @@ fn compact_policy_reason(plan: &OperationPlan) -> String {
             .to_owned();
     }
     controlling.to_owned()
+}
+
+fn tiny_policy_reason(plan: &OperationPlan) -> String {
+    let reason = compact_policy_reason(plan);
+    if let Some(branch) = reason.strip_prefix("protected branch ") {
+        return format!("Protected: {}", branch.chars().take(7).collect::<String>());
+    }
+    if let Some((risk, requirement)) = reason.split_once(" risk: ") {
+        return format!("{risk}: {requirement}");
+    }
+    format!("Policy: {reason}")
 }
 
 fn compact_accepted_confirmation_keys(plan: &OperationPlan, width: u16) -> &'static str {
@@ -3371,6 +3400,7 @@ impl PlanExecutor {
             upstream,
             remote,
             upstream_branch,
+            tracking_oid,
             upstream_oid,
         } = typed_payload(context, OperationKind::PullFastForward)?
         else {
@@ -3378,7 +3408,17 @@ impl PlanExecutor {
         };
         validate_pull_plan(git, false, local_branch, upstream, target)
             .map_err(StepExecutionError::Blocked)?;
-        git_output(git.pull_ff_only_from(remote, upstream_branch, upstream_oid.as_deref(), target))
+        let upstream_oid = upstream_oid.as_deref().ok_or_else(|| {
+            StepExecutionError::Blocked("Pull blocked: fetched upstream is unavailable.".to_owned())
+        })?;
+        git.publish_remote_tracking(
+            remote,
+            upstream_branch,
+            upstream_oid,
+            tracking_oid.as_deref(),
+        )
+        .map_err(StepExecutionError::Git)?;
+        git_output(git.pull_ff_only_from(remote, upstream_branch, Some(upstream_oid), target))
     }
 
     fn run_pull_rebase_step(
@@ -3394,6 +3434,7 @@ impl PlanExecutor {
             upstream,
             remote,
             upstream_branch,
+            tracking_oid,
             upstream_oid,
         } = typed_payload(context, OperationKind::PullRebase)?
         else {
@@ -3401,7 +3442,19 @@ impl PlanExecutor {
         };
         validate_pull_plan(git, true, local_branch, upstream, target)
             .map_err(StepExecutionError::Blocked)?;
-        git_output(git.pull_rebase_from(remote, upstream_branch, upstream_oid.as_deref(), target))
+        let upstream_oid = upstream_oid.as_deref().ok_or_else(|| {
+            StepExecutionError::Blocked(
+                "Pull rebase blocked: fetched upstream is unavailable.".to_owned(),
+            )
+        })?;
+        git.publish_remote_tracking(
+            remote,
+            upstream_branch,
+            upstream_oid,
+            tracking_oid.as_deref(),
+        )
+        .map_err(StepExecutionError::Git)?;
+        git_output(git.pull_rebase_from(remote, upstream_branch, Some(upstream_oid), target))
     }
 
     fn run_checkout_step(
@@ -6452,6 +6505,160 @@ mod tests {
     }
 
     #[test]
+    fn allowed_pull_publishes_staged_tracking_ref_only_during_execution()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, branch, original_tracking_oid) = stale_pull_tracking_repo("allowed-pull")?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::Pull { rebase: false })
+            .map_err(std::io::Error::other)?;
+        let fetched_oid = match operation.context.payload.as_ref() {
+            Some(PendingPayload::Pull { upstream_oid, .. }) => upstream_oid
+                .clone()
+                .ok_or_else(|| std::io::Error::other("expected fetched upstream"))?,
+            _ => return Err(std::io::Error::other("expected pull payload").into()),
+        };
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            original_tracking_oid
+        );
+
+        let result =
+            PlanExecutor::with_audit_paths(&repo, isolated_store_paths("allowed-pull-audit")?)
+                .execute(&operation.plan, operation.context);
+
+        assert!(result.succeeded(), "{}", result.message());
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            fetched_oid
+        );
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "HEAD"])?.trim(),
+            fetched_oid
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pull_fetch_stages_tracking_update_until_changed_policy_is_revalidated()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, branch, original_tracking_oid) =
+            stale_pull_tracking_repo("in-flight-pull-policy")?;
+        let paths = isolated_store_paths("in-flight-pull-policy-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh = policy_changing_ssh(
+            "in-flight-pull-policy",
+            &store.paths().config_file,
+            "medium",
+            "blocked",
+        )?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+
+        let operation = planner
+            .plan_request(OperationRequest::Pull { rebase: false })
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            original_tracking_oid
+        );
+        let executor = PlanExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(paths.clone()),
+            policy: effective_policy_from_paths(&paths)
+                .ok_or_else(|| std::io::Error::other("expected changed policy"))?,
+            ssh_executable: None,
+        };
+        let result = executor.execute(&operation.plan, operation.context);
+
+        assert!(!result.succeeded());
+        let message = result.message();
+        assert!(
+            message.contains("policy now requires the operation to be blocked"),
+            "{message}"
+        );
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            original_tracking_oid
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_pull_fetch_revalidates_changed_policy_before_publishing_tracking_ref()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, branch, original_tracking_oid) =
+            stale_pull_tracking_repo("deferred-in-flight-pull-policy")?;
+        let planner = OperationPlanner::new(&repo);
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Branches,
+                OperationRequest::Pull { rebase: false },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("deferred-in-flight-pull-policy-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh = policy_changing_ssh(
+            "deferred-in-flight-pull-policy",
+            &store.paths().config_file,
+            "medium",
+            "blocked",
+        )?;
+        let executor = PromptSequenceExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+
+        let result =
+            executor.execute_confirmed(sequence.sequence, ConfirmationRequirement::VisiblePlan);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 2."),
+            "{message}"
+        );
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            original_tracking_oid
+        );
+        Ok(())
+    }
+
+    #[test]
     fn deferred_blocked_pull_does_not_fetch_remote_tracking_ref() -> Result<(), Box<dyn Error>> {
         let (repo, branch, original_tracking_oid) =
             stale_pull_tracking_repo("deferred-blocked-pull")?;
@@ -7151,6 +7358,7 @@ mod tests {
                     upstream: "origin/main".to_owned(),
                     remote: "origin".to_owned(),
                     upstream_branch: "main".to_owned(),
+                    tracking_oid: None,
                     upstream_oid: Some("abcdef1234567890".to_owned()),
                 },
             ),
@@ -7618,7 +7826,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_queue_renders_compact_confirmation_keys_and_policy_reason() -> Result<(), Box<dyn Error>>
+    fn tiny_queue_renders_keys_policy_reason_and_confirmation_action() -> Result<(), Box<dyn Error>>
     {
         let mut plan = OperationPlan::new(
             OperationRequest::PromptSequence {
@@ -7655,8 +7863,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Keys: Y/n/Esc"), "{rendered}");
-        assert!(rendered.contains("Policy: protected"), "{rendered}");
-        assert!(rendered.contains("branch production"), "{rendered}");
+        assert!(rendered.contains("Protected: product"), "{rendered}");
+        assert!(rendered.contains("run 2 prompt steps"), "{rendered}");
         Ok(())
     }
 
@@ -7939,6 +8147,32 @@ mod tests {
             Ok(command) => Ok(command.clone()),
             Err(error) => Err(std::io::Error::other(error.clone()).into()),
         }
+    }
+
+    fn policy_changing_ssh(
+        name: &str,
+        config_file: &std::path::Path,
+        risk: &str,
+        setting: &str,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let root = isolated_temp_root(&format!("{name}-ssh"))?;
+        std::fs::create_dir_all(&root)?;
+        let executable = root.join("ssh");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'schema-version = 1' '[policy.confirmation]' '{risk} = \"{setting}\"' > '{}'\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\nexec git-upload-pack \"$target\"\n",
+                config_file.display()
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&executable)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions)?;
+        }
+        Ok(executable)
     }
 
     fn fake_gh(name: &str, existing: bool) -> Result<PathBuf, Box<dyn Error>> {
