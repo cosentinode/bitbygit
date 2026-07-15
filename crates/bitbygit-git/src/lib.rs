@@ -54,6 +54,8 @@ const RECOVERY_CONTROL_PATHS: &[&str] = &[
     "MERGE_HEAD",
     "MERGE_MSG",
     "MERGE_MODE",
+    "MERGE_AUTOSTASH",
+    "MERGE_RR",
     "AUTO_MERGE",
     "SQUASH_MSG",
     "REBASE_HEAD",
@@ -63,6 +65,7 @@ const RECOVERY_CONTROL_PATHS: &[&str] = &[
     "rebase-apply",
     "rebase-merge",
     "sequencer",
+    "rr-cache",
     "info/attributes",
     "info/sparse-checkout",
 ];
@@ -285,6 +288,7 @@ impl Git {
         operation: RepositoryOperation,
         action: RecoveryAction,
     ) -> Result<GitOutput, GitError> {
+        ensure_recovery_execution_supported(operation, action)?;
         let deadline = Instant::now() + self.recovery_execution_timeout;
         self.validate_recovery_until(operation, action, deadline)?;
         self.run_recovery_args_until(operation, action, deadline)
@@ -335,6 +339,7 @@ impl Git {
     where
         F: FnOnce() -> Result<(), GitError>,
     {
+        ensure_recovery_execution_supported(operation, action)?;
         self.validate_recovery_action(operation, action)?;
         let deadline = Instant::now() + self.recovery_execution_timeout;
         self.run_recovery_args_until_with(operation, action, deadline, || {
@@ -1931,6 +1936,31 @@ fn kill_process_tree(child: &mut Child) {
     let _result = child.kill();
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_recovery_execution_supported(
+    _operation: RepositoryOperation,
+    _action: RecoveryAction,
+) -> Result<(), GitError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_recovery_execution_supported(
+    operation: RepositoryOperation,
+    action: RecoveryAction,
+) -> Result<(), GitError> {
+    Err(GitError::Blocked {
+        message: format!(
+            "{} {} is blocked on {} because bitbygit cannot guarantee bounded Git output and descendant process cleanup on this platform; review the repository state and run `git {} --{}` manually, or use bitbygit on Linux",
+            operation.label(),
+            action.label(),
+            env::consts::OS,
+            operation.label(),
+            action.label()
+        ),
+    })
+}
+
 fn hash_recovery_path(
     hasher: &mut Sha256,
     label: &[u8],
@@ -1938,17 +1968,35 @@ fn hash_recovery_path(
     deadline: Instant,
     entries: &mut usize,
 ) -> Result<(), GitError> {
-    hash_recovery_path_inner(hasher, label, path, deadline, entries, 0)
+    hash_recovery_path_with(hasher, label, path, deadline, entries, &mut |_, _| Ok(()))
 }
 
-fn hash_recovery_path_inner(
+fn hash_recovery_path_with<F>(
+    hasher: &mut Sha256,
+    label: &[u8],
+    path: &Path,
+    deadline: Instant,
+    entries: &mut usize,
+    after_contents: &mut F,
+) -> Result<(), GitError>
+where
+    F: FnMut(&Path, RecoveryPathKind) -> Result<(), GitError>,
+{
+    hash_recovery_path_inner(hasher, label, path, deadline, entries, 0, after_contents)
+}
+
+fn hash_recovery_path_inner<F>(
     hasher: &mut Sha256,
     label: &[u8],
     path: &Path,
     deadline: Instant,
     entries: &mut usize,
     symlink_depth: usize,
-) -> Result<(), GitError> {
+    after_contents: &mut F,
+) -> Result<(), GitError>
+where
+    F: FnMut(&Path, RecoveryPathKind) -> Result<(), GitError>,
+{
     ensure_recovery_fingerprint_capacity(deadline, entries)?;
     hash_field(hasher, label);
     let opened = match open_recovery_file(path) {
@@ -1968,22 +2016,38 @@ fn hash_recovery_path_inner(
             }
             *entries += 1;
             hash_field(hasher, b"symlink");
+            let metadata = recovery_symlink_metadata(path)?;
             let target = fs::read_link(path).map_err(|source| recovery_state_io(path, source))?;
+            let read_metadata = recovery_symlink_metadata(path)?;
+            if !same_recovery_file(&metadata, &read_metadata) {
+                return Err(recovery_path_changed(path));
+            }
             hash_field(hasher, target.as_os_str().as_encoded_bytes());
             ensure_recovery_fingerprint_capacity(deadline, entries)?;
-            let target = if target.is_absolute() {
-                target
+            let resolved_target = if target.is_absolute() {
+                target.clone()
             } else {
-                path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(&target)
             };
-            return hash_recovery_path_inner(
+            hash_recovery_path_inner(
                 hasher,
                 label,
-                &target,
+                &resolved_target,
                 deadline,
                 entries,
                 symlink_depth + 1,
-            );
+                after_contents,
+            )?;
+            after_contents(path, RecoveryPathKind::Symlink)?;
+            let final_target =
+                fs::read_link(path).map_err(|source| recovery_state_io(path, source))?;
+            let final_metadata = recovery_symlink_metadata(path)?;
+            if final_target != target || !same_recovery_file(&metadata, &final_metadata) {
+                return Err(recovery_path_changed(path));
+            }
+            return Ok(());
         }
         Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
     };
@@ -2054,18 +2118,24 @@ fn hash_recovery_path_inner(
                 deadline,
                 entries,
                 symlink_depth,
+                after_contents,
             )?;
         }
+        after_contents(path, RecoveryPathKind::Directory)?;
         let final_metadata = file
             .metadata()
             .map_err(|source| recovery_state_io(path, source))?;
-        if !same_recovery_file(&metadata, &final_metadata) {
-            return Err(GitError::Blocked {
-                message: format!(
-                    "recovery planning is blocked because {} changed while it was fingerprinted",
-                    path.display()
-                ),
-            });
+        let path_metadata = match open_recovery_file(path) {
+            Ok(reopened) => reopened.metadata,
+            Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
+            Err(RecoveryOpenError::Missing | RecoveryOpenError::Symlink) => {
+                return Err(recovery_path_changed(path));
+            }
+        };
+        if !same_recovery_file(&metadata, &final_metadata)
+            || !same_recovery_file(&metadata, &path_metadata)
+        {
+            return Err(recovery_path_changed(path));
         }
     } else {
         return Err(GitError::Blocked {
@@ -2076,6 +2146,29 @@ fn hash_recovery_path_inner(
         });
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryPathKind {
+    Symlink,
+    Directory,
+}
+
+fn recovery_symlink_metadata(path: &Path) -> Result<fs::Metadata, GitError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| recovery_state_io(path, source))?;
+    if !metadata.file_type().is_symlink() {
+        return Err(recovery_path_changed(path));
+    }
+    Ok(metadata)
+}
+
+fn recovery_path_changed(path: &Path) -> GitError {
+    GitError::Blocked {
+        message: format!(
+            "recovery planning is blocked because {} changed while it was fingerprinted",
+            path.display()
+        ),
+    }
 }
 
 struct RecoveryFile {
@@ -3668,6 +3761,33 @@ mod tests {
     }
 
     #[test]
+    fn recovery_fingerprint_tracks_autostash_and_rerere_state() -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let baseline = git.recovery_state()?;
+
+        for relative in ["MERGE_AUTOSTASH", "MERGE_RR"] {
+            let path = git.git_path(relative)?;
+            fs::write(&path, format!("{original_head}\n"))?;
+            assert_ne!(git.recovery_state()?, baseline, "{relative}");
+            fs::remove_file(path)?;
+            assert_eq!(git.recovery_state()?, baseline, "{relative}");
+        }
+
+        let rr_cache = git.git_path("rr-cache")?;
+        let rr_cache_existed = rr_cache.exists();
+        fs::create_dir_all(&rr_cache)?;
+        fs::write(rr_cache.join("review-regression"), "changed rerere state\n")?;
+        assert_ne!(git.recovery_state()?, baseline, "rr-cache");
+        fs::remove_file(rr_cache.join("review-regression"))?;
+        if !rr_cache_existed {
+            fs::remove_dir(rr_cache)?;
+        }
+        assert_eq!(git.recovery_state()?, baseline, "rr-cache");
+        Ok(())
+    }
+
+    #[test]
     fn recovery_fingerprint_tracks_attributes_and_sparse_checkout_inputs()
     -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
@@ -3733,6 +3853,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recovery_fingerprint_rejects_synchronized_symlink_retarget() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let repo = TempRepo::new()?;
+        let first = repo.path().join("first-hook");
+        let second = repo.path().join("second-hook");
+        let hook = repo.path().join("commit-msg");
+        let replacement = repo.path().join("replacement-link");
+        fs::write(&first, "same hook contents\n")?;
+        fs::write(&second, "same hook contents\n")?;
+        symlink(&first, &hook)?;
+        symlink(&second, &replacement)?;
+        let mut hasher = Sha256::new();
+        let mut entries = 0;
+        let mut replaced = false;
+
+        let Err(error) = hash_recovery_path_with(
+            &mut hasher,
+            b"hook",
+            &hook,
+            Instant::now() + Duration::from_secs(2),
+            &mut entries,
+            &mut |path, kind| {
+                if path == hook && kind == RecoveryPathKind::Symlink {
+                    fs::rename(&replacement, &hook)
+                        .map_err(|source| recovery_state_io(path, source))?;
+                    replaced = true;
+                }
+                Ok(())
+            },
+        ) else {
+            return Err("expected a retargeted symlink to be rejected".into());
+        };
+
+        assert!(replaced);
+        assert!(
+            error
+                .to_string()
+                .contains("changed while it was fingerprinted")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fingerprint_rejects_synchronized_directory_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        let hooks = repo.path().join("hooks");
+        let original = repo.path().join("original-hooks");
+        let replacement = repo.path().join("replacement-hooks");
+        fs::create_dir(&hooks)?;
+        fs::write(hooks.join("commit-msg"), "same hook contents\n")?;
+        fs::create_dir(&replacement)?;
+        fs::write(replacement.join("commit-msg"), "same hook contents\n")?;
+        let mut hasher = Sha256::new();
+        let mut entries = 0;
+        let mut replaced = false;
+
+        let Err(error) = hash_recovery_path_with(
+            &mut hasher,
+            b"hooks",
+            &hooks,
+            Instant::now() + Duration::from_secs(2),
+            &mut entries,
+            &mut |path, kind| {
+                if path == hooks && kind == RecoveryPathKind::Directory {
+                    fs::rename(&hooks, &original)
+                        .map_err(|source| recovery_state_io(path, source))?;
+                    fs::rename(&replacement, &hooks)
+                        .map_err(|source| recovery_state_io(path, source))?;
+                    replaced = true;
+                }
+                Ok(())
+            },
+        ) else {
+            return Err("expected a replaced directory to be rejected".into());
+        };
+
+        assert!(replaced);
+        assert!(
+            error
+                .to_string()
+                .contains("changed while it was fingerprinted")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recovery_fingerprint_rejects_fifo_without_blocking() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         let fifo = repo.path().join("attributes.fifo");
@@ -3790,6 +4000,31 @@ mod tests {
             &expected,
         ) else {
             return Err("expected changed merge metadata to block recovery".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_changed_merge_autostash() -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let autostash = git.git_path("MERGE_AUTOSTASH")?;
+        fs::write(&autostash, format!("{original_head}\n"))?;
+        let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+        let merge_head = fs::read_to_string(git.git_path("MERGE_HEAD")?)?;
+        fs::write(&autostash, merge_head)?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected changed merge autostash to block recovery".into());
         };
 
         assert!(error.to_string().contains("state changed after preview"));
@@ -3962,6 +4197,88 @@ mod tests {
 
         assert!(matches!(error, GitError::TimedOut { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_timeout_terminates_hook_descendants() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let descendant_pid = repo.path().join("descendant.pid");
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s' $! > '{}'\nwait\n",
+                descendant_pid.display()
+            ),
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::with_recovery_limits(
+            repo.path(),
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            4096,
+        );
+
+        let Err(error) = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue) else {
+            return Err("expected hanging recovery hook to time out".into());
+        };
+
+        assert!(matches!(error, GitError::TimedOut { .. }));
+        let pid = fs::read_to_string(descendant_pid)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()?
+                .success()
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()?
+                .success(),
+            "hook descendant {pid} survived recovery timeout"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_execution_capability_is_available() -> Result<(), Box<dyn Error>> {
+        ensure_recovery_execution_supported(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn recovery_execution_capability_fails_closed_after_planning() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected recovery execution to fail closed".into());
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("cannot guarantee bounded Git output"));
+        assert!(message.contains("descendant process cleanup"));
+        assert!(message.contains("git merge --abort"));
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         Ok(())
     }

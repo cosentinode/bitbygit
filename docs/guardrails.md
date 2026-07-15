@@ -124,6 +124,10 @@ Conflict recovery actions are high risk because they move repository state.
 BitByGit revalidates bounded recovery inputs immediately before invoking Git and
 surfaces Git's own operation-state failures. This narrows but does not claim to
 eliminate the cross-process scheduling window for external worktree writers.
+Recovery planning remains available on all release platforms. Recovery execution
+fails closed with a manual-command diagnostic on platforms where BitByGit cannot
+guarantee both hard output bounds and descendant process cleanup; currently,
+execution is supported on Linux.
 
 ## Confirmation Copy
 

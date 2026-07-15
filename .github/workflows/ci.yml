@@ -49,3 +49,23 @@ jobs:
 
       - name: Build
         run: cargo build --locked --workspace
+
+  recovery-platforms:
+    name: Recovery safety (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify fail-closed recovery execution
+        run: cargo test --locked -p bitbygit-git recovery_execution_capability
