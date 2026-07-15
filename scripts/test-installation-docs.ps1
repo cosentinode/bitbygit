@@ -221,6 +221,7 @@ try {
     if ($ErrorActionPreference -ne "Continue") { Fail "failed source block changed the caller error preference" }
     if ($env:Path -ne $OriginalProcessPath) { Fail "failed source block changed the process PATH" }
 
+    $global:LASTEXITCODE = 0
     Write-Output "installation docs validation passed on Windows"
 } finally {
     $env:LOCALAPPDATA = $OriginalLocalAppData
