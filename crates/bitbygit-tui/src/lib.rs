@@ -618,6 +618,7 @@ struct QueuedPromptSequence {
     first: PreparedOperation,
     remaining_requests: Vec<OperationRequest>,
     policy_evaluations: Vec<PolicyEvaluation>,
+    sequence_policy_evaluations: Vec<PolicyEvaluation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,11 +649,13 @@ impl QueuedPromptSequence {
         first: PreparedOperation,
         remaining_requests: Vec<OperationRequest>,
         policy_evaluations: Vec<PolicyEvaluation>,
+        sequence_policy_evaluations: Vec<PolicyEvaluation>,
     ) -> Self {
         Self {
             first,
             remaining_requests,
             policy_evaluations,
+            sequence_policy_evaluations,
         }
     }
 
@@ -1330,6 +1333,16 @@ fn evaluate_plan_policy(
     )
 }
 
+fn evaluate_sequence_plan_policy(
+    policy: &EffectivePolicy,
+    plan: &OperationPlan,
+    branch: Option<&str>,
+) -> PolicyEvaluation {
+    combined_policy_evaluation(plan.steps.iter().map(|step| {
+        policy.evaluate_confirmation(sequence_step_risk(step.risk_level), step.kind, branch)
+    }))
+}
+
 fn combined_policy_evaluation(
     evaluations: impl IntoIterator<Item = PolicyEvaluation>,
 ) -> PolicyEvaluation {
@@ -1898,12 +1911,17 @@ impl OperationPlanner {
             prompt_sequence_policy_evaluations(&self.policy, &self.git(), &requests, branch)?;
         apply_policy_evaluation(
             &mut plan,
-            combined_policy_evaluation(sequence_policy_evaluations),
+            combined_policy_evaluation(sequence_policy_evaluations.clone()),
         );
         let remaining_requests = requests.into_iter().skip(1).collect();
         Ok(PreparedPromptSequence::new(
             plan,
-            QueuedPromptSequence::new(first, remaining_requests, policy_evaluations),
+            QueuedPromptSequence::new(
+                first,
+                remaining_requests,
+                policy_evaluations,
+                sequence_policy_evaluations,
+            ),
         ))
     }
 
@@ -2735,8 +2753,8 @@ fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
             risk_label(plan.confirmation.risk_level)
         ),
         format!("Accepted keys: {}", accepted_confirmation_keys(plan)),
-        format!("Confirm: {}", confirmation_copy(plan)),
         format!("Policy: {}", policy_reason(plan)),
+        format!("Confirm: {}", confirmation_copy(plan)),
         format!("Steps: {}", plan_steps_summary(plan)),
     ]
 }
@@ -3606,11 +3624,16 @@ impl PromptSequenceExecutor {
             first,
             remaining_requests,
             policy_evaluations,
+            sequence_policy_evaluations,
         } = sequence;
         let mut previewed_policies = policy_evaluations.into_iter();
+        let mut previewed_sequence_policies = sequence_policy_evaluations.into_iter();
         let mut step_results = Vec::with_capacity(total_steps);
 
-        let Some(previewed_policy) = previewed_policies.next() else {
+        let (Some(previewed_policy), Some(previewed_sequence_policy)) = (
+            previewed_policies.next(),
+            previewed_sequence_policies.next(),
+        ) else {
             step_results.push(PromptSequenceStepResult::planning_failed(
                 1,
                 first.plan.title.clone(),
@@ -3619,13 +3642,20 @@ impl PromptSequenceExecutor {
             return PromptSequenceExecutionResult::new(total_steps, step_results);
         };
         let current_policy = self.load_policy();
-        let current_evaluation =
-            evaluate_plan_policy(&current_policy, &first.plan, policy_branch(&first.context));
+        let branch = policy_branch(&first.context);
+        let current_evaluation = evaluate_plan_policy(&current_policy, &first.plan, branch);
+        let current_sequence_evaluation =
+            evaluate_sequence_plan_policy(&current_policy, &first.plan, branch);
         if !confirmation_covers(
             &first.plan,
             confirmed_requirement,
             &previewed_policy,
             &current_evaluation,
+        ) || !confirmation_covers(
+            &first.plan,
+            confirmed_requirement,
+            &previewed_sequence_policy,
+            &current_sequence_evaluation,
         ) {
             step_results.push(PromptSequenceStepResult::planning_failed(
                 1,
@@ -3669,7 +3699,10 @@ impl PromptSequenceExecutor {
                     return PromptSequenceExecutionResult::new(total_steps, step_results);
                 }
             };
-            let Some(previewed_policy) = previewed_policies.next() else {
+            let (Some(previewed_policy), Some(previewed_sequence_policy)) = (
+                previewed_policies.next(),
+                previewed_sequence_policies.next(),
+            ) else {
                 step_results.push(PromptSequenceStepResult::planning_failed(
                     step_number,
                     operation.plan.title.clone(),
@@ -3678,16 +3711,20 @@ impl PromptSequenceExecutor {
                 return PromptSequenceExecutionResult::new(total_steps, step_results);
             };
             let current_policy = self.load_policy();
-            let current_evaluation = evaluate_plan_policy(
-                &current_policy,
-                &operation.plan,
-                policy_branch(&operation.context),
-            );
+            let branch = policy_branch(&operation.context);
+            let current_evaluation = evaluate_plan_policy(&current_policy, &operation.plan, branch);
+            let current_sequence_evaluation =
+                evaluate_sequence_plan_policy(&current_policy, &operation.plan, branch);
             if !confirmation_covers(
                 &operation.plan,
                 confirmed_requirement,
                 &previewed_policy,
                 &current_evaluation,
+            ) || !confirmation_covers(
+                &operation.plan,
+                confirmed_requirement,
+                &previewed_sequence_policy,
+                &current_sequence_evaluation,
             ) {
                 step_results.push(PromptSequenceStepResult::planning_failed(
                     step_number,
@@ -6178,8 +6215,8 @@ mod tests {
         assert!(queue_text[0].contains("Stage all plan"));
         assert!(queue_text[0].contains("Risk: medium"));
         assert!(queue_text[1].contains("y confirm; n/Esc cancel"));
-        assert!(queue_text[2].contains("Press y to stage all changes"));
-        assert!(queue_text[3].contains("medium risk policy requires visible-plan"));
+        assert!(queue_text[2].contains("medium risk policy requires visible-plan"));
+        assert!(queue_text[3].contains("Press y to stage all changes"));
         assert!(queue_text[4].contains("stage all working tree changes"));
 
         app.handle_key(key(KeyCode::Char('n')));
@@ -6524,6 +6561,84 @@ mod tests {
             sequence.sequence,
             ConfirmationRequirement::ExplicitConfirmation,
         );
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 2."),
+            "{message}"
+        );
+        assert!(message.contains("new sequence preview"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn low_risk_sequence_rejects_changed_medium_policy_at_confirmation()
+    -> Result<(), Box<dyn Error>> {
+        for (name, setting) in [
+            ("explicit", "explicit-confirmation"),
+            ("blocked", "blocked"),
+        ] {
+            let repo = isolated_git_repo(&format!("sequence-medium-change-{name}"))?;
+            let sequence = OperationPlanner::new(&repo)
+                .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Branches])
+                .map_err(std::io::Error::other)?;
+            let paths = isolated_store_paths(&format!("sequence-medium-change-{name}-audit"))?;
+            let store = LocalStore::open(paths.clone())?;
+            std::fs::write(
+                &store.paths().config_file,
+                format!("schema-version = 1\n[policy.confirmation]\nmedium = \"{setting}\"\n"),
+            )?;
+
+            let result = PromptSequenceExecutor::with_audit_paths(&repo, paths)
+                .execute_confirmed(sequence.sequence, ConfirmationRequirement::VisiblePlan);
+
+            let message = result.message();
+            assert!(
+                message.contains("Prompt sequence stopped before step 1 of 2."),
+                "{message}"
+            );
+            assert!(message.contains("new sequence preview"), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn later_low_risk_step_reloads_changed_medium_policy() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("sequence-medium-change-during-fetch")?;
+        let remote = isolated_bare_git_repo("sequence-medium-change-during-fetch-remote")?;
+        add_github_remote(&repo, "origin", &remote)?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Branches])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("sequence-medium-change-during-fetch-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh_root = isolated_temp_root("sequence-medium-change-during-fetch-ssh")?;
+        std::fs::create_dir_all(&ssh_root)?;
+        let ssh = ssh_root.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'schema-version = 1' '[policy.confirmation]' 'medium = \"explicit-confirmation\"' > '{}'\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\nexec git-upload-pack \"$target\"\n",
+                store.paths().config_file.display()
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ssh)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ssh, permissions)?;
+        }
+        let executor = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+
+        let result =
+            executor.execute_confirmed(sequence.sequence, ConfirmationRequirement::VisiblePlan);
 
         let message = result.message();
         assert!(
@@ -6907,7 +7022,7 @@ mod tests {
             "Explicit confirmation required: press uppercase Y to run 2 prompt steps or n to cancel.",
         );
         plan.confirmation.reason = Some(
-            "high risk policy requires explicit confirmation and this deliberately long policy explanation wraps"
+            "high risk policy requires explicit confirmation; protected branch production: rebase requires at least explicit confirmation"
                 .to_owned(),
         );
         app.operation_queue
@@ -6926,6 +7041,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Accepted keys: uppercase Y confirm; n/Esc cancel"));
+        assert!(rendered.contains("protected branch production"));
         Ok(())
     }
 
