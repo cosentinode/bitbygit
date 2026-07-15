@@ -34,22 +34,10 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
-      - name: Enable Linux recovery isolation
+      - name: Test fail-closed recovery capabilities
         run: |
-          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
-          fi
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-
-      - name: Test production recovery path
-        env:
-          BITBYGIT_REQUIRE_RECOVERY_SUCCESS: "1"
-        run: |
-          cargo test --locked -p bitbygit-git tests::exact_recovery_executes_every_supported_action -- --exact
-          cargo test --locked -p bitbygit-git tests::exact_recovery_rejects_nested_bind_mount_and_preserves_mounted_data -- --exact
-          cargo test --locked -p bitbygit-tui tests::tui_reattaches_to_promoted_repository_after_recovery -- --exact
+          cargo test --locked -p bitbygit-git tests::exact_recovery_fails_closed_before_creating_candidate -- --exact
+          cargo test --locked -p bitbygit-git tests::capability_probe_enforces_deadline_and_output_bounds -- --exact
 
       - name: Build
         run: cargo build --locked --workspace

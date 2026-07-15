@@ -937,13 +937,15 @@ impl Git {
             "repository attributes",
             false,
         )?;
-        let attributes = snapshot_recovery_paths(
+        let mut attributes = snapshot_recovery_paths(
             [(
                 PathBuf::from("info/attributes"),
                 git_dir.join("info/attributes"),
             )],
             capture,
         )?;
+        attributes.extend(snapshot_recovery_worktree_attributes(root, capture)?);
+        attributes.sort_by(|left, right| left.path.cmp(&right.path));
         let hooks_path = path_from_bytes(strip_byte_line_ending(&capture.required(
             self,
             &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
@@ -1789,7 +1791,7 @@ impl RecoveryTransaction {
                 "--fork",
                 "sh",
                 "-c",
-                "mount --bind \"$1\" \"$2\" || { printf '%s\\n' 'bitbygit: recovery namespace setup failed' >&2; exit 125; }; cd \"$2\" || { printf '%s\\n' 'bitbygit: recovery namespace setup failed' >&2; exit 125; }; shift 2; exec git \"$@\"",
+                "mount --bind \"$1\" \"$2\" || { printf '%s\\n' 'bitbygit: recovery namespace setup failed' >&2; exit 125; }; cd \"$2\" || { printf '%s\\n' 'bitbygit: recovery namespace setup failed' >&2; exit 125; }; shift 2; exec git -c core.attributesFile=/dev/null \"$@\"",
                 "bitbygit-recovery",
             ])
             .arg(&self.candidate)
@@ -1882,9 +1884,11 @@ impl RecoveryTransaction {
         run_recovery_promotion_hook(&self.root);
         ensure_recovery_git_storage_isolated(&self.candidate)?;
         let candidate_generation = RecoveryGeneration::capture_isolated(&self.candidate)?;
-        if recovery_path_identity(&self.candidate)? != self.candidate_identity {
+        if recovery_path_identity(&self.root)? != self.root_identity
+            || recovery_path_identity(&self.candidate)? != self.candidate_identity
+        {
             return Err(recovery_transaction_blocked(
-                "isolated recovery candidate changed before atomic promotion",
+                "repository or isolated recovery candidate changed before atomic promotion",
             ));
         }
         ensure_recovery_mount_tree_isolated(&self.root)?;
@@ -1902,20 +1906,15 @@ impl RecoveryTransaction {
             || !matches!(&old_generation, Ok(generation) if generation == &self.baseline)
             || !matches!(&installed_generation, Ok(generation) if generation == &candidate_generation)
         {
-            if let Err(error) = atomic_exchange_directories(&self.root, &self.candidate) {
-                return Err(recovery_transaction_blocked(format!(
-                    "repository changed during atomic recovery promotion and rollback failed; both complete generations were retained: {error}"
-                )));
-            }
             self.keep_candidate = true;
             return Err(recovery_transaction_blocked(
                 match (old_generation, installed_generation) {
                     (Err(error), _) | (_, Err(error)) => format!(
-                        "repository metadata changed during atomic recovery promotion; the rolled-back generation was retained at {}: {error}",
+                        "repository metadata changed during atomic recovery promotion; no rollback was attempted through uncertain pathnames and the other exposed generation was retained at {}: {error}",
                         self.candidate.display()
                     ),
                     _ => format!(
-                        "repository changed during atomic recovery promotion; the rolled-back generation was retained at {}",
+                        "repository changed during atomic recovery promotion; no rollback was attempted through uncertain pathnames and the other exposed generation was retained at {}",
                         self.candidate.display()
                     ),
                 },
@@ -3132,6 +3131,15 @@ fn repository_local_recovery_config(
                 origin_path.display()
             )));
         }
+        let key = field[2]
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        if key.eq_ignore_ascii_case(b"core.attributesfile") {
+            return Err(recovery_transaction_blocked(
+                "atomic recovery does not support core.attributesFile; user attributes are pinned off",
+            ));
+        }
         config.extend_from_slice(field[0]);
         config.push(0);
         config.extend_from_slice(field[2]);
@@ -3184,9 +3192,10 @@ fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> 
         }
     };
     let mut exchanged = false;
-    let result = (|| {
+    let result: Result<(), GitError> = (|| {
         let _mount_id = recovery_mount_id(&source, Path::new("capability probe"))?;
-        let output = Command::new("unshare")
+        let mut command = Command::new(recovery_probe_program(parent));
+        command
             .args([
                 "--user",
                 "--map-root-user",
@@ -3200,13 +3209,15 @@ fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> 
                 "bitbygit-recovery-capability",
             ])
             .arg(&source)
-            .arg(&target)
-            .output()
-            .map_err(|source| {
-                recovery_capability_unavailable(format!(
-                    "the Linux user/mount namespace probe could not start: {source}"
-                ))
-            })?;
+            .arg(&target);
+        let output = run_bounded_recovery_process(
+            &mut command,
+            vec!["unshare".to_owned(), "recovery-capability-probe".to_owned()],
+            recovery_probe_duration(parent),
+            "capability probe",
+            None,
+        )
+        .map_err(recovery_capability_unavailable)?;
         if !output.status.success() {
             let detail = if output.stderr.is_empty() {
                 format!("status {}", output.status)
@@ -3223,7 +3234,9 @@ fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> 
             ))
         })?;
         exchanged = true;
-        Ok(())
+        Err(recovery_capability_unavailable(
+            "the platform cannot make a writable speculative repository unreachable to same-identity host processes or condition directory exchange on inode identity",
+        ))
     })();
     run_recovery_probe_cleanup_hook(parent);
     let source_cleanup = remove_recovery_directory(
@@ -3243,6 +3256,44 @@ fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> 
         },
     );
     result.and(source_cleanup).and(target_cleanup)
+}
+
+#[cfg(test)]
+static RECOVERY_PROBE_PROGRAMS: std::sync::Mutex<Vec<(PathBuf, OsString)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn recovery_probe_program(parent: &Path) -> OsString {
+    if let Ok(mut programs) = RECOVERY_PROBE_PROGRAMS.lock()
+        && let Some(index) = programs.iter().position(|(target, _)| target == parent)
+    {
+        return programs.swap_remove(index).1;
+    }
+    OsString::from("unshare")
+}
+
+#[cfg(not(test))]
+fn recovery_probe_program(_parent: &Path) -> OsString {
+    OsString::from("unshare")
+}
+
+#[cfg(test)]
+static RECOVERY_PROBE_DURATIONS: std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn recovery_probe_duration(parent: &Path) -> std::time::Duration {
+    if let Ok(mut durations) = RECOVERY_PROBE_DURATIONS.lock()
+        && let Some(index) = durations.iter().position(|(target, _)| target == parent)
+    {
+        return durations.swap_remove(index).1;
+    }
+    MAX_RECOVERY_COMMAND_DURATION
+}
+
+#[cfg(not(test))]
+fn recovery_probe_duration(_parent: &Path) -> std::time::Duration {
+    MAX_RECOVERY_COMMAND_DURATION
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4220,6 +4271,45 @@ fn snapshot_recovery_metadata(
             .map(|relative| (PathBuf::from(relative), git_dir.join(relative))),
         capture,
     )
+}
+
+fn snapshot_recovery_worktree_attributes(
+    root: &Path,
+    capture: &mut RecoveryCapture,
+) -> Result<Vec<RecoveryMetadataEntry>, GitError> {
+    let mut pending = vec![PathBuf::new()];
+    let mut paths = Vec::new();
+    let mut entries = 0_usize;
+    let mut path_bytes = 0_usize;
+    while let Some(relative) = pending.pop() {
+        for child in fs::read_dir(root.join(&relative))
+            .map_err(|source| recovery_metadata_io_error(&relative, source))?
+        {
+            let child = child.map_err(|source| recovery_metadata_io_error(&relative, source))?;
+            let child_relative = relative.join(child.file_name());
+            if child_relative == Path::new(".git") {
+                continue;
+            }
+            entries = entries.saturating_add(1);
+            path_bytes =
+                path_bytes.saturating_add(child_relative.as_os_str().as_encoded_bytes().len());
+            if entries > MAX_RECOVERY_GENERATION_ENTRIES
+                || path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
+            {
+                return Err(recovery_bound_error(
+                    "attribute source traversal exceeds repository entry or path bounds".to_owned(),
+                ));
+            }
+            let metadata = fs::symlink_metadata(child.path())
+                .map_err(|source| recovery_metadata_io_error(&child_relative, source))?;
+            if metadata.file_type().is_dir() {
+                pending.push(child_relative);
+            } else if child.file_name() == ".gitattributes" {
+                paths.push((Path::new("worktree").join(&child_relative), child.path()));
+            }
+        }
+    }
+    snapshot_recovery_paths(paths, capture)
 }
 
 fn snapshot_recovery_paths(
@@ -6800,6 +6890,93 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probe_enforces_deadline_and_output_bounds() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (name, body, expected) in [
+            (
+                "quiet",
+                "#!/bin/sh\nsleep 30\n",
+                "capability probe exceeded",
+            ),
+            (
+                "noisy",
+                "#!/bin/sh\ntrap '' PIPE\ndd if=/dev/zero bs=1048576 count=5 2>/dev/null || true\nsleep 30\n",
+                "capability probe output bytes exceed",
+            ),
+        ] {
+            let parent = TempRepo::new()?;
+            let script = parent.path().with_extension(format!("{name}-probe"));
+            fs::write(&script, body)?;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+            RECOVERY_PROBE_PROGRAMS
+                .lock()
+                .map_err(|_| "recovery probe program lock poisoned")?
+                .push((parent.path(), script.clone().into_os_string()));
+            RECOVERY_PROBE_DURATIONS
+                .lock()
+                .map_err(|_| "recovery probe duration lock poisoned")?
+                .push((parent.path(), std::time::Duration::from_millis(250)));
+
+            let started = std::time::Instant::now();
+            let Err(error) = ensure_recovery_platform_capabilities(&parent.path()) else {
+                return Err(format!("expected {name} capability probe to be bounded").into());
+            };
+
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            assert!(fs::read_dir(parent.path())?.next().is_none());
+            fs::remove_file(script)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_fails_closed_before_creating_candidate() -> Result<(), Box<dyn Error>> {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let root = repo.path().canonicalize()?;
+        let before = RecoveryGeneration::capture(&root)?;
+        let executed = Arc::new(AtomicBool::new(false));
+        let hook_executed = Arc::clone(&executed);
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            hook_executed.store(true, Ordering::Release);
+        });
+        RECOVERY_EXECUTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery execution hook lock poisoned")?
+            .push((root.clone(), hook));
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected speculative recovery to fail closed".into());
+        };
+
+        assert!(
+            matches!(&error, GitError::Blocked { message } if message.starts_with(RECOVERY_CAPABILITY_UNAVAILABLE)),
+            "{error}"
+        );
+        assert!(!executed.load(Ordering::Acquire));
+        assert_eq!(RecoveryGeneration::capture(&root)?, before);
+        assert_eq!(git.recovery_state()?, expected);
+        let parent = root.parent().ok_or("test repository has no parent")?;
+        assert!(fs::read_dir(parent)?.all(|entry| {
+            entry.is_ok_and(|entry| {
+                !entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(RECOVERY_CANDIDATE_PREFIX.as_bytes())
+            })
+        }));
+        Ok(())
+    }
+
     #[test]
     fn exact_recovery_fails_closed_when_platform_capabilities_are_unavailable()
     -> Result<(), Box<dyn Error>> {
@@ -6954,23 +7131,19 @@ mod tests {
         }
 
         guard.unmount()?;
-        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
         let root = repo.path().canonicalize()?;
-        let backup = recovery_backup_from_pointer(&root)?.ok_or("missing retained backup")?;
-        repo.run_allow_failure(["merge", "other"])?;
-        let expected = git.recovery_state()?;
-
+        let before = RecoveryGeneration::capture(&root)?;
         let Err(error) =
             git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
         else {
-            return Err("retained backup was not blocked before later recovery".into());
+            return Err("expected speculative recovery to remain unavailable".into());
         };
         assert!(
-            error.to_string().contains("inspect and move or delete it"),
+            matches!(&error, GitError::Blocked { message } if message.starts_with(RECOVERY_CAPABILITY_UNAVAILABLE)),
             "{error}"
         );
         assert_eq!(git.recovery_state()?, expected);
-        assert_eq!(recovery_backup_from_pointer(&root)?, Some(backup));
+        assert_eq!(RecoveryGeneration::capture(&root)?, before);
         assert_eq!(
             fs::read_to_string(source.join("sentinel"))?,
             "must survive recovery\n"
@@ -7456,6 +7629,174 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn atomic_promotion_does_not_exchange_a_synchronized_root_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let (mut repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let root = repo.path().canonicalize()?;
+        let parent = root.parent().ok_or("test repository has no parent")?;
+        let baseline = RecoveryGeneration::capture(&root)?;
+        let root_identity = recovery_path_identity(&root)?;
+        let (candidate, _) = create_recovery_candidate(parent, &root)?;
+        let candidate_identity = recovery_path_identity(&candidate)?;
+        let mut transaction = RecoveryTransaction {
+            root: root.clone(),
+            backup_pointer: recovery_backup_pointer_path(&candidate)?,
+            candidate,
+            baseline,
+            root_identity,
+            candidate_identity,
+            keep_candidate: false,
+        };
+        transaction.copy_repository()?;
+        let displaced = root.with_extension("promotion-displaced");
+        let hook_root = root.clone();
+        let hook_displaced = displaced.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            if fs::rename(&hook_root, &hook_displaced).is_ok() && fs::create_dir(&hook_root).is_ok()
+            {
+                let _ = fs::write(hook_root.join("replacement-sentinel"), "preserve\n");
+            }
+        });
+        RECOVERY_PROMOTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery promotion hook lock poisoned")?
+            .push((root.clone(), hook));
+
+        let Err(error) = transaction.promote(&git, &expected) else {
+            return Err("expected synchronized root replacement to block promotion".into());
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed before atomic promotion")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("replacement-sentinel"))?,
+            "preserve\n"
+        );
+        fs::remove_dir_all(&root)?;
+        fs::rename(&displaced, &root)?;
+        repo.path = root;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_promotion_does_not_exchange_a_synchronized_candidate_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let root = repo.path().canonicalize()?;
+        let parent = root.parent().ok_or("test repository has no parent")?;
+        let baseline = RecoveryGeneration::capture(&root)?;
+        let root_identity = recovery_path_identity(&root)?;
+        let (candidate, _) = create_recovery_candidate(parent, &root)?;
+        let candidate_identity = recovery_path_identity(&candidate)?;
+        let mut transaction = RecoveryTransaction {
+            root: root.clone(),
+            backup_pointer: recovery_backup_pointer_path(&candidate)?,
+            candidate: candidate.clone(),
+            baseline,
+            root_identity,
+            candidate_identity,
+            keep_candidate: false,
+        };
+        transaction.copy_repository()?;
+        let displaced = candidate.with_extension("promotion-displaced");
+        let hook_candidate = candidate.clone();
+        let hook_displaced = displaced.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            if fs::rename(&hook_candidate, &hook_displaced).is_ok()
+                && fs::create_dir(&hook_candidate).is_ok()
+                && fs::create_dir(hook_candidate.join(".git")).is_ok()
+            {
+                let _ = fs::write(hook_candidate.join("replacement-sentinel"), "preserve\n");
+            }
+        });
+        RECOVERY_PROMOTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery promotion hook lock poisoned")?
+            .push((root, hook));
+
+        let Err(error) = transaction.promote(&git, &expected) else {
+            return Err("expected synchronized candidate replacement to block promotion".into());
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed before atomic promotion")
+        );
+        assert_eq!(
+            fs::read_to_string(candidate.join("replacement-sentinel"))?,
+            "preserve\n"
+        );
+        fs::remove_dir_all(&candidate)?;
+        fs::remove_dir_all(&displaced)?;
+        let _ = fs::remove_file(recovery_candidate_owner_path(&candidate));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_promotion_never_rolls_back_through_a_replaced_root() -> Result<(), Box<dyn Error>> {
+        let (mut repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let root = repo.path().canonicalize()?;
+        let parent = root.parent().ok_or("test repository has no parent")?;
+        let baseline = RecoveryGeneration::capture(&root)?;
+        let root_identity = recovery_path_identity(&root)?;
+        let (candidate, _) = create_recovery_candidate(parent, &root)?;
+        let candidate_identity = recovery_path_identity(&candidate)?;
+        let mut transaction = RecoveryTransaction {
+            root: root.clone(),
+            backup_pointer: recovery_backup_pointer_path(&candidate)?,
+            candidate: candidate.clone(),
+            baseline,
+            root_identity,
+            candidate_identity,
+            keep_candidate: false,
+        };
+        transaction.copy_repository()?;
+        let installed = root.with_extension("installed-recovery");
+        let hook_root = root.clone();
+        let hook_installed = installed.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            if fs::rename(&hook_root, &hook_installed).is_ok() && fs::create_dir(&hook_root).is_ok()
+            {
+                let _ = fs::write(hook_root.join("replacement-sentinel"), "preserve\n");
+            }
+        });
+        RECOVERY_POST_EXCHANGE_HOOKS
+            .lock()
+            .map_err(|_| "recovery post-exchange hook lock poisoned")?
+            .push((root.clone(), hook));
+
+        let Err(error) = transaction.promote(&git, &expected) else {
+            return Err("expected post-exchange root replacement to block promotion".into());
+        };
+
+        assert!(error.to_string().contains("no rollback was attempted"));
+        assert_eq!(
+            fs::read_to_string(root.join("replacement-sentinel"))?,
+            "preserve\n"
+        );
+        assert_eq!(recovery_path_identity(&candidate)?, root_identity);
+        fs::remove_dir_all(&root)?;
+        fs::rename(&candidate, &root)?;
+        fs::remove_dir_all(installed)?;
+        let _ = fs::remove_file(recovery_candidate_owner_path(&candidate));
+        repo.path = root;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn recovery_cleanup_rejects_synchronized_path_replacement() -> Result<(), Box<dyn Error>> {
         let repo = initialized_repo()?;
         let root = repo.path().canonicalize()?;
@@ -7824,6 +8165,50 @@ mod tests {
         assert!(error.to_string().contains("state changed after preview"));
         assert!(!marker.exists());
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_untracked_worktree_attributes_added_after_preview()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        fs::write(
+            repo.path().join(".gitattributes"),
+            "conflict.txt filter=late\n",
+        )?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected untracked worktree attributes to invalidate the preview".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_configured_user_attributes_file() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let attributes = repo.path().with_extension("external-attributes");
+        fs::write(&attributes, "conflict.txt filter=external\n")?;
+        repo.run_args(&[
+            "config",
+            "core.attributesFile",
+            attributes.to_string_lossy().as_ref(),
+        ])?;
+
+        let Err(error) = Git::new(repo.path()).recovery_state() else {
+            return Err("expected configured user attributes to block recovery preview".into());
+        };
+
+        assert!(error.to_string().contains("core.attributesFile"), "{error}");
+        fs::remove_file(attributes)?;
         Ok(())
     }
 
