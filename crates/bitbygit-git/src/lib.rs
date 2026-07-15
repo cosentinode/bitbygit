@@ -458,19 +458,26 @@ impl Git {
         Ok(Some((remote.to_owned(), push_branch.to_owned())))
     }
 
-    pub fn prospective_push_target(
+    pub fn typed_push_target(
         &self,
         branch: &str,
-        upstream_remote: &str,
-        upstream_branch: &str,
+        upstream: Option<(&str, &str)>,
+        default_remote: Option<&str>,
     ) -> Result<Option<(String, String)>, GitError> {
         let remote = self
             .config_value(["config", "--get", &format!("branch.{branch}.pushRemote")])?
             .or(self.config_value(["config", "--get", "remote.pushDefault"])?)
-            .unwrap_or_else(|| upstream_remote.to_owned());
+            .or_else(|| upstream.map(|(remote, _)| remote.to_owned()))
+            .or_else(|| default_remote.map(ToOwned::to_owned));
+        let Some(remote) = remote else {
+            return Ok(None);
+        };
         if remote.is_empty() {
             return Ok(None);
         }
+        let Some((upstream_remote, upstream_branch)) = upstream else {
+            return Ok(Some((remote, branch.to_owned())));
+        };
         let push_default = self
             .config_value(["config", "--get", "push.default"])?
             .unwrap_or_else(|| "simple".to_owned());
@@ -3250,7 +3257,7 @@ mod tests {
     }
 
     #[test]
-    fn prospective_push_target_matches_configured_git_push_target() -> Result<(), Box<dyn Error>> {
+    fn typed_push_target_resolves_tracked_and_new_branches() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         repo.run(["init", "-b", "topic"])?;
         repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
@@ -3268,7 +3275,7 @@ mod tests {
         let git = Git::new(repo.path());
 
         assert_eq!(
-            git.prospective_push_target("topic", "fork", "topic")?,
+            git.typed_push_target("topic", Some(("fork", "topic")), Some("origin"))?,
             git.push_target("topic")?
         );
 
@@ -3276,7 +3283,7 @@ mod tests {
         for push_default in ["simple", "current", "upstream", "matching", "nothing"] {
             repo.run(["config", "push.default", push_default])?;
             assert_eq!(
-                git.prospective_push_target("topic", "fork", "topic")?,
+                git.typed_push_target("topic", Some(("fork", "topic")), Some("fork"))?,
                 git.push_target("topic")?,
                 "push.default={push_default}"
             );
@@ -3285,8 +3292,13 @@ mod tests {
         repo.run(["config", "branch.topic.pushRemote", "fork"])?;
         repo.run(["config", "push.default", "current"])?;
         assert_eq!(
-            git.prospective_push_target("topic", "fork", "topic")?,
+            git.typed_push_target("topic", Some(("fork", "topic")), Some("origin"))?,
             git.push_target("topic")?
+        );
+        repo.run(["config", "branch.new.pushRemote", "fork"])?;
+        assert_eq!(
+            git.typed_push_target("new", None, Some("origin"))?,
+            Some(("fork".to_owned(), "new".to_owned()))
         );
         Ok(())
     }

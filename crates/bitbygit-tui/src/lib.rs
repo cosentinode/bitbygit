@@ -704,6 +704,13 @@ enum SequenceUpstream {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TypedPushTarget {
+    remote: String,
+    branch: String,
+    sets_upstream: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GitHubRepository(String);
 
 impl GitHubRepository {
@@ -2258,24 +2265,11 @@ impl OperationPlanner {
                         "Prompt sequence blocked: push branch cannot be resolved during preflight; create a new sequence preview."
                             .to_owned()
                     })?;
-                    let missing_upstream = match branch.upstream {
-                        SequenceUpstream::Missing => true,
-                        SequenceUpstream::Existing => git
-                            .upstream_push_target(&branch.name)
-                            .map_err(|error| {
-                                format!("Unable to resolve sequence push target: {error}")
-                            })?
-                            .is_none(),
-                        SequenceUpstream::Bound { .. } => false,
-                    };
-                    if missing_upstream {
-                        let remote = self.default_remote_name().ok_or_else(|| {
-                            "Prompt sequence blocked: push target cannot be resolved during preflight; create a new sequence preview."
-                                .to_owned()
-                        })?;
+                    let target = self.typed_push_target(&git, &branch.name, &branch.upstream)?;
+                    if target.sets_upstream {
                         branch.upstream = SequenceUpstream::Bound {
-                            remote,
-                            branch: branch.name.clone(),
+                            remote: target.remote,
+                            branch: target.branch,
                         };
                     }
                 }
@@ -2292,33 +2286,18 @@ impl OperationPlanner {
         branch: &SequenceBranch,
         requested_base: Option<&str>,
     ) -> Result<DeferredPullRequestTarget, String> {
-        let (remote, upstream_branch) = match &branch.upstream {
-            SequenceUpstream::Existing => git
-                .push_target(&branch.name)
-                .map_err(|error| format!("Unable to prepare pull request target: {error}"))?
-                .ok_or_else(|| {
-                    "Open pull request blocked: the deferred branch has no resolvable upstream; add `push` before `open pr` and create a new sequence preview."
-                        .to_owned()
-                })?,
-            SequenceUpstream::Missing => {
-                return Err(
-                    "Open pull request blocked: the deferred branch will not have an upstream; add `push` before `open pr` and create a new sequence preview."
-                        .to_owned(),
-                );
-            }
-            SequenceUpstream::Bound {
-                remote,
-                branch: upstream_branch,
-            } => git
-                .prospective_push_target(&branch.name, remote, upstream_branch)
-                .map_err(|error| {
-                    format!("Unable to prepare deferred pull request target: {error}")
-                })?
-                .ok_or_else(|| {
-                    "Open pull request blocked: the deferred push target cannot be bound during preflight; update push.default and create a new sequence preview."
-                        .to_owned()
-                })?,
-        };
+        let push_target = self.typed_push_target(git, &branch.name, &branch.upstream)?;
+        if push_target.sets_upstream {
+            return Err(
+                "Open pull request blocked: the deferred branch will not have an upstream; add `push` before `open pr` and create a new sequence preview."
+                    .to_owned(),
+            );
+        }
+        let TypedPushTarget {
+            remote,
+            branch: upstream_branch,
+            ..
+        } = push_target;
         let remote_urls = git
             .remote_push_urls(&remote)
             .map_err(|error| format!("Unable to prepare pull request remote: {error}"))?;
@@ -2364,6 +2343,12 @@ impl OperationPlanner {
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_else(|| repository.default_branch.clone());
+        validate_pull_request_base_head(
+            &canonical_head_repository,
+            &canonical_github_repository,
+            &base,
+            &upstream_branch,
+        )?;
         if !github
             .branch_exists(&base)
             .map_err(open_pull_request_gh_error)?
@@ -2459,62 +2444,61 @@ impl OperationPlanner {
             .map_err(|error| format!("Unable to snapshot push target: {error}"))?;
         let ahead = status.branch.ahead;
 
-        match status.branch.upstream {
+        let upstream = status.branch.upstream;
+        let sequence_upstream = match upstream.as_deref() {
             Some(upstream) => {
-                let (remote, upstream_branch) = git
+                let (remote, branch) = git
                     .upstream_push_target(&branch)
                     .map_err(|error| format!("Unable to prepare push target: {error}"))?
                     .ok_or_else(|| {
                         format!("Push blocked: unable to resolve upstream {upstream}.")
                     })?;
-                let expected_upstream = format!("{remote}/{upstream_branch}");
+                let expected_upstream = format!("{remote}/{branch}");
                 if expected_upstream != upstream {
                     return Err(format!(
                         "Push blocked: upstream config does not match {upstream}."
                     ));
                 }
-                let remote_urls = git
-                    .remote_push_urls(&remote)
-                    .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
-                let push_url = single_push_url(&remote, &remote_urls)?;
-                let expected_remote_oid = git
-                    .remote_url_head_oid(push_url, &upstream_branch)
-                    .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
-                Ok(PreparedOperation::new(
-                    push_plan(&branch, &upstream, ahead),
-                    ExecutionContext::from_payload(PendingPayload::Push {
-                        local_branch: branch,
-                        target: head_target,
-                        remote,
-                        upstream_branch,
-                        upstream,
-                        expected_remote_oid,
-                        remote_urls,
-                    }),
-                ))
+                SequenceUpstream::Bound { remote, branch }
             }
-            None => {
-                let Some(remote) = self.default_remote_name() else {
-                    return Err("Push blocked: no remotes are configured.".to_owned());
-                };
-                let remote_urls = git
-                    .remote_push_urls(&remote)
-                    .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
-                let push_url = single_push_url(&remote, &remote_urls)?;
-                let expected_remote_oid = git
-                    .remote_url_head_oid(push_url, &branch)
-                    .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
-                Ok(PreparedOperation::new(
-                    push_set_upstream_plan(&branch, &remote),
-                    ExecutionContext::from_payload(PendingPayload::PushSetUpstream {
-                        remote,
-                        branch,
-                        target: head_target,
-                        expected_remote_oid,
-                        remote_urls,
-                    }),
-                ))
-            }
+            None => SequenceUpstream::Missing,
+        };
+        let push_target = self.typed_push_target(&git, &branch, &sequence_upstream)?;
+        let remote_urls = git
+            .remote_push_urls(&push_target.remote)
+            .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
+        let push_url = single_push_url(&push_target.remote, &remote_urls)?;
+        let expected_remote_oid = git
+            .remote_url_head_oid(push_url, &push_target.branch)
+            .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
+        if push_target.sets_upstream {
+            Ok(PreparedOperation::new(
+                push_set_upstream_plan(&branch, &push_target.remote),
+                ExecutionContext::from_payload(PendingPayload::PushSetUpstream {
+                    remote: push_target.remote,
+                    branch,
+                    target: head_target,
+                    expected_remote_oid,
+                    remote_urls,
+                }),
+            ))
+        } else {
+            let upstream = upstream.ok_or_else(|| {
+                "Push blocked: tracked push destination has no upstream.".to_owned()
+            })?;
+            let destination = format!("{}/{}", push_target.remote, push_target.branch);
+            Ok(PreparedOperation::new(
+                push_plan(&branch, &destination, ahead),
+                ExecutionContext::from_payload(PendingPayload::Push {
+                    local_branch: branch,
+                    target: head_target,
+                    remote: push_target.remote,
+                    upstream_branch: push_target.branch,
+                    upstream,
+                    expected_remote_oid,
+                    remote_urls,
+                }),
+            ))
         }
     }
 
@@ -2723,13 +2707,28 @@ impl OperationPlanner {
         let Some(upstream) = status.branch.upstream.clone() else {
             return Err("Open pull request blocked: current branch has no upstream. Push it with `push` first.".to_owned());
         };
-        let (remote, upstream_branch) = git
-            .push_target(&branch)
+        let (tracking_remote, tracking_branch) = git
+            .upstream_push_target(&branch)
             .map_err(|error| format!("Unable to prepare pull request target: {error}"))?
             .ok_or_else(|| {
-                "Open pull request blocked: unable to resolve the current branch push target."
+                "Open pull request blocked: unable to resolve the current branch upstream."
                     .to_owned()
             })?;
+        if format!("{tracking_remote}/{tracking_branch}") != upstream {
+            return Err(format!(
+                "Open pull request blocked: upstream config does not match {upstream}."
+            ));
+        }
+        let push_target = self.typed_push_target(
+            &git,
+            &branch,
+            &SequenceUpstream::Bound {
+                remote: tracking_remote,
+                branch: tracking_branch,
+            },
+        )?;
+        let remote = push_target.remote;
+        let upstream_branch = push_target.branch;
         let remote_urls = git
             .remote_push_urls(&remote)
             .map_err(|error| format!("Unable to prepare pull request remote: {error}"))?;
@@ -2789,14 +2788,12 @@ impl OperationPlanner {
                     .map(ToOwned::to_owned)
             })
             .unwrap_or(repository.default_branch);
-        if canonical_head_github_repository.eq_ignore_ascii_case(&canonical_github_repository)
-            && base == upstream_branch
-        {
-            return Err(
-                "Open pull request blocked: base branch must differ from the pull request head."
-                    .to_owned(),
-            );
-        }
+        validate_pull_request_base_head(
+            &canonical_head_github_repository,
+            &canonical_github_repository,
+            &base,
+            &upstream_branch,
+        )?;
         if !github
             .branch_exists(&base)
             .map_err(open_pull_request_gh_error)?
@@ -2865,13 +2862,37 @@ impl OperationPlanner {
         branch_name(&status.branch).map_err(|error| error.replace("Operation", action))
     }
 
-    fn default_remote_name(&self) -> Option<String> {
-        let remotes = self.git().remotes().ok()?;
-        remotes
-            .iter()
-            .find(|remote| remote.name == "origin")
-            .or_else(|| remotes.first())
-            .map(|remote| remote.name.clone())
+    fn typed_push_target(
+        &self,
+        git: &Git,
+        branch: &str,
+        upstream: &SequenceUpstream,
+    ) -> Result<TypedPushTarget, String> {
+        let upstream = match upstream {
+            SequenceUpstream::Existing => git
+                .upstream_push_target(branch)
+                .map_err(|error| format!("Unable to prepare push target: {error}"))?,
+            SequenceUpstream::Missing => None,
+            SequenceUpstream::Bound { remote, branch } => Some((remote.clone(), branch.clone())),
+        };
+        let default_remote = default_remote_name(git);
+        let (remote, target_branch) = git
+            .typed_push_target(
+                branch,
+                upstream
+                    .as_ref()
+                    .map(|(remote, branch)| (remote.as_str(), branch.as_str())),
+                default_remote.as_deref(),
+            )
+            .map_err(|error| format!("Unable to prepare push target: {error}"))?
+            .ok_or_else(|| {
+                "Push blocked: no configured push destination could be resolved.".to_owned()
+            })?;
+        Ok(TypedPushTarget {
+            remote,
+            branch: target_branch,
+            sets_upstream: upstream.is_none(),
+        })
     }
 
     fn git(&self) -> Git {
@@ -2898,6 +2919,15 @@ impl OperationPlanner {
             ),
         }
     }
+}
+
+fn default_remote_name(git: &Git) -> Option<String> {
+    let remotes = git.remotes().ok()?;
+    remotes
+        .iter()
+        .find(|remote| remote.name == "origin")
+        .or_else(|| remotes.first())
+        .map(|remote| remote.name.clone())
 }
 
 fn prompt_sequence_preflight_operation(
@@ -3091,6 +3121,21 @@ fn pull_request_head(
     Ok(format!("{owner}:{branch}"))
 }
 
+fn validate_pull_request_base_head(
+    head_repository: &GitHubRepository,
+    base_repository: &GitHubRepository,
+    base: &str,
+    head_branch: &str,
+) -> Result<(), String> {
+    if head_repository.eq_ignore_ascii_case(base_repository) && base == head_branch {
+        return Err(
+            "Open pull request blocked: base branch must differ from the pull request head."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn matching_pull_request<'a>(
     pull_requests: &'a [bitbygit_gh::PullRequest],
     base: &str,
@@ -3117,6 +3162,7 @@ fn validate_push_plan(
     expected_upstream: Option<&str>,
     target: &HeadTarget,
     remote: &str,
+    remote_branch: &str,
     remote_urls: &[String],
 ) -> Result<(), String> {
     if git
@@ -3135,6 +3181,40 @@ fn validate_push_plan(
     }
     if status.branch.upstream.as_deref() != expected_upstream {
         return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
+    }
+    let upstream = match expected_upstream {
+        Some(expected_upstream) => {
+            let upstream = git
+                .upstream_push_target(branch)
+                .map_err(|error| format!("Unable to revalidate push target: {error}"))?
+                .ok_or_else(|| {
+                    "Push blocked: upstream config is no longer available.".to_owned()
+                })?;
+            if format!("{}/{}", upstream.0, upstream.1) != expected_upstream {
+                return Err(
+                    "Push blocked: upstream config changed since the plan was shown.".to_owned(),
+                );
+            }
+            Some(upstream)
+        }
+        None => None,
+    };
+    let default_remote = default_remote_name(git);
+    let current_target = git
+        .typed_push_target(
+            branch,
+            upstream
+                .as_ref()
+                .map(|(remote, branch)| (remote.as_str(), branch.as_str())),
+            default_remote.as_deref(),
+        )
+        .map_err(|error| format!("Unable to revalidate push target: {error}"))?;
+    if current_target
+        .as_ref()
+        .map(|(remote, branch)| (remote.as_str(), branch.as_str()))
+        != Some((remote, remote_branch))
+    {
+        return Err("Push blocked: push destination changed since the plan was shown.".to_owned());
     }
     let current_remote_urls = git
         .remote_push_urls(remote)
@@ -3208,7 +3288,27 @@ fn validate_open_pull_request_plan(
             "Open pull request blocked: upstream changed since the plan was shown.".to_owned(),
         ));
     }
-    let current_target = git.push_target(branch).map_err(StepExecutionError::Git)?;
+    let tracking_target = git
+        .upstream_push_target(branch)
+        .map_err(StepExecutionError::Git)?
+        .ok_or_else(|| {
+            StepExecutionError::Blocked(
+                "Open pull request blocked: upstream config is no longer available.".to_owned(),
+            )
+        })?;
+    if format!("{}/{}", tracking_target.0, tracking_target.1) != expected_upstream {
+        return Err(StepExecutionError::Blocked(
+            "Open pull request blocked: upstream config changed since the plan was shown."
+                .to_owned(),
+        ));
+    }
+    let current_target = git
+        .typed_push_target(
+            branch,
+            Some((tracking_target.0.as_str(), tracking_target.1.as_str())),
+            None,
+        )
+        .map_err(StepExecutionError::Git)?;
     if current_target
         .as_ref()
         .map(|(name, branch)| (name.as_str(), branch.as_str()))
@@ -3872,6 +3972,7 @@ impl PlanExecutor {
             Some(upstream),
             target,
             remote,
+            upstream_branch,
             remote_urls,
         )
         .map_err(StepExecutionError::Blocked)?;
@@ -3899,7 +4000,7 @@ impl PlanExecutor {
         else {
             return Err(mismatched_context(OperationKind::PushSetUpstream));
         };
-        validate_push_plan(git, branch, None, target, remote, remote_urls)
+        validate_push_plan(git, branch, None, target, remote, branch, remote_urls)
             .map_err(StepExecutionError::Blocked)?;
         let source_oid = target.oid.as_deref().ok_or_else(|| {
             StepExecutionError::Git(GitError::Blocked {
@@ -5847,6 +5948,194 @@ mod tests {
                 .success(),
             "push must not run before the changed pull request target is rejected"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_checkout_push_pr_uses_configured_push_destination() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-remote-checkout-push-target")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-remote-checkout-origin")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        git_stdout(
+            &repo,
+            &["remote", "add", "fork", "ssh://git@github.com/bob/repo.git"],
+        )?;
+        git_stdout(&repo, &["update-ref", "refs/remotes/fork/topic", "HEAD"])?;
+        add_github_remote(&repo, "origin", &origin)?;
+        git_stdout(&repo, &["config", "remote.pushDefault", "origin"])?;
+        let fake_gh = fake_gh("prompt-sequence-remote-checkout-push-target", false)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Checkout {
+                    branch: "fork/topic".to_owned(),
+                },
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(
+            preview.contains("repository: github.com/octo/repo"),
+            "{preview}"
+        );
+        assert!(preview.contains("head: topic"), "{preview}");
+        let paths = isolated_store_paths("prompt-sequence-remote-checkout-push-target-audit")?;
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths, &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        assert!(
+            result.message().contains("completed 3 step(s)"),
+            "{}",
+            result.message()
+        );
+        let local_head = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let pushed = git_stdout(&origin, &["rev-parse", "refs/heads/topic"])?;
+        assert_eq!(pushed.trim(), local_head.trim());
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("--head topic"), "{invocations}");
+        Ok(())
+    }
+
+    #[test]
+    fn create_branch_push_pr_uses_branch_push_remote() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-create-branch-push-target")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-create-branch-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        add_github_remote(&repo, "fork", &fork)?;
+        git_stdout(&repo, &["config", "branch.feature/new.pushRemote", "fork"])?;
+        let fake_gh = fake_gh("prompt-sequence-create-branch-push-target", false)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::CreateBranch {
+                    branch: "feature/new".to_owned(),
+                    base: None,
+                },
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(
+            preview.contains("repository: github.com/upstream/repo"),
+            "{preview}"
+        );
+        assert!(preview.contains("head: octo:feature/new"), "{preview}");
+        let paths = isolated_store_paths("prompt-sequence-create-branch-push-target-audit")?;
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths, &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        assert!(
+            result.message().contains("completed 3 step(s)"),
+            "{}",
+            result.message()
+        );
+        let local_head = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let pushed = git_stdout(&fork, &["rev-parse", "refs/heads/feature/new"])?;
+        assert_eq!(pushed.trim(), local_head.trim());
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(
+            invocations.contains("--head octo:feature/new"),
+            "{invocations}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_matching_base_and_head_fails_before_any_step() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-matching-base-head")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-matching-base-head-origin")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let original_branch = git_stdout(&repo, &["branch", "--show-current"])?;
+        git_stdout(&repo, &["update-ref", "refs/remotes/origin/topic", "HEAD"])?;
+        add_github_remote(&repo, "origin", &origin)?;
+        let fake_gh = fake_gh("prompt-sequence-matching-base-head", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let error = match planner.plan_prompt_sequence(vec![
+            OperationRequest::Checkout {
+                branch: "origin/topic".to_owned(),
+            },
+            OperationRequest::Push,
+            OperationRequest::OpenPullRequest {
+                base: Some("topic".to_owned()),
+            },
+        ]) {
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "matching base and head must fail during sequence preflight",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains("base branch must differ"), "{error}");
+        assert_eq!(
+            git_stdout(&repo, &["branch", "--show-current"])?,
+            original_branch
+        );
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&origin)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/topic"])
+                .status()?
+                .success()
+        );
+        let paths = isolated_store_paths("prompt-sequence-matching-base-head-audit")?;
+        assert!(LocalStore::open(paths)?.list_audit_entries()?.is_empty());
         Ok(())
     }
 
