@@ -47,6 +47,9 @@ const MAX_RECOVERY_SUBPROCESSES: usize = 12;
 const MAX_RECOVERY_GENERATION_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_GENERATION_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_GENERATION_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RECOVERY_BACKUP_POINTER_BYTES: u64 = 16 * 1024;
+const RECOVERY_BACKUP_IDENTITY_BYTES: usize = 64;
+const RECOVERY_GENERATION_DIGEST_BYTES: usize = 32;
 const RECOVERY_BACKUP_POINTER: &str = "bitbygit-recovery-backup.pointer";
 const RECOVERY_CANDIDATE_PREFIX: &str = ".bitbygit-recovery-candidate-";
 const RECOVERY_GIT_ENVIRONMENT: &[&str] = &[
@@ -1526,6 +1529,7 @@ impl RecoveryTransaction {
         let mut pointer_contents = candidate.as_os_str().as_encoded_bytes().to_vec();
         pointer_contents.push(0);
         pointer_contents.extend_from_slice(&backup_identity);
+        pointer_contents.extend_from_slice(&baseline.digest());
         let mut transaction = Self {
             root,
             candidate,
@@ -1921,6 +1925,40 @@ impl RecoveryGeneration {
             entries,
         })
     }
+
+    fn digest(&self) -> [u8; RECOVERY_GENERATION_DIGEST_BYTES] {
+        let mut digest = Sha256::new();
+        update_recovery_filesystem_metadata_digest(&mut digest, &self.root);
+        digest.update((self.entries.len() as u64).to_le_bytes());
+        for entry in &self.entries {
+            update_recovery_digest_bytes(&mut digest, entry.path.as_os_str().as_encoded_bytes());
+            match &entry.value {
+                RecoveryGenerationValue::Directory { metadata } => {
+                    digest.update([0]);
+                    update_recovery_filesystem_metadata_digest(&mut digest, metadata);
+                }
+                RecoveryGenerationValue::File {
+                    metadata,
+                    size,
+                    digest: file_digest,
+                } => {
+                    digest.update([1]);
+                    update_recovery_filesystem_metadata_digest(&mut digest, metadata);
+                    digest.update(size.to_le_bytes());
+                    digest.update(file_digest);
+                }
+                RecoveryGenerationValue::Symlink { metadata, target } => {
+                    digest.update([2]);
+                    update_recovery_filesystem_metadata_digest(&mut digest, metadata);
+                    update_recovery_digest_bytes(
+                        &mut digest,
+                        target.as_os_str().as_encoded_bytes(),
+                    );
+                }
+            }
+        }
+        digest.finalize().into()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1951,6 +1989,23 @@ struct RecoveryFilesystemMetadata {
     owner: (u32, u32),
     modified: (i64, i64),
     inode_flags: u32,
+}
+
+fn update_recovery_filesystem_metadata_digest(
+    digest: &mut Sha256,
+    metadata: &RecoveryFilesystemMetadata,
+) {
+    digest.update(metadata.mode.to_le_bytes());
+    digest.update(metadata.owner.0.to_le_bytes());
+    digest.update(metadata.owner.1.to_le_bytes());
+    digest.update(metadata.modified.0.to_le_bytes());
+    digest.update(metadata.modified.1.to_le_bytes());
+    digest.update(metadata.inode_flags.to_le_bytes());
+}
+
+fn update_recovery_digest_bytes(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
 }
 
 fn recovery_filesystem_metadata(
@@ -2212,25 +2267,40 @@ fn recovery_backup_pointer_path(root: &Path) -> Result<PathBuf, GitError> {
     Ok(root.join(".git").join(RECOVERY_BACKUP_POINTER))
 }
 
-fn recovery_backup_from_pointer(expected_root: &Path) -> Result<Option<PathBuf>, GitError> {
+struct RecoveryBackup {
+    path: PathBuf,
+    generation_digest: [u8; RECOVERY_GENERATION_DIGEST_BYTES],
+}
+
+fn recovery_backup_record_from_pointer(
+    expected_root: &Path,
+) -> Result<Option<RecoveryBackup>, GitError> {
     let pointer = recovery_backup_pointer_path(expected_root)?;
-    let bytes = match fs::read(&pointer) {
-        Ok(bytes) => bytes,
+    let pointer_metadata = match fs::symlink_metadata(&pointer) {
+        Ok(metadata) => metadata,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(recovery_transaction_io(
-                "read the retained recovery backup pointer",
+                "inspect the retained recovery backup pointer",
                 source,
             ));
         }
     };
+    let bytes = read_recovery_sidecar(
+        &pointer,
+        &pointer_metadata,
+        MAX_RECOVERY_BACKUP_POINTER_BYTES,
+        None,
+    )?;
     let Some(separator) = bytes.iter().position(|byte| *byte == 0) else {
-        return Err(recovery_transaction_blocked(
-            "the retained recovery backup pointer is invalid; refusing to remove it",
-        ));
+        return Err(invalid_recovery_backup_pointer());
     };
     let backup = path_from_bytes(&bytes[..separator]);
-    let identity = &bytes[separator + 1..];
+    let record = &bytes[separator + 1..];
+    if record.len() != RECOVERY_BACKUP_IDENTITY_BYTES + RECOVERY_GENERATION_DIGEST_BYTES {
+        return Err(invalid_recovery_backup_pointer());
+    }
+    let (identity, generation_digest) = record.split_at(RECOVERY_BACKUP_IDENTITY_BYTES);
     let valid_location = backup.is_absolute()
         && backup.file_name().is_some_and(|name| {
             name.as_encoded_bytes()
@@ -2240,13 +2310,11 @@ fn recovery_backup_from_pointer(expected_root: &Path) -> Result<Option<PathBuf>,
     let expected_root_metadata = fs::symlink_metadata(expected_root);
     let valid_expected_root = expected_root_metadata.as_ref().is_ok_and(|metadata| {
         metadata.file_type().is_dir()
-            && identity.len() >= 32
             && recovery_file_identity(metadata).0.to_le_bytes() == identity[16..24]
             && recovery_file_identity(metadata).1.to_le_bytes() == identity[24..32]
     });
     let valid_directory = backup_metadata.as_ref().is_ok_and(|metadata| {
         metadata.file_type().is_dir()
-            && identity.len() >= 16
             && recovery_file_identity(metadata).0.to_le_bytes() == identity[..8]
             && recovery_file_identity(metadata).1.to_le_bytes() == identity[8..16]
     });
@@ -2255,25 +2323,86 @@ fn recovery_backup_from_pointer(expected_root: &Path) -> Result<Option<PathBuf>,
         .is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound);
     let owner = recovery_candidate_owner_path(&backup);
     let valid_owner = fs::symlink_metadata(&owner)
-        .is_ok_and(|metadata| metadata.file_type().is_file())
-        && fs::read(&owner).is_ok_and(|contents| contents == identity);
+        .ok()
+        .and_then(|metadata| {
+            read_recovery_sidecar(
+                &owner,
+                &metadata,
+                RECOVERY_BACKUP_IDENTITY_BYTES as u64,
+                Some(RECOVERY_BACKUP_IDENTITY_BYTES as u64),
+            )
+            .ok()
+        })
+        .is_some_and(|contents| contents == identity);
     if !valid_location
         || !valid_expected_root
         || (!valid_directory && !missing_directory)
         || !valid_owner
     {
-        return Err(recovery_transaction_blocked(
-            "the retained recovery backup pointer is invalid; refusing to remove it",
-        ));
+        return Err(invalid_recovery_backup_pointer());
     }
-    Ok(Some(backup))
+    let mut digest = [0_u8; RECOVERY_GENERATION_DIGEST_BYTES];
+    digest.copy_from_slice(generation_digest);
+    Ok(Some(RecoveryBackup {
+        path: backup,
+        generation_digest: digest,
+    }))
+}
+
+#[cfg(test)]
+fn recovery_backup_from_pointer(expected_root: &Path) -> Result<Option<PathBuf>, GitError> {
+    Ok(recovery_backup_record_from_pointer(expected_root)?.map(|backup| backup.path))
+}
+
+fn read_recovery_sidecar(
+    path: &Path,
+    expected: &fs::Metadata,
+    max_bytes: u64,
+    exact_bytes: Option<u64>,
+) -> Result<Vec<u8>, GitError> {
+    if !expected.file_type().is_file()
+        || expected.len() > max_bytes
+        || exact_bytes.is_some_and(|bytes| expected.len() != bytes)
+    {
+        return Err(invalid_recovery_backup_pointer());
+    }
+    let (mut file, opened) = open_recovery_regular_file(path, path, expected)?;
+    let mut contents = Vec::with_capacity(opened.len() as usize);
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)
+        .map_err(|source| {
+            recovery_transaction_io("read retained recovery backup metadata", source)
+        })?;
+    if contents.len() as u64 != opened.len() || contents.len() as u64 > max_bytes {
+        return Err(invalid_recovery_backup_pointer());
+    }
+    ensure_recovery_regular_file_path_unchanged(path, path, &opened)?;
+    Ok(contents)
+}
+
+fn invalid_recovery_backup_pointer() -> GitError {
+    recovery_transaction_blocked(
+        "the retained recovery backup pointer is invalid; refusing to remove it",
+    )
 }
 
 fn remove_previous_recovery_backup(root: &Path) -> Result<(), GitError> {
-    let Some(backup) = recovery_backup_from_pointer(root)? else {
+    let Some(backup) = recovery_backup_record_from_pointer(root)? else {
         return Ok(());
     };
-    if let Err(source) = fs::remove_dir_all(&backup)
+    match RecoveryGeneration::capture(&backup.path) {
+        Ok(generation) if generation.digest() != backup.generation_digest => {
+            return Err(recovery_transaction_blocked(format!(
+                "the retained recovery backup at {} changed after promotion; refusing to remove it",
+                backup.path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(_) if !backup.path.exists() => {}
+        Err(error) => return Err(error),
+    }
+    if let Err(source) = fs::remove_dir_all(&backup.path)
         && source.kind() != std::io::ErrorKind::NotFound
     {
         return Err(recovery_transaction_io(
@@ -2283,7 +2412,7 @@ fn remove_previous_recovery_backup(root: &Path) -> Result<(), GitError> {
     }
     fs::remove_file(recovery_backup_pointer_path(root)?)
         .map_err(|source| recovery_transaction_io("remove the previous backup pointer", source))?;
-    let _result = fs::remove_file(recovery_candidate_owner_path(&backup));
+    let _result = fs::remove_file(recovery_candidate_owner_path(&backup.path));
     Ok(())
 }
 
@@ -2304,7 +2433,7 @@ fn append_recovery_backup_notice(output: &mut String, backup: &Path) {
         output.push('\n');
     }
     output.push_str(&format!(
-        "bitbygit: previous repository generation retained at {}; it will be removed before the next recovery attempt\n",
+        "bitbygit: previous repository generation retained at {}; it will be removed before the next recovery attempt only if unchanged\n",
         backup.display()
     ));
 }
@@ -4750,6 +4879,53 @@ mod tests {
     }
 
     #[test]
+    fn changed_retained_backup_blocks_later_recovery() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let mut stale_file = fs::OpenOptions::new()
+            .write(true)
+            .open(repo.path().join("conflict.txt"))?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+        let root = repo.path().canonicalize()?;
+        let backup =
+            recovery_backup_from_pointer(&root)?.ok_or("missing retained recovery backup")?;
+        stale_file.set_len(0)?;
+        stale_file.write_all(b"late stale-descriptor write\n")?;
+        stale_file.sync_all()?;
+        assert_eq!(
+            fs::read_to_string(backup.join("conflict.txt"))?,
+            "late stale-descriptor write\n"
+        );
+
+        repo.run_allow_failure(["merge", "other"])?;
+        let expected = git.recovery_state()?;
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected changed retained backup to block later recovery".into());
+        };
+
+        assert!(error.to_string().contains("changed after promotion"));
+        assert_eq!(recovery_backup_from_pointer(&root)?, Some(backup.clone()));
+        assert_eq!(
+            fs::read_to_string(backup.join("conflict.txt"))?,
+            "late stale-descriptor write\n"
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[test]
     fn retained_backup_follows_repository_rename() -> Result<(), Box<dyn Error>> {
         let (mut repo, _original_head) = prepare_merge_conflict()?;
         let git = Git::new(repo.path());
@@ -5052,6 +5228,79 @@ mod tests {
         assert_eq!(fs::read_to_string(&victim)?, "must remain unchanged\n");
         fs::remove_file(owner)?;
         fs::remove_file(victim)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_backup_sidecars_reject_fifo_and_oversized_files() -> Result<(), Box<dyn Error>> {
+        let fifo_repo = initialized_repo()?;
+        let fifo_root = fifo_repo.path().canonicalize()?;
+        let fifo_pointer = recovery_backup_pointer_path(&fifo_root)?;
+        if !Command::new("mkfifo")
+            .arg(&fifo_pointer)
+            .status()?
+            .success()
+        {
+            return Err("mkfifo failed".into());
+        }
+        let started = std::time::Instant::now();
+        let Err(error) = recovery_backup_from_pointer(&fifo_root) else {
+            return Err("expected FIFO backup pointer to be rejected".into());
+        };
+        assert!(matches!(error, GitError::Blocked { .. }));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        fs::remove_file(fifo_pointer)?;
+
+        let oversized_repo = initialized_repo()?;
+        let oversized_root = oversized_repo.path().canonicalize()?;
+        let oversized_pointer = recovery_backup_pointer_path(&oversized_root)?;
+        fs::write(
+            &oversized_pointer,
+            vec![0_u8; MAX_RECOVERY_BACKUP_POINTER_BYTES as usize + 1],
+        )?;
+        let Err(error) = recovery_backup_from_pointer(&oversized_root) else {
+            return Err("expected oversized backup pointer to be rejected".into());
+        };
+        assert!(matches!(error, GitError::Blocked { .. }));
+        fs::remove_file(oversized_pointer)?;
+
+        let owner_repo = initialized_repo()?;
+        let owner_root = owner_repo.path().canonicalize()?;
+        let parent = owner_root.parent().ok_or("test repository has no parent")?;
+        let backup = parent.join(format!(
+            "{RECOVERY_CANDIDATE_PREFIX}hostile-owner-{}",
+            NEXT_REPO_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&backup)?;
+        let backup_identity = recovery_file_identity(&fs::symlink_metadata(&backup)?);
+        let root_identity = recovery_file_identity(&fs::symlink_metadata(&owner_root)?);
+        let mut identity = Vec::with_capacity(RECOVERY_BACKUP_IDENTITY_BYTES);
+        for value in [
+            backup_identity.0,
+            backup_identity.1,
+            root_identity.0,
+            root_identity.1,
+        ] {
+            identity.extend_from_slice(&value.to_le_bytes());
+        }
+        identity.extend_from_slice(&[0_u8; 32]);
+        let owner = recovery_candidate_owner_path(&backup);
+        fs::write(&owner, vec![0_u8; RECOVERY_BACKUP_IDENTITY_BYTES + 1])?;
+        let mut pointer_contents = backup.as_os_str().as_encoded_bytes().to_vec();
+        pointer_contents.push(0);
+        pointer_contents.extend_from_slice(&identity);
+        pointer_contents.extend_from_slice(&[0_u8; RECOVERY_GENERATION_DIGEST_BYTES]);
+        fs::write(recovery_backup_pointer_path(&owner_root)?, pointer_contents)?;
+
+        let Err(error) = recovery_backup_from_pointer(&owner_root) else {
+            return Err("expected oversized backup owner sidecar to be rejected".into());
+        };
+        assert!(matches!(error, GitError::Blocked { .. }));
+        assert!(backup.is_dir());
+        fs::remove_file(recovery_backup_pointer_path(&owner_root)?)?;
+        fs::remove_file(owner)?;
+        fs::remove_dir(backup)?;
         Ok(())
     }
 
