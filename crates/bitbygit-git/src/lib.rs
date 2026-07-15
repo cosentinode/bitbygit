@@ -4735,8 +4735,12 @@ mod tests {
         };
         #[cfg(windows)]
         let mut command = {
-            let mut command = Command::new("cmd");
-            command.args(["/C", "for /L %i in (1,1,1000000) do @echo 0123456789"]);
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::Out.Write('x' * 5000000)",
+            ]);
             command
         };
         configure_process_group(&mut command);
@@ -4752,7 +4756,10 @@ mod tests {
             return Err("expected oversized recovery output to be stopped".into());
         };
 
-        assert!(error.to_string().contains("bounded capture limit"));
+        assert!(
+            error.to_string().contains("bounded capture limit"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 
