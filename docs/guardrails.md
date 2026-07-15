@@ -121,9 +121,12 @@ Conflict mode should:
 - audit conflict recovery actions
 
 Conflict recovery actions are high risk because they move repository state.
-Atomic conflict recovery is currently Linux-only and requires user and mount
-namespaces plus same-filesystem atomic directory exchange. Unsupported or
-restricted hosts block recovery before changing repository state.
+Atomic conflict recovery is currently Linux-only and requires user, mount, and
+PID namespaces plus same-filesystem atomic directory exchange. Recovery ignores
+system and global Git configuration, rejects external config includes, and
+retains one prior repository generation until the user explicitly moves or
+deletes it. Unsupported or restricted hosts block recovery before changing
+repository state.
 
 ## Confirmation Copy
 

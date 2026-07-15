@@ -50,10 +50,12 @@ Prerequisites:
 - `git` available on `PATH`.
 - `gh` is optional for future GitHub workflows.
 
-Conflict recovery is supported on Linux hosts that provide unprivileged user
-and mount namespaces, bind mounts, and same-filesystem atomic directory
+Conflict recovery is supported on Linux hosts that provide unprivileged user,
+mount, and PID namespaces, bind mounts, and same-filesystem atomic directory
 exchange. It fails closed without changing the repository on other platforms
-or when those Linux capabilities are restricted.
+or when those Linux capabilities are restricted. Recovery retains one previous
+repository generation; inspect and move or delete the reported directory before
+running another recovery.
 
 Run local checks:
 
