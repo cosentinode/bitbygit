@@ -146,13 +146,15 @@ if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $Output"
 }
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ";") -notcontains $InstallDir) {
-    $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
-    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
-}
-if (($env:Path -split ";") -notcontains $InstallDir) {
-    $env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $InstallDir } else { "$InstallDir;$env:Path" }
-}
+$UserPathEntries = @($UserPath -split ";" | Where-Object {
+    -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
+})
+$NewUserPath = (@($InstallDir) + $UserPathEntries) -join ";"
+[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+$ProcessPathEntries = @($env:Path -split ";" | Where-Object {
+    -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
+})
+$env:Path = (@($InstallDir) + $ProcessPathEntries) -join ";"
 $PathOutput = bitbygit --version
 if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version on PATH, got $PathOutput"
@@ -254,13 +256,15 @@ if ($LASTEXITCODE -ne 0 -or $InstalledOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $InstalledOutput"
 }
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ";") -notcontains $InstallDir) {
-    $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
-    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
-}
-if (($env:Path -split ";") -notcontains $InstallDir) {
-    $env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $InstallDir } else { "$InstallDir;$env:Path" }
-}
+$UserPathEntries = @($UserPath -split ";" | Where-Object {
+    -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
+})
+$NewUserPath = (@($InstallDir) + $UserPathEntries) -join ";"
+[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+$ProcessPathEntries = @($env:Path -split ";" | Where-Object {
+    -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
+})
+$env:Path = (@($InstallDir) + $ProcessPathEntries) -join ";"
 $PathOutput = bitbygit --version
 if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version on PATH, got $PathOutput"

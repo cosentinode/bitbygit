@@ -53,13 +53,17 @@ if ($SelectedVersion -eq $WorkspaceVersion -or $SelectedVersion -eq "0.1.0") {
 if (-not $DocsText.Contains("`$Version = `"$WorkspaceVersion`"")) {
     Fail "PowerShell examples do not use workspace version $WorkspaceVersion"
 }
-$EmptyPathGuard = '$NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }'
-if ([regex]::Matches($DocsText, [regex]::Escape($EmptyPathGuard)).Count -ne 2) {
-    Fail "Windows examples do not handle empty user PATH values consistently"
+$UserPathOrder = '$NewUserPath = (@($InstallDir) + $UserPathEntries) -join ";"'
+if ([regex]::Matches($DocsText, [regex]::Escape($UserPathOrder)).Count -ne 2) {
+    Fail "Windows examples do not prioritize the install directory in user PATH"
 }
-$ProcessPathGuard = '$env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $InstallDir } else { "$InstallDir;$env:Path" }'
-if ([regex]::Matches($DocsText, [regex]::Escape($ProcessPathGuard)).Count -ne 2) {
-    Fail "Windows examples do not handle process PATH values consistently"
+$ProcessPathOrder = '$env:Path = (@($InstallDir) + $ProcessPathEntries) -join ";"'
+if ([regex]::Matches($DocsText, [regex]::Escape($ProcessPathOrder)).Count -ne 2) {
+    Fail "Windows examples do not prioritize the install directory in process PATH"
+}
+$PathEntryFilter = '-not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir'
+if ([regex]::Matches($DocsText, [regex]::Escape($PathEntryFilter)).Count -ne 4) {
+    Fail "Windows examples do not remove empty and duplicate install directory PATH entries"
 }
 if ([regex]::Matches($DocsText, '(?m)^bitbygit --version\r?$').Count -ne 2) {
     Fail "Windows examples do not finish with PATH-resolved version output"
@@ -243,7 +247,14 @@ try {
     Set-Content -Path $SourceScript -Value $SourceBlock
     $env:LOCALAPPDATA = Join-Path $SourceSuccessDir "local-app-data"
     $SourceInstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
-    $SourceStartingPath = "$SourceInstallDir;$OriginalProcessPath"
+    $OldBinaryDir = Join-Path $SourceSuccessDir "old-bin"
+    New-Item -ItemType Directory -Path $OldBinaryDir | Out-Null
+    Copy-Item $WorkspaceBinary (Join-Path $OldBinaryDir "bitbygit.exe")
+    $SourceStartingPath = "$OldBinaryDir;$OriginalProcessPath;$SourceInstallDir;$SourceInstallDir"
+    $SourceExpectedEntries = @($OldBinaryDir) + @($OriginalProcessPath -split ";" | Where-Object {
+        -not [string]::IsNullOrEmpty($_)
+    })
+    $SourceExpectedPath = (@($SourceInstallDir) + $SourceExpectedEntries) -join ";"
     $env:Path = $SourceStartingPath
     $env:BITBYGIT_TEST_USER_PATH = $SourceStartingPath
     $CapturedUserPath = $null
@@ -263,9 +274,10 @@ try {
     }
     $SourceInstalledBinary = Join-Path $SourceInstallDir "bitbygit.exe"
     if ($ErrorActionPreference -ne "Continue") { Fail "source block changed the caller error preference" }
-    if ($env:Path -ne $SourceStartingPath) { Fail "source block duplicated an existing process PATH entry" }
+    if ($env:Path -ne $SourceExpectedPath) { Fail "source block did not prioritize and deduplicate the process PATH entry" }
     if (($env:Path -split ';' | Where-Object { $_ -eq $SourceInstallDir }).Count -ne 1) { Fail "source block duplicated the process PATH entry" }
-    if ($null -ne $CapturedUserPath) { Fail "source block duplicated an existing user PATH entry" }
+    if ($CapturedUserPath -ne $SourceExpectedPath) { Fail "source block did not prioritize and deduplicate the user PATH entry" }
+    if (($CapturedUserPath -split ';' | Where-Object { $_ -eq $SourceInstallDir }).Count -ne 1) { Fail "source block duplicated the user PATH entry" }
     if (-not $FetchedExactTag -or -not $CheckedOutExactTag) { Fail "source block did not check out the exact tag" }
     if (-not (Test-Path $SourceInstalledBinary)) { Fail "source block did not install bitbygit.exe" }
     $SourceResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
@@ -273,6 +285,13 @@ try {
     $SourceOutput = bitbygit --version
     if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $SelectedVersion") {
         Fail "source block installed the wrong version"
+    }
+    $env:Path = $CapturedUserPath
+    $NewShellResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
+    if ($NewShellResolvedBinary -ne $SourceInstalledBinary) { Fail "new shell PATH resolved the older bitbygit.exe" }
+    $NewShellOutput = bitbygit --version
+    if ($LASTEXITCODE -ne 0 -or $NewShellOutput -ne "bitbygit $SelectedVersion") {
+        Fail "new shell PATH resolved the wrong bitbygit version"
     }
 
     $SourceFailureDir = Join-Path $Temp "source-failure"
