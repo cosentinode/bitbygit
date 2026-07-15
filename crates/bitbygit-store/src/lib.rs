@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bitbygit_core::config::AppConfig;
+
 #[cfg(unix)]
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -14,6 +16,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorePaths {
     pub config_dir: PathBuf,
+    pub config_file: PathBuf,
     pub data_dir: PathBuf,
     pub registry_file: PathBuf,
     pub state_file: PathBuf,
@@ -25,10 +28,11 @@ impl StorePaths {
         let config_dir = config_dir.into();
         let data_dir = data_dir.into();
         Self {
-            config_dir,
+            config_file: config_dir.join("config.toml"),
             registry_file: data_dir.join("registry.tsv"),
             state_file: data_dir.join("state.tsv"),
             audit_file: data_dir.join("audit.tsv"),
+            config_dir,
             data_dir,
         }
     }
@@ -48,6 +52,40 @@ pub struct LocalStore {
     paths: StorePaths,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedConfig {
+    pub settings: AppConfig,
+    pub diagnostic: Option<ConfigDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigDiagnosticKind {
+    Unreadable,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDiagnostic {
+    pub path: PathBuf,
+    pub kind: ConfigDiagnosticKind,
+    pub message: String,
+}
+
+impl Display for ConfigDiagnostic {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "configuration at {} {}: {}; using safe defaults",
+            self.path.display(),
+            match self.kind {
+                ConfigDiagnosticKind::Unreadable => "could not be read",
+                ConfigDiagnosticKind::Invalid => "is invalid",
+            },
+            self.message
+        )
+    }
+}
+
 impl LocalStore {
     pub fn open(paths: StorePaths) -> Result<Self, StoreError> {
         fs::create_dir_all(&paths.config_dir).map_err(|source| StoreError::Io {
@@ -63,6 +101,38 @@ impl LocalStore {
 
     pub fn paths(&self) -> &StorePaths {
         &self.paths
+    }
+
+    pub fn load_config(&self) -> LoadedConfig {
+        let path = &self.paths.config_file;
+        match fs::read_to_string(path) {
+            Ok(contents) => match AppConfig::parse(&contents) {
+                Ok(settings) => LoadedConfig {
+                    settings,
+                    diagnostic: None,
+                },
+                Err(error) => LoadedConfig {
+                    settings: AppConfig::default(),
+                    diagnostic: Some(ConfigDiagnostic {
+                        path: path.clone(),
+                        kind: ConfigDiagnosticKind::Invalid,
+                        message: error.to_string(),
+                    }),
+                },
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => LoadedConfig {
+                settings: AppConfig::default(),
+                diagnostic: None,
+            },
+            Err(error) => LoadedConfig {
+                settings: AppConfig::default(),
+                diagnostic: Some(ConfigDiagnostic {
+                    path: path.clone(),
+                    kind: ConfigDiagnosticKind::Unreadable,
+                    message: error.to_string(),
+                }),
+            },
+        }
     }
 
     pub fn add_repository(&self, path: impl AsRef<Path>) -> Result<RepositoryRecord, StoreError> {
@@ -1205,11 +1275,91 @@ mod tests {
     }
 
     #[test]
+    fn missing_config_loads_complete_safe_defaults() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+
+        let loaded = store.load_config();
+
+        assert_eq!(loaded.settings, AppConfig::default());
+        assert_eq!(loaded.diagnostic, None);
+        Ok(())
+    }
+
+    #[test]
+    fn valid_config_loads_typed_settings() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        fs::write(
+            &store.paths().config_file,
+            "[policy]\ndisabled-operations = [\"rebase\"]\n[prompt]\nenabled = false\n",
+        )?;
+
+        let loaded = store.load_config();
+
+        assert_eq!(
+            loaded.settings.policy.disabled_operations,
+            [bitbygit_core::config::OperationFamily::Rebase]
+        );
+        assert!(!loaded.settings.prompt.enabled);
+        assert_eq!(loaded.diagnostic, None);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_config_reports_safe_context_and_does_not_reach_audit() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        fs::write(
+            &store.paths().config_file,
+            "github-token = \"super-secret-value\"\n",
+        )?;
+
+        let loaded = store.load_config();
+        let diagnostic = loaded
+            .diagnostic
+            .as_ref()
+            .ok_or("invalid config should produce a diagnostic")?;
+
+        assert_eq!(loaded.settings, AppConfig::default());
+        assert_eq!(diagnostic.path, store.paths().config_file);
+        assert_eq!(diagnostic.kind, ConfigDiagnosticKind::Invalid);
+        assert!(diagnostic.to_string().contains("line 1"));
+        assert!(!format!("{diagnostic:?}").contains("super-secret-value"));
+        assert!(!store.paths().audit_file.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_config_reports_path_and_uses_safe_defaults() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let store = fixture.store()?;
+        fs::create_dir(&store.paths().config_file)?;
+
+        let loaded = store.load_config();
+        let diagnostic = loaded
+            .diagnostic
+            .as_ref()
+            .ok_or("unreadable config should produce a diagnostic")?;
+
+        assert_eq!(loaded.settings, AppConfig::default());
+        assert_eq!(diagnostic.path, store.paths().config_file);
+        assert_eq!(diagnostic.kind, ConfigDiagnosticKind::Unreadable);
+        assert!(diagnostic.to_string().contains("using safe defaults"));
+        Ok(())
+    }
+
+    #[test]
     fn store_paths_define_config_and_data_locations() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new()?;
         let paths = fixture.paths();
 
         assert_eq!(paths.config_dir, fixture.path.join("config"));
+        assert_eq!(
+            paths.config_file,
+            fixture.path.join("config").join("config.toml")
+        );
         assert_eq!(paths.data_dir, fixture.path.join("data"));
         assert_eq!(
             paths.registry_file,

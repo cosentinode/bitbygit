@@ -31,3 +31,5 @@ semantic versioning once releases begin.
   golden parser tests, manual planner parity, and safe non-provider multi-step
   prompts; `open pr` prompt execution remains Phase 11 GitHub integration work
   in [#13](https://github.com/cosentinode/bitbygit/issues/13).
+- Added strict typed TOML configuration loading with complete safe-default
+  fallback and redacted path-aware diagnostics.
