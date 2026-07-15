@@ -1586,6 +1586,7 @@ impl RecoveryTransaction {
             ));
         }
         ensure_recovery_git_storage_isolated(&root)?;
+        ensure_recovery_mount_tree_isolated(&root)?;
         let parent = root.parent().ok_or_else(|| {
             recovery_transaction_blocked("repository root has no parent for isolated recovery")
         })?;
@@ -1595,6 +1596,7 @@ impl RecoveryTransaction {
     }
 
     fn copy_repository(&mut self) -> Result<(), GitError> {
+        ensure_recovery_mount_tree_isolated(&self.root)?;
         let output = Command::new("cp")
             .args(["-a", "--no-preserve=links", "--reflink=auto", "--"])
             .arg(self.root.join("."))
@@ -1708,6 +1710,7 @@ impl RecoveryTransaction {
         }
 
         run_recovery_promotion_hook(&self.root);
+        ensure_recovery_mount_tree_isolated(&self.root)?;
         atomic_exchange_directories(&self.root, &self.candidate)?;
         self.keep_candidate = true;
         let old_generation = RecoveryGeneration::capture(&self.candidate);
@@ -1731,7 +1734,7 @@ impl RecoveryTransaction {
 
 impl Drop for RecoveryTransaction {
     fn drop(&mut self) {
-        if !self.keep_candidate {
+        if !self.keep_candidate && ensure_recovery_mount_tree_isolated(&self.candidate).is_ok() {
             let _result = fs::remove_dir_all(&self.candidate);
             let _result = fs::remove_file(recovery_candidate_owner_path(&self.candidate));
             let _result = fs::remove_file(&self.backup_pointer);
@@ -1765,11 +1768,13 @@ impl RecoveryGeneration {
                 "repository root changed while its generation was captured",
             ));
         }
+        let root_mount_id = recovery_mount_id(root, Path::new("."))?;
         let root_value = recovery_filesystem_metadata(
             root,
             Path::new("."),
             &root_metadata,
             None,
+            root_mount_id,
             allow_hard_linked_git_objects,
         )?;
         let mut entries = Vec::new();
@@ -1807,6 +1812,7 @@ impl RecoveryGeneration {
                             &relative,
                             &metadata,
                             None,
+                            root_mount_id,
                             allow_hard_linked_git_objects,
                         )?,
                     }
@@ -1824,6 +1830,7 @@ impl RecoveryGeneration {
                         &relative,
                         &opened_metadata,
                         Some(&file),
+                        root_mount_id,
                         allow_hard_linked_git_objects,
                     )?;
                     run_recovery_generation_file_read_hook(&path);
@@ -1862,6 +1869,7 @@ impl RecoveryGeneration {
                         &relative,
                         &current,
                         Some(&file),
+                        root_mount_id,
                         allow_hard_linked_git_objects,
                     )?;
                     if current_metadata != file_metadata {
@@ -1887,6 +1895,7 @@ impl RecoveryGeneration {
                             &relative,
                             &metadata,
                             None,
+                            root_mount_id,
                             allow_hard_linked_git_objects,
                         )?,
                         target: fs::read_link(&path).map_err(|source| {
@@ -1913,6 +1922,7 @@ impl RecoveryGeneration {
             Path::new("."),
             &current_root,
             None,
+            root_mount_id,
             allow_hard_linked_git_objects,
         )?;
         if current_root_value != root_value {
@@ -2013,8 +2023,15 @@ fn recovery_filesystem_metadata(
     relative: &Path,
     metadata: &fs::Metadata,
     opened: Option<&fs::File>,
+    root_mount_id: u64,
     allow_hard_linked_git_objects: bool,
 ) -> Result<RecoveryFilesystemMetadata, GitError> {
+    if recovery_mount_id(path, relative)? != root_mount_id {
+        return Err(recovery_transaction_blocked(format!(
+            "atomic recovery does not support mounted filesystem entry {}",
+            relative.display()
+        )));
+    }
     ensure_no_recovery_extended_attributes(path, relative)?;
     #[cfg(unix)]
     {
@@ -2046,6 +2063,87 @@ fn recovery_filesystem_metadata(
             inode_flags: 0,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_mount_id(path: &Path, relative: &Path) -> Result<u64, GitError> {
+    use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
+
+    let result = statx(
+        CWD,
+        path,
+        AtFlags::NO_AUTOMOUNT | AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::MNT_ID,
+    )
+    .map_err(|source| {
+        recovery_capability_unavailable(format!(
+            "the mount identity of {} could not be inspected: {source}",
+            relative.display()
+        ))
+    })?;
+    if result.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        return Err(recovery_capability_unavailable(
+            "Linux mount identity inspection is not available",
+        ));
+    }
+    Ok(result.stx_mnt_id)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recovery_mount_id(_path: &Path, _relative: &Path) -> Result<u64, GitError> {
+    Ok(0)
+}
+
+fn ensure_recovery_mount_tree_isolated(root: &Path) -> Result<(), GitError> {
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|source| recovery_transaction_io("inspect recovery cleanup root", source))?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(recovery_transaction_blocked(
+            "recovery directory changed before its mount boundary was checked",
+        ));
+    }
+    let root_mount_id = recovery_mount_id(root, Path::new("."))?;
+    let mut pending = vec![PathBuf::new()];
+    let mut entries = 0_usize;
+    let mut path_bytes = 0_usize;
+    while let Some(relative_dir) = pending.pop() {
+        let directory = root.join(&relative_dir);
+        let children = fs::read_dir(&directory)
+            .map_err(|source| recovery_transaction_io("inspect recovery mount tree", source))?;
+        for child in children {
+            let child = child
+                .map_err(|source| recovery_transaction_io("inspect recovery mount tree", source))?;
+            let relative = relative_dir.join(child.file_name());
+            entries = entries.saturating_add(1);
+            path_bytes = path_bytes.saturating_add(relative.as_os_str().as_encoded_bytes().len());
+            if entries > MAX_RECOVERY_GENERATION_ENTRIES
+                || path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
+            {
+                return Err(recovery_transaction_blocked(
+                    "repository generation exceeds atomic recovery entry or path bounds",
+                ));
+            }
+            let path = child.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|source| {
+                recovery_transaction_io("inspect recovery mount tree entry", source)
+            })?;
+            if recovery_mount_id(&path, &relative)? != root_mount_id {
+                return Err(recovery_transaction_blocked(format!(
+                    "atomic recovery does not support mounted filesystem entry {}",
+                    relative.display()
+                )));
+            }
+            if metadata.file_type().is_dir() {
+                pending.push(relative);
+            }
+        }
+    }
+    if recovery_mount_id(root, Path::new("."))? != root_mount_id {
+        return Err(recovery_transaction_blocked(
+            "recovery directory mount changed while it was checked",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2402,6 +2500,9 @@ fn remove_previous_recovery_backup(root: &Path) -> Result<(), GitError> {
         Err(_) if !backup.path.exists() => {}
         Err(error) => return Err(error),
     }
+    if backup.path.exists() {
+        ensure_recovery_mount_tree_isolated(&backup.path)?;
+    }
     if let Err(source) = fs::remove_dir_all(&backup.path)
         && source.kind() != std::io::ErrorKind::NotFound
     {
@@ -2449,6 +2550,7 @@ fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> 
         }
     };
     let result = (|| {
+        let _mount_id = recovery_mount_id(&source, Path::new("capability probe"))?;
         let output = Command::new("unshare")
             .args([
                 "--user",
@@ -5064,6 +5166,159 @@ mod tests {
         assert_eq!(RecoveryGeneration::capture(&root)?, before);
         assert_eq!(git.recovery_state()?, expected);
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_recovery_rejects_nested_bind_mount_and_preserves_mounted_data()
+    -> Result<(), Box<dyn Error>> {
+        const CHILD: &str = "BITBYGIT_TEST_NESTED_RECOVERY_MOUNT";
+
+        if env::var_os(CHILD).is_none() {
+            let probe_root = TempRepo::new()?;
+            let probe_source = probe_root.path().join("source");
+            let probe_target = probe_root.path().join("target");
+            fs::create_dir(&probe_source)?;
+            fs::create_dir(&probe_target)?;
+            let probe = Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--fork",
+                    "mount",
+                    "--bind",
+                ])
+                .arg(&probe_source)
+                .arg(&probe_target)
+                .output()?;
+            if !probe.status.success() {
+                if env::var_os("BITBYGIT_REQUIRE_RECOVERY_SUCCESS").is_some() {
+                    return Err(format!(
+                        "nested-mount recovery capabilities are required for this test: {}",
+                        String::from_utf8_lossy(&probe.stderr).trim()
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+            let output = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "--fork"])
+                .arg(env::current_exe()?)
+                .args([
+                    "--exact",
+                    "tests::exact_recovery_rejects_nested_bind_mount_and_preserves_mounted_data",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "nested-mount recovery child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        use std::os::unix::fs::MetadataExt;
+
+        struct BindMountGuard(Option<PathBuf>);
+
+        impl BindMountGuard {
+            fn unmount(&mut self) -> Result<(), Box<dyn Error>> {
+                let Some(target) = self.0.take() else {
+                    return Ok(());
+                };
+                let status = Command::new("umount").arg(&target).status()?;
+                if !status.success() {
+                    self.0 = Some(target);
+                    return Err("nested bind unmount failed".into());
+                }
+                Ok(())
+            }
+        }
+
+        impl Drop for BindMountGuard {
+            fn drop(&mut self) {
+                if let Some(target) = &self.0 {
+                    let _result = Command::new("umount").arg(target).status();
+                }
+            }
+        }
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let source = repo.path().with_extension("nested-mount-source");
+        let target = repo.path().join("nested-mount");
+        fs::create_dir(&source)?;
+        fs::create_dir(&target)?;
+        fs::write(source.join("sentinel"), "must survive recovery\n")?;
+        assert_eq!(fs::metadata(&source)?.dev(), fs::metadata(&target)?.dev());
+        let bind_mount = |target: &Path| -> Result<BindMountGuard, Box<dyn Error>> {
+            let mount = Command::new("mount")
+                .args(["--bind"])
+                .arg(&source)
+                .arg(target)
+                .output()?;
+            if !mount.status.success() {
+                return Err(format!(
+                    "nested bind mount failed: {}",
+                    String::from_utf8_lossy(&mount.stderr).trim()
+                )
+                .into());
+            }
+            Ok(BindMountGuard(Some(target.to_owned())))
+        };
+        let mut guard = bind_mount(&target)?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+
+        for attempt in 1..=2 {
+            let Err(error) =
+                git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+            else {
+                return Err(
+                    format!("nested mount recovery attempt {attempt} was not blocked").into(),
+                );
+            };
+            assert!(
+                error.to_string().contains("mounted filesystem entry"),
+                "{error}"
+            );
+            assert_eq!(git.recovery_state()?, expected);
+            assert_eq!(
+                fs::read_to_string(source.join("sentinel"))?,
+                "must survive recovery\n"
+            );
+        }
+
+        guard.unmount()?;
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+        let root = repo.path().canonicalize()?;
+        let backup = recovery_backup_from_pointer(&root)?.ok_or("missing retained backup")?;
+        repo.run_allow_failure(["merge", "other"])?;
+        let expected = git.recovery_state()?;
+        let mut guard = bind_mount(&backup.join("nested-mount"))?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("nested backup mount was not blocked before later recovery cleanup".into());
+        };
+        assert!(
+            error.to_string().contains("mounted filesystem entry"),
+            "{error}"
+        );
+        assert_eq!(git.recovery_state()?, expected);
+        assert_eq!(recovery_backup_from_pointer(&root)?, Some(backup));
+        assert_eq!(
+            fs::read_to_string(source.join("sentinel"))?,
+            "must survive recovery\n"
+        );
+
+        guard.unmount()?;
+        fs::remove_dir_all(source)?;
         Ok(())
     }
 

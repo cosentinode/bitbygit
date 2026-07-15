@@ -48,6 +48,7 @@ jobs:
           BITBYGIT_REQUIRE_RECOVERY_SUCCESS: "1"
         run: |
           cargo test --locked -p bitbygit-git tests::exact_recovery_executes_every_supported_action -- --exact
+          cargo test --locked -p bitbygit-git tests::exact_recovery_rejects_nested_bind_mount_and_preserves_mounted_data -- --exact
           cargo test --locked -p bitbygit-tui tests::tui_reattaches_to_promoted_repository_after_recovery -- --exact
 
       - name: Build
