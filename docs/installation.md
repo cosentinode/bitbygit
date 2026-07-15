@@ -76,12 +76,13 @@ new_path="${install_dir}"
 if [[ -z "${PATH+x}" ]]; then
   PATH="$(command -p getconf PATH)"
 fi
-IFS=: read -r -a path_entries <<< "${PATH}:__BITBYGIT_PATH_END__"
-path_entry_count="${#path_entries[@]}"
-unset "path_entries[$((path_entry_count - 1))]"
-for entry in "${path_entries[@]}"; do
+remaining_path="${PATH}"
+while [[ "${remaining_path}" == *:* ]]; do
+  entry="${remaining_path%%:*}"
+  remaining_path="${remaining_path#*:}"
   [[ "${entry}" == "${install_dir}" ]] || new_path+=":${entry}"
 done
+[[ "${remaining_path}" == "${install_dir}" ]] || new_path+=":${remaining_path}"
 export PATH="${new_path}"
 resolved_binary="$(type -P bitbygit || true)"
 if [[ -n "${resolved_binary}" && "${resolved_binary}" -ef "${install_dir}/bitbygit" ]] &&
@@ -148,12 +149,13 @@ new_path="${install_dir}"
 if [[ -z "${PATH+x}" ]]; then
   PATH="$(command -p getconf PATH)"
 fi
-IFS=: read -r -a path_entries <<< "${PATH}:__BITBYGIT_PATH_END__"
-path_entry_count="${#path_entries[@]}"
-unset "path_entries[$((path_entry_count - 1))]"
-for entry in "${path_entries[@]}"; do
+remaining_path="${PATH}"
+while [[ "${remaining_path}" == *:* ]]; do
+  entry="${remaining_path%%:*}"
+  remaining_path="${remaining_path#*:}"
   [[ "${entry}" == "${install_dir}" ]] || new_path+=":${entry}"
 done
+[[ "${remaining_path}" == "${install_dir}" ]] || new_path+=":${remaining_path}"
 export PATH="${new_path}"
 resolved_binary="$(type -P bitbygit || true)"
 if [[ -n "${resolved_binary}" && "${resolved_binary}" -ef "${install_dir}/bitbygit" ]] &&
@@ -300,6 +302,7 @@ VERSION="${VERSION}" bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 TAG="refs/tags/v${VERSION}"
 WORK_DIR="$(mktemp -d)"
 SOURCE_DIR="${WORK_DIR}/bitbygit"
+TARGET_DIR="${WORK_DIR}/cargo-target"
 cleanup() {
   status=$?
   trap - EXIT
@@ -316,15 +319,25 @@ git -C "${SOURCE_DIR}" fetch --depth 1 https://github.com/cosentinode/bitbygit.g
 tag_commit="$(git -C "${SOURCE_DIR}" rev-parse --verify "${TAG}^{commit}")"
 git -C "${SOURCE_DIR}" checkout --detach "${tag_commit}"
 [[ "$(git -C "${SOURCE_DIR}" rev-parse --verify HEAD)" == "${tag_commit}" ]]
-cargo build --manifest-path "${SOURCE_DIR}/Cargo.toml" --locked --release -p bitbygit
-built_output="$("${SOURCE_DIR}/target/release/bitbygit" --version)"
+rustc_version="$(rustc -vV)"
+host_target=
+while IFS= read -r rustc_line; do
+  case "${rustc_line}" in
+    "host: "*) host_target="${rustc_line#host: }"; break ;;
+  esac
+done <<< "${rustc_version}"
+[[ -n "${host_target}" ]]
+cargo build --manifest-path "${SOURCE_DIR}/Cargo.toml" --locked --release -p bitbygit \
+  --target-dir "${TARGET_DIR}" --target "${host_target}"
+built_binary="${TARGET_DIR}/${host_target}/release/bitbygit"
+built_output="$("${built_binary}" --version)"
 if [[ "${built_output}" != "bitbygit ${VERSION}" ]]; then
   printf 'Expected bitbygit %s, got %s\n' "${VERSION}" "${built_output}" >&2
   exit 1
 fi
 
 mkdir -p "${HOME}/.local/bin"
-install -m 0755 "${SOURCE_DIR}/target/release/bitbygit" "${HOME}/.local/bin/bitbygit"
+install -m 0755 "${built_binary}" "${HOME}/.local/bin/bitbygit"
 installed_output="$("${HOME}/.local/bin/bitbygit" --version)"
 if [[ "${installed_output}" != "bitbygit ${VERSION}" ]]; then
   printf 'Expected bitbygit %s, got %s\n' "${VERSION}" "${installed_output}" >&2
@@ -337,12 +350,13 @@ new_path="${install_dir}"
 if [[ -z "${PATH+x}" ]]; then
   PATH="$(command -p getconf PATH)"
 fi
-IFS=: read -r -a path_entries <<< "${PATH}:__BITBYGIT_PATH_END__"
-path_entry_count="${#path_entries[@]}"
-unset "path_entries[$((path_entry_count - 1))]"
-for entry in "${path_entries[@]}"; do
+remaining_path="${PATH}"
+while [[ "${remaining_path}" == *:* ]]; do
+  entry="${remaining_path%%:*}"
+  remaining_path="${remaining_path#*:}"
   [[ "${entry}" == "${install_dir}" ]] || new_path+=":${entry}"
 done
+[[ "${remaining_path}" == "${install_dir}" ]] || new_path+=":${remaining_path}"
 export PATH="${new_path}"
 resolved_binary="$(type -P bitbygit || true)"
 if [[ -n "${resolved_binary}" && "${resolved_binary}" -ef "${install_dir}/bitbygit" ]] &&
@@ -366,6 +380,7 @@ $Version = "0.1.0"
 $Tag = "refs/tags/v$Version"
 $WorkDir = (New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName()))).FullName
 $SourceDir = Join-Path $WorkDir "bitbygit"
+$TargetDir = Join-Path $WorkDir "cargo-target"
 
 try {
 New-Item -ItemType Directory -Path $SourceDir | Out-Null
@@ -379,9 +394,14 @@ git -C $SourceDir checkout --detach $TagCommit
 if ($LASTEXITCODE -ne 0) { throw "release tag checkout failed" }
 $HeadCommit = git -C $SourceDir rev-parse --verify HEAD
 if ($LASTEXITCODE -ne 0 -or $HeadCommit -ne $TagCommit) { throw "release tag checkout verification failed" }
-cargo build --manifest-path (Join-Path $SourceDir "Cargo.toml") --locked --release -p bitbygit
+$RustcVersion = rustc -vV
+if ($LASTEXITCODE -ne 0) { throw "rustc version detection failed" }
+$HostLine = $RustcVersion | Where-Object { $_.StartsWith("host: ") } | Select-Object -First 1
+if (-not $HostLine) { throw "rustc host target detection failed" }
+$HostTarget = $HostLine.Substring(6)
+cargo build --manifest-path (Join-Path $SourceDir "Cargo.toml") --locked --release -p bitbygit --target-dir $TargetDir --target $HostTarget
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-$BuiltBinary = Join-Path $SourceDir "target\release\bitbygit.exe"
+$BuiltBinary = Join-Path $TargetDir "$HostTarget\release\bitbygit.exe"
 $BuiltOutput = & $BuiltBinary --version
 if ($LASTEXITCODE -ne 0 -or $BuiltOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $BuiltOutput"

@@ -133,6 +133,8 @@ $OriginalProcessPath = $env:Path
 $OriginalTemp = $env:TEMP
 $OriginalTmp = $env:TMP
 $OriginalPathExt = $env:PATHEXT
+$OriginalCargoTargetDir = $env:CARGO_TARGET_DIR
+$OriginalCargoBuildTarget = $env:CARGO_BUILD_TARGET
 
 try {
     cargo build --locked --release -p bitbygit
@@ -394,9 +396,6 @@ try {
         $ExpectedTag = "refs/tags/v$SelectedVersion"
         if ($Arguments.Count -eq 3 -and $Arguments[0] -eq "-C" -and
             $Arguments[2] -eq "init") {
-            $BuildDir = Join-Path $Arguments[1] "target/release"
-            New-Item -ItemType Directory -Path $BuildDir | Out-Null
-            Copy-Item $FixtureBinary (Join-Path $BuildDir "bitbygit.exe")
         } elseif ($Arguments.Count -eq 7 -and $Arguments[0] -eq "-C" -and
             $Arguments[2] -eq "fetch" -and $Arguments[3] -eq "--depth" -and
             $Arguments[4] -eq "1" -and
@@ -422,10 +421,37 @@ try {
     }
 
     function cargo {
+        param(
+            [Alias("p")] [string] $Package,
+            [Parameter(ValueFromRemainingArguments = $true)] [object[]] $Arguments
+        )
+
         if ($env:MOCK_CARGO_FAILURE -eq "1") {
             $global:LASTEXITCODE = 1
             return
         }
+
+        $ManifestIndex = [array]::IndexOf($Arguments, "--manifest-path")
+        $TargetDirIndex = [array]::IndexOf($Arguments, "--target-dir")
+        $TargetIndex = [array]::IndexOf($Arguments, "--target")
+        if ($Arguments[0] -ne "build" -or $ManifestIndex -lt 0 -or $TargetDirIndex -lt 0 -or
+            $TargetIndex -lt 0 -or
+            -not $Arguments.Contains("--locked") -or -not $Arguments.Contains("--release") -or
+            $Package -ne "bitbygit") {
+            throw "unexpected cargo arguments: $Arguments"
+        }
+        $ManifestPath = [string] $Arguments[$ManifestIndex + 1]
+        $TargetDir = [string] $Arguments[$TargetDirIndex + 1]
+        $Target = [string] $Arguments[$TargetIndex + 1]
+        $ExpectedTargetDir = Join-Path (Split-Path -Parent (Split-Path -Parent $ManifestPath)) "cargo-target"
+        if ($TargetDir -ne $ExpectedTargetDir -or $TargetDir -eq $env:CARGO_TARGET_DIR -or
+            $Target -ne $script:HostTarget) {
+            throw "cargo output was not isolated for the native target: $Arguments"
+        }
+        $BuildDir = Join-Path $TargetDir "$Target\release"
+        New-Item -ItemType Directory -Path $BuildDir | Out-Null
+        Copy-Item $FixtureBinary (Join-Path $BuildDir "bitbygit.exe")
+        $script:CargoUsedIsolatedTarget = $true
         $global:LASTEXITCODE = 0
     }
 
@@ -451,6 +477,11 @@ try {
     $env:Path = $SourceStartingPath
     $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
     $env:BITBYGIT_TEST_USER_PATH = $SourceUserPath
+    $env:CARGO_TARGET_DIR = Join-Path $SourceSuccessDir "configured-target"
+    $env:CARGO_BUILD_TARGET = "configured-non-host-target"
+    $HostLine = rustc -vV | Where-Object { $_.StartsWith("host: ") } | Select-Object -First 1
+    if (-not $HostLine) { Fail "could not determine validator host target" }
+    $HostTarget = $HostLine.Substring(6)
     $OldResolvedBinary = (Get-Command bitbygit -CommandType Application | Select-Object -First 1).Source
     if ($OldResolvedBinary -ne (Join-Path $OldBinaryDir "bitbygit.exe")) { Fail "older bitbygit.exe fixture was not first on PATH" }
     $OldOutput = bitbygit --version
@@ -481,6 +512,7 @@ try {
         foreach ($Attempt in 1..2) {
             $FetchedExactTag = $false
             $CheckedOutExactTag = $false
+            $CargoUsedIsolatedTarget = $false
             $ShadowInvoked = $false
             . $SourceScript
             if ($ShadowInvoked) { Fail "source block invoked a shadowing alias or function" }
@@ -491,6 +523,7 @@ try {
             if ((Get-ChildItem -Force $SourceSuccessTemp).Count -ne 0) {
                 Fail "source block left temporary build files behind"
             }
+            if (-not $CargoUsedIsolatedTarget) { Fail "source block did not use isolated native Cargo output" }
         }
     } finally {
         Pop-Location
@@ -582,5 +615,7 @@ try {
     $env:TEMP = $OriginalTemp
     $env:TMP = $OriginalTmp
     $env:PATHEXT = $OriginalPathExt
+    $env:CARGO_TARGET_DIR = $OriginalCargoTargetDir
+    $env:CARGO_BUILD_TARGET = $OriginalCargoBuildTarget
     Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
 }

@@ -34,6 +34,8 @@ workspace_version="$(perl -ne '
   if ($workspace && /^version = "([^"]+)"$/) { print $1; exit }
 ' "${root}/Cargo.toml")"
 [[ -n "${workspace_version}" ]] || fail "workspace version was not found"
+validator_host_target="$(rustc -vV | perl -ne 'if (/^host: (.+)$/) { print $1; exit }')"
+[[ -n "${validator_host_target}" ]] || fail "rustc host target was not found"
 selected_version=2.3.4
 [[ "${selected_version}" != "${workspace_version}" && "${selected_version}" != "0.1.0" ]] || fail "selected validator version must differ from the documented example"
 [[ "${docs_text}" == *"VERSION=${workspace_version}"* ]] || fail "Bash examples do not use workspace version ${workspace_version}"
@@ -144,8 +146,9 @@ check_unix_success() {
     export MOCK_DOWNLOAD_DIR="${tmp}/assets"
     export MOCK_UNAME_MACHINE="${machine}"
     base_path="${PATH}"
-    expected_path="${HOME}/.local/bin::${tmp}/mock-bin::${base_path}:"
-    export PATH=":${tmp}/mock-bin::${HOME}/.local/bin:${base_path}:${HOME}/.local/bin:"
+    newline_entry="${case_dir}/line"$'\n'"break"
+    expected_path="${HOME}/.local/bin::${tmp}/mock-bin::${newline_entry}:${base_path}:"
+    export PATH=":${tmp}/mock-bin::${newline_entry}:${HOME}/.local/bin:${base_path}:${HOME}/.local/bin:"
     starting_dir="${PWD}"
 
     bitbygit() {
@@ -172,10 +175,13 @@ check_unix_success() {
     fi
     [[ "${PATH}" == "${expected_path}" ]] || fail "${heading} did not preserve empty PATH entries while deduplicating the install directory"
     path_entry_count=0
-    IFS=: read -r -a path_entries <<< "${PATH}"
-    for entry in "${path_entries[@]}"; do
+    remaining_path="${PATH}"
+    while [[ "${remaining_path}" == *:* ]]; do
+      entry="${remaining_path%%:*}"
+      remaining_path="${remaining_path#*:}"
       [[ "${entry}" == "${HOME}/.local/bin" ]] && path_entry_count=$((path_entry_count + 1))
     done
+    [[ "${remaining_path}" == "${HOME}/.local/bin" ]] && path_entry_count=$((path_entry_count + 1))
     [[ "${path_entry_count}" -eq 1 ]] || fail "${heading} duplicated the install directory on PATH"
     [[ -x "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not install the binary"
     [[ "$("${HOME}/.local/bin/bitbygit" --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} installed the wrong version"
@@ -339,6 +345,10 @@ extract_selected_block "${failure_heading}" bash > "${cleanup_failure_dir}/snipp
 [[ "$(grep -c -- '-ef "${install_dir}/bitbygit"' "${docs}")" -eq 3 ]] || fail "Unix installations do not verify resolved file identity"
 [[ "$(grep -c '^  command bitbygit --version$' "${docs}")" -eq 3 ]] || fail "Unix installations do not finish with PATH-resolved version output"
 [[ "$(grep -c '^& \$ResolvedPath --version$' "${docs}")" -eq 2 ]] || fail "Windows installations do not finish with PATH-resolved version output"
+[[ "$(grep -c 'remaining_path="${PATH}"' "${docs}")" -eq 3 ]] || fail "Unix installations do not parse PATH by its colon delimiter"
+[[ "${docs_text}" != *'read -r -a path_entries'* ]] || fail "Unix installations use line-oriented PATH serialization"
+[[ "${docs_text}" == *'--target-dir "${TARGET_DIR}" --target "${host_target}"'* ]] || fail "Bash source build does not isolate and pin Cargo output"
+[[ "${docs_text}" == *'--target-dir $TargetDir --target $HostTarget'* ]] || fail "PowerShell source build does not isolate and pin Cargo output"
 
 source_remote="${tmp}/source-remote.git"
 source_seed="${tmp}/source-seed"
@@ -346,13 +356,11 @@ git init --bare --quiet "${source_remote}"
 git init --quiet "${source_seed}"
 git -C "${source_seed}" config user.email validator@example.invalid
 git -C "${source_seed}" config user.name "Installation validator"
-mkdir -p "${source_seed}/target/release"
-printf '#!/usr/bin/env sh\nprintf '\''bitbygit %s\\n'\''\n' "${selected_version}" > "${source_seed}/target/release/bitbygit"
-chmod +x "${source_seed}/target/release/bitbygit"
-git -C "${source_seed}" add -f target/release/bitbygit
+printf '[workspace]\nmembers = []\n' > "${source_seed}/Cargo.toml"
+git -C "${source_seed}" add Cargo.toml
 git -C "${source_seed}" commit --quiet -m "tagged source"
 git -C "${source_seed}" tag -a "v${selected_version}" -m "release ${selected_version}"
-printf '#!/usr/bin/env sh\nprintf '\''bitbygit 9.9.9\\n'\''\n' > "${source_seed}/target/release/bitbygit"
+printf '[workspace]\nmembers = []\n# branch, not tag\n' > "${source_seed}/Cargo.toml"
 git -C "${source_seed}" commit --quiet -am "same-named branch"
 git -C "${source_seed}" branch "v${selected_version}"
 git -C "${source_seed}" push --quiet "${source_remote}" \
@@ -368,7 +376,39 @@ cat > "${source_dir}/mock-bin/cargo" <<'MOCK'
 if [ "${MOCK_CARGO_FAILURE:-0}" = 1 ]; then
   exit 1
 fi
-exit 0
+manifest=
+target_dir=
+target=
+locked=0
+release=0
+package=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    build) ;;
+    --manifest-path) shift; manifest="$1" ;;
+    --target-dir) shift; target_dir="$1" ;;
+    --target) shift; target="$1" ;;
+    --locked) locked=1 ;;
+    --release) release=1 ;;
+    -p) shift; package="$1" ;;
+    *) exit 64 ;;
+  esac
+  shift
+done
+[ -n "${manifest}" ] && [ -f "${manifest}" ] || exit 65
+[ "${target}" = "${MOCK_HOST_TARGET}" ] || exit 66
+[ "${target_dir}" != "${CARGO_TARGET_DIR}" ] || exit 67
+case "${target_dir}" in */cargo-target) ;; *) exit 68 ;; esac
+[ "${locked}" = 1 ] && [ "${release}" = 1 ] && [ "${package}" = bitbygit ] || exit 69
+mkdir -p "${target_dir}/${target}/release"
+printf '#!/usr/bin/env sh\nprintf '\''bitbygit %s\\n'\''\n' "${MOCK_SELECTED_VERSION}" > "${target_dir}/${target}/release/bitbygit"
+chmod +x "${target_dir}/${target}/release/bitbygit"
+printf '%s\n' "${target_dir}/${target}/release/bitbygit" > "${MOCK_CARGO_RECORD}"
+MOCK
+cat > "${source_dir}/mock-bin/rustc" <<'MOCK'
+#!/usr/bin/env sh
+[ "$#" -eq 1 ] && [ "$1" = -vV ] || exit 64
+printf 'rustc 1.85.0\nhost: %s\nrelease: 1.85.0\n' "${MOCK_HOST_TARGET}"
 MOCK
 cp "${tmp}/mock-bin/bitbygit" "${source_dir}/mock-bin/bitbygit"
 chmod +x "${source_dir}/mock-bin/"*
@@ -380,9 +420,15 @@ extract_selected_path_block "Build from source" > "${source_dir}/path-snippet.ba
   cd "${source_dir}"
   export HOME="${source_dir}/home"
   export TMPDIR="${source_dir}/temp"
+  export CARGO_TARGET_DIR="${source_dir}/configured-target"
+  export CARGO_BUILD_TARGET="configured-non-host-target"
+  export MOCK_HOST_TARGET="${validator_host_target}"
+  export MOCK_SELECTED_VERSION="${selected_version}"
+  export MOCK_CARGO_RECORD="${source_dir}/cargo-output"
   base_path="${PATH}"
-  original_path=":${source_dir}/mock-bin::${HOME}/.local/bin:${base_path}:${HOME}/.local/bin:"
-  expected_path="${HOME}/.local/bin::${source_dir}/mock-bin::${base_path}:"
+  newline_entry="${source_dir}/line"$'\n'"break"
+  original_path=":${source_dir}/mock-bin::${newline_entry}:${HOME}/.local/bin:${base_path}:${HOME}/.local/bin:"
+  expected_path="${HOME}/.local/bin::${source_dir}/mock-bin::${newline_entry}:${base_path}:"
   export PATH="${original_path}"
   starting_dir="${PWD}"
   export MOCK_CARGO_FAILURE=1
@@ -401,6 +447,8 @@ extract_selected_path_block "Build from source" > "${source_dir}/path-snippet.ba
     printf 'bitbygit %s\n' "${selected_version}"
   }
   source "${source_dir}/snippet.bash" || fail "Bash source block could not retry a failed build"
+  [[ -s "${MOCK_CARGO_RECORD}" ]] || fail "Bash source block did not use the isolated Cargo output"
+  [[ "$(<"${MOCK_CARGO_RECORD}")" != "${CARGO_TARGET_DIR}"* ]] || fail "Bash source block honored an external Cargo target directory"
   [[ ! -e "${source_dir}/function-shadow-used" ]] || fail "Bash source block invoked a shadowing function"
   unset -f bitbygit
   shadow_bitbygit() {
@@ -416,10 +464,13 @@ extract_selected_path_block "Build from source" > "${source_dir}/path-snippet.ba
   [[ "${PWD}" == "${starting_dir}" ]] || fail "Bash source block changed the caller working directory"
   [[ "${PATH}" == "${expected_path}" ]] || fail "Bash source block did not preserve empty PATH entries while deduplicating the install directory"
   path_entry_count=0
-  IFS=: read -r -a path_entries <<< "${PATH}"
-  for entry in "${path_entries[@]}"; do
+  remaining_path="${PATH}"
+  while [[ "${remaining_path}" == *:* ]]; do
+    entry="${remaining_path%%:*}"
+    remaining_path="${remaining_path#*:}"
     [[ "${entry}" == "${HOME}/.local/bin" ]] && path_entry_count=$((path_entry_count + 1))
   done
+  [[ "${remaining_path}" == "${HOME}/.local/bin" ]] && path_entry_count=$((path_entry_count + 1))
   [[ "${path_entry_count}" -eq 1 ]] || fail "Bash source block duplicated the install directory on PATH"
   resolved_binary="$(type -P bitbygit)"
   [[ "${resolved_binary}" -ef "${HOME}/.local/bin/bitbygit" ]] || fail "Bash source block did not resolve the installed application through PATH"
