@@ -67,5 +67,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify recovery platform boundary
-        run: cargo test --locked -p bitbygit-git recovery_platform_capability
+      - name: Test recovery support
+        run: cargo test --locked -p bitbygit-git recovery_
+
+      - name: Build workspace
+        run: cargo build --locked --workspace

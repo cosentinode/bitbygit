@@ -123,12 +123,13 @@ Conflict mode should:
 - audit conflict recovery actions
 
 Conflict recovery actions are high risk because they move repository state.
-On Linux, BitByGit fingerprints bounded tracked, untracked, ignored, control,
+BitByGit fingerprints bounded tracked, untracked, ignored, control,
 configuration, attribute, hook, and ref inputs at preview. It takes an
-identity-checked lock in the common Git directory, checks that fingerprint as the
-last operation before spawning Git, and holds the lock through execution. A
-recovery action in a prompt sequence must be first so this state is captured by
-the displayed sequence preview.
+identity-checked lock in app-owned data storage keyed by the canonical repository
+root, checks that fingerprint as the last operation before spawning Git, and
+holds the lock through execution. Replacing a repository's Git directory does
+not change this lock identity. A recovery action in a prompt sequence must be
+first so this state is captured by the displayed sequence preview.
 
 The lock serializes BitByGit recovery processes for the repository. Other Git
 clients and filesystem writers do not honor an application lock; their normal
@@ -136,12 +137,12 @@ concurrency boundary still applies, and BitByGit surfaces resulting Git failures
 rather than claiming to exclude those writers.
 
 Recovery rejects executable hooks, active external filters or merge drivers,
-fsmonitor and signing processes, and remaining rebase `exec` commands. This
-prevents those configured processes from detaching outside bounded cleanup.
-Planning also fails closed when its path, entry, ignored-data, or output limits
-are exceeded. On non-Linux platforms, both recovery planning and execution fail
-before Git is spawned, with a manual-command diagnostic, until equivalent hard
-output and descendant-process bounds are available.
+fsmonitor and signing processes, non-built-in persisted rebase strategies, and
+remaining rebase `exec` commands. This prevents those configured processes from
+detaching outside bounded cleanup. Planning also fails closed when its path,
+entry, ignored-data, or output limits are exceeded. Linux uses sealed capture
+files, macOS uses bounded temporary captures, Unix places Git in a process group,
+and Windows uses bounded temporary captures plus a kill-on-close Job Object.
 
 ## Confirmation Copy
 
