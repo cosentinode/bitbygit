@@ -59,11 +59,18 @@ Prerequisites:
 Run local checks:
 
 ```sh
+bash scripts/test-release-workflow.sh
+bash scripts/test-installation-docs.sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --workspace
 ```
+
+The Bash installation validator runs on Linux and macOS without PowerShell.
+Windows contributors can run the platform-specific archive validation with
+`pwsh -NoProfile -File scripts/test-installation-docs.ps1`; CI runs that command
+on a Windows runner.
 
 Or run:
 

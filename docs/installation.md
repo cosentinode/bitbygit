@@ -33,12 +33,12 @@ or `$Version` to an available release version without the leading `v`.
 
 ## Linux x86-64 archive
 
-Run these commands in Bash. They require `curl`, `sha256sum`, and `tar` and stop
-before extraction or installation if any download or checksum check fails:
+Run these commands in Bash. They require `curl`, `tar`, `grep`, and GNU
+coreutils (`sha256sum`, `mkdir`, and `install`) and stop before extraction or
+installation if any download or checksum check fails:
 
 ```bash
-set -euo pipefail
-
+bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 VERSION=0.1.0
 TARGET=x86_64-unknown-linux-gnu
 ARCHIVE="bitbygit-${VERSION}-${TARGET}.tar.gz"
@@ -57,6 +57,7 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
   printf 'Expected bitbygit %s, got %s\n' "${VERSION}" "${output}" >&2
   exit 1
 fi
+BITBYGIT_INSTALL
 export PATH="${HOME}/.local/bin:${PATH}"
 ```
 
@@ -71,8 +72,7 @@ macOS. The shell stops before extraction or installation if any download or
 checksum check fails:
 
 ```bash
-set -euo pipefail
-
+bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 VERSION=0.1.0
 case "$(uname -m)" in
   x86_64) TARGET=x86_64-apple-darwin ;;
@@ -95,6 +95,7 @@ if [[ "${output}" != "bitbygit ${VERSION}" ]]; then
   printf 'Expected bitbygit %s, got %s\n' "${VERSION}" "${output}" >&2
   exit 1
 fi
+BITBYGIT_INSTALL
 export PATH="${HOME}/.local/bin:${PATH}"
 ```
 
@@ -106,6 +107,7 @@ for your shell) to keep the command available in new shells.
 Run these commands in PowerShell:
 
 ```powershell
+& {
 $ErrorActionPreference = "Stop"
 
 $Version = "0.1.0"
@@ -136,6 +138,7 @@ if (($UserPath -split ";") -notcontains $InstallDir) {
     [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
 }
 $env:Path = "$InstallDir;$env:Path"
+}
 ```
 
 New shells will use the updated user `PATH`.
@@ -147,7 +150,8 @@ or newer, Cargo, and the native tools used by the selected Rust target:
 
 - Linux GNU targets require a C compiler, linker, and libc development headers,
   commonly installed through the distribution's `build-essential` or
-  equivalent package.
+  equivalent package. The installation commands also use GNU coreutils
+  (`mkdir` and `install`).
 - macOS requires the Xcode Command Line Tools (`xcode-select --install`).
 - `x86_64-pc-windows-msvc` requires Visual Studio 2022 Build Tools with the
   **Desktop development with C++** workload, including MSVC and a Windows SDK.
@@ -159,8 +163,7 @@ usable only if that release appears on the Releases page.
 On Linux or macOS, run:
 
 ```bash
-set -euo pipefail
-
+bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 VERSION=0.1.0
 git clone --branch "v${VERSION}" --depth 1 https://github.com/cosentinode/bitbygit.git
 cd bitbygit
@@ -178,12 +181,14 @@ if [[ "${installed_output}" != "bitbygit ${VERSION}" ]]; then
   printf 'Expected bitbygit %s, got %s\n' "${VERSION}" "${installed_output}" >&2
   exit 1
 fi
+BITBYGIT_INSTALL
 export PATH="${HOME}/.local/bin:${PATH}"
 ```
 
 On Windows, run in PowerShell:
 
 ```powershell
+& {
 $ErrorActionPreference = "Stop"
 
 $Version = "0.1.0"
@@ -210,6 +215,7 @@ if (($UserPath -split ";") -notcontains $InstallDir) {
     [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
 }
 $env:Path = "$InstallDir;$env:Path"
+}
 ```
 
 ## Package managers

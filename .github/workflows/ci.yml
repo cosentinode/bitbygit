@@ -38,7 +38,7 @@ jobs:
           "${tool_dir}/actionlint"
           bash scripts/test-release-workflow.sh
 
-      - name: Validate installation documentation
+      - name: Validate Linux installation documentation
         shell: bash
         run: bash scripts/test-installation-docs.sh
 
@@ -53,3 +53,30 @@ jobs:
 
       - name: Build
         run: cargo build --locked --workspace
+
+  installation-docs-macos:
+    name: macOS installation docs
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate installation documentation
+        shell: bash
+        run: bash scripts/test-installation-docs.sh
+
+  installation-docs-windows:
+    name: Windows installation docs
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate installation documentation
+        shell: pwsh
+        run: ./scripts/test-installation-docs.ps1
