@@ -458,6 +458,36 @@ impl Git {
         Ok(Some((remote.to_owned(), push_branch.to_owned())))
     }
 
+    pub fn prospective_push_target(
+        &self,
+        branch: &str,
+        upstream_remote: &str,
+        upstream_branch: &str,
+    ) -> Result<Option<(String, String)>, GitError> {
+        let remote = self
+            .config_value(["config", "--get", &format!("branch.{branch}.pushRemote")])?
+            .or(self.config_value(["config", "--get", "remote.pushDefault"])?)
+            .unwrap_or_else(|| upstream_remote.to_owned());
+        if remote.is_empty() {
+            return Ok(None);
+        }
+        let push_default = self
+            .config_value(["config", "--get", "push.default"])?
+            .unwrap_or_else(|| "simple".to_owned());
+        let target = match push_default.as_str() {
+            "simple" if remote != upstream_remote => (remote, branch.to_owned()),
+            "simple" | "upstream" => (upstream_remote.to_owned(), upstream_branch.to_owned()),
+            "current" | "matching" => (remote, branch.to_owned()),
+            "nothing" => return Ok(None),
+            _ => {
+                return Err(GitError::Blocked {
+                    message: format!("push.default has unsupported value {push_default}"),
+                });
+            }
+        };
+        Ok(Some(target))
+    }
+
     pub fn remote_tracking_oid(
         &self,
         remote: &str,
@@ -3215,6 +3245,48 @@ mod tests {
         assert_eq!(
             Git::new(repo.path()).push_target("feature")?,
             Some(("fork".to_owned(), "feature".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prospective_push_target_matches_configured_git_push_target() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "topic"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.run(["commit", "--allow-empty", "-m", "initial"])?;
+        repo.run(["remote", "add", "fork", "https://github.com/octo/repo.git"])?;
+        repo.run([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        repo.run(["config", "branch.topic.remote", "fork"])?;
+        repo.run(["config", "branch.topic.merge", "refs/heads/topic"])?;
+        let git = Git::new(repo.path());
+
+        assert_eq!(
+            git.prospective_push_target("topic", "fork", "topic")?,
+            git.push_target("topic")?
+        );
+
+        repo.run(["config", "remote.pushDefault", "origin"])?;
+        for push_default in ["simple", "current", "upstream", "matching", "nothing"] {
+            repo.run(["config", "push.default", push_default])?;
+            assert_eq!(
+                git.prospective_push_target("topic", "fork", "topic")?,
+                git.push_target("topic")?,
+                "push.default={push_default}"
+            );
+        }
+
+        repo.run(["config", "branch.topic.pushRemote", "fork"])?;
+        repo.run(["config", "push.default", "current"])?;
+        assert_eq!(
+            git.prospective_push_target("topic", "fork", "topic")?,
+            git.push_target("topic")?
         );
         Ok(())
     }

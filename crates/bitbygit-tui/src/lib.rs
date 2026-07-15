@@ -693,7 +693,14 @@ struct DeferredPullRequestTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SequenceBranch {
     name: String,
-    push_target: Option<(String, String)>,
+    upstream: SequenceUpstream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SequenceUpstream {
+    Existing,
+    Missing,
+    Bound { remote: String, branch: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2180,7 +2187,7 @@ impl OperationPlanner {
         let git = self.git();
         let mut branch = initial_branch.map(|name| SequenceBranch {
             name,
-            push_target: None,
+            upstream: SequenceUpstream::Existing,
         });
         let mut targets = Vec::with_capacity(requests.len().saturating_sub(1));
 
@@ -2199,6 +2206,12 @@ impl OperationPlanner {
                 targets.push(target);
             }
 
+            if !requests[index + 1..]
+                .iter()
+                .any(|request| matches!(request, OperationRequest::OpenPullRequest { .. }))
+            {
+                continue;
+            }
             match request {
                 OperationRequest::Checkout { branch: target }
                     if branch.as_ref().map(|branch| &branch.name) != Some(target) =>
@@ -2218,29 +2231,53 @@ impl OperationPlanner {
                             )
                         })?;
                     let name = checkout_resulting_branch(&target)?;
-                    let push_target = if target.kind == BranchKind::Remote {
-                        Some(
-                            target
-                                .name
-                                .split_once('/')
-                                .map(|(remote, branch)| (remote.to_owned(), branch.to_owned()))
-                                .ok_or_else(|| {
-                                    format!(
-                                        "Prompt sequence blocked: remote checkout target {} cannot be bound during preflight; create a new sequence preview.",
-                                        target.name
-                                    )
-                                })?,
-                        )
+                    let upstream = if target.kind == BranchKind::Remote {
+                        let (remote, branch) = target.name.split_once('/').ok_or_else(|| {
+                            format!(
+                                "Prompt sequence blocked: remote checkout target {} cannot be bound during preflight; create a new sequence preview.",
+                                target.name
+                            )
+                        })?;
+                        SequenceUpstream::Bound {
+                            remote: remote.to_owned(),
+                            branch: branch.to_owned(),
+                        }
                     } else {
-                        None
+                        SequenceUpstream::Existing
                     };
-                    branch = Some(SequenceBranch { name, push_target });
+                    branch = Some(SequenceBranch { name, upstream });
                 }
                 OperationRequest::CreateBranch { branch: target, .. } => {
                     branch = Some(SequenceBranch {
                         name: target.clone(),
-                        push_target: None,
+                        upstream: SequenceUpstream::Missing,
                     });
+                }
+                OperationRequest::Push => {
+                    let branch = branch.as_mut().ok_or_else(|| {
+                        "Prompt sequence blocked: push branch cannot be resolved during preflight; create a new sequence preview."
+                            .to_owned()
+                    })?;
+                    let missing_upstream = match branch.upstream {
+                        SequenceUpstream::Missing => true,
+                        SequenceUpstream::Existing => git
+                            .upstream_push_target(&branch.name)
+                            .map_err(|error| {
+                                format!("Unable to resolve sequence push target: {error}")
+                            })?
+                            .is_none(),
+                        SequenceUpstream::Bound { .. } => false,
+                    };
+                    if missing_upstream {
+                        let remote = self.default_remote_name().ok_or_else(|| {
+                            "Prompt sequence blocked: push target cannot be resolved during preflight; create a new sequence preview."
+                                .to_owned()
+                        })?;
+                        branch.upstream = SequenceUpstream::Bound {
+                            remote,
+                            branch: branch.name.clone(),
+                        };
+                    }
                 }
                 _ => {}
             }
@@ -2255,17 +2292,31 @@ impl OperationPlanner {
         branch: &SequenceBranch,
         requested_base: Option<&str>,
     ) -> Result<DeferredPullRequestTarget, String> {
-        let (remote, upstream_branch) = match &branch.push_target {
-            Some(target) => target.clone(),
-            None => git
+        let (remote, upstream_branch) = match &branch.upstream {
+            SequenceUpstream::Existing => git
                 .push_target(&branch.name)
                 .map_err(|error| format!("Unable to prepare pull request target: {error}"))?
-                .or_else(|| {
-                    self.default_remote_name()
-                        .map(|remote| (remote, branch.name.clone()))
-                })
                 .ok_or_else(|| {
-                    "Open pull request blocked: no remotes are configured.".to_owned()
+                    "Open pull request blocked: the deferred branch has no resolvable upstream; add `push` before `open pr` and create a new sequence preview."
+                        .to_owned()
+                })?,
+            SequenceUpstream::Missing => {
+                return Err(
+                    "Open pull request blocked: the deferred branch will not have an upstream; add `push` before `open pr` and create a new sequence preview."
+                        .to_owned(),
+                );
+            }
+            SequenceUpstream::Bound {
+                remote,
+                branch: upstream_branch,
+            } => git
+                .prospective_push_target(&branch.name, remote, upstream_branch)
+                .map_err(|error| {
+                    format!("Unable to prepare deferred pull request target: {error}")
+                })?
+                .ok_or_else(|| {
+                    "Open pull request blocked: the deferred push target cannot be bound during preflight; update push.default and create a new sequence preview."
+                        .to_owned()
                 })?,
         };
         let remote_urls = git
@@ -5766,15 +5817,7 @@ mod tests {
         assert!(preview.contains(
             "target: https://github.com/upstream/repo/compare/main...octo%3Atopic?expand=1"
         ));
-        git_stdout(
-            &repo,
-            &[
-                "remote",
-                "set-url",
-                "fork",
-                "ssh://git@github.com/bob/repo.git",
-            ],
-        )?;
+        git_stdout(&repo, &["config", "remote.pushDefault", "origin"])?;
         let paths = isolated_store_paths("prompt-sequence-remote-checkout-pr-audit")?;
 
         let result =
