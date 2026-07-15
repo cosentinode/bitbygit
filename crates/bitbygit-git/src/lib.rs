@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::ffi::{CStr, CString};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::{BufReader, Read, Write};
@@ -1513,6 +1515,8 @@ struct RecoveryTransaction {
     candidate: PathBuf,
     backup_pointer: PathBuf,
     baseline: RecoveryGeneration,
+    root_identity: (u64, u64),
+    candidate_identity: (u64, u64),
     keep_candidate: bool,
 }
 
@@ -1524,7 +1528,15 @@ impl RecoveryTransaction {
         })?;
         remove_previous_recovery_backup(&root)?;
         let baseline = RecoveryGeneration::capture(&root)?;
+        let root_identity =
+            recovery_file_identity(&fs::symlink_metadata(&root).map_err(|source| {
+                recovery_transaction_io("identify repository generation", source)
+            })?);
         let (candidate, backup_identity) = create_recovery_candidate(parent, &root)?;
+        let candidate_identity =
+            recovery_file_identity(&fs::symlink_metadata(&candidate).map_err(|source| {
+                recovery_transaction_io("identify isolated repository", source)
+            })?);
         let backup_pointer = recovery_backup_pointer_path(&candidate)?;
         let mut pointer_contents = candidate.as_os_str().as_encoded_bytes().to_vec();
         pointer_contents.push(0);
@@ -1535,6 +1547,8 @@ impl RecoveryTransaction {
             candidate,
             backup_pointer,
             baseline,
+            root_identity,
+            candidate_identity,
             keep_candidate: false,
         };
         transaction.copy_repository()?;
@@ -1703,6 +1717,7 @@ impl RecoveryTransaction {
     ) -> Result<PathBuf, GitError> {
         if live_git.recovery_state()? != *expected_state
             || RecoveryGeneration::capture(&self.root)? != self.baseline
+            || recovery_path_identity(&self.root)? != self.root_identity
         {
             return Err(recovery_transaction_blocked(
                 "repository changed while recovery executed in isolation",
@@ -1710,23 +1725,40 @@ impl RecoveryTransaction {
         }
 
         run_recovery_promotion_hook(&self.root);
+        ensure_recovery_git_storage_isolated(&self.candidate)?;
+        let candidate_generation = RecoveryGeneration::capture_isolated(&self.candidate)?;
+        if recovery_path_identity(&self.candidate)? != self.candidate_identity {
+            return Err(recovery_transaction_blocked(
+                "isolated recovery candidate changed before atomic promotion",
+            ));
+        }
         ensure_recovery_mount_tree_isolated(&self.root)?;
         atomic_exchange_directories(&self.root, &self.candidate)?;
         self.keep_candidate = true;
         let old_generation = RecoveryGeneration::capture(&self.candidate);
-        if !matches!(&old_generation, Ok(generation) if generation == &self.baseline) {
+        let installed_generation = RecoveryGeneration::capture_isolated(&self.root);
+        let identities_match = recovery_path_identity(&self.root)
+            .is_ok_and(|identity| identity == self.candidate_identity)
+            && recovery_path_identity(&self.candidate)
+                .is_ok_and(|identity| identity == self.root_identity);
+        if !identities_match
+            || !matches!(&old_generation, Ok(generation) if generation == &self.baseline)
+            || !matches!(&installed_generation, Ok(generation) if generation == &candidate_generation)
+        {
             if let Err(error) = atomic_exchange_directories(&self.root, &self.candidate) {
                 return Err(recovery_transaction_blocked(format!(
                     "repository changed during atomic recovery promotion and rollback failed; both complete generations were retained: {error}"
                 )));
             }
             self.keep_candidate = false;
-            return Err(recovery_transaction_blocked(match old_generation {
-                Ok(_) => "repository changed during atomic recovery promotion".to_owned(),
-                Err(error) => {
-                    format!("repository metadata changed during atomic recovery promotion: {error}")
-                }
-            }));
+            return Err(recovery_transaction_blocked(
+                match (old_generation, installed_generation) {
+                    (Err(error), _) | (_, Err(error)) => format!(
+                        "repository metadata changed during atomic recovery promotion: {error}"
+                    ),
+                    _ => "repository changed during atomic recovery promotion".to_owned(),
+                },
+            ));
         }
         Ok(self.candidate.clone())
     }
@@ -1734,10 +1766,10 @@ impl RecoveryTransaction {
 
 impl Drop for RecoveryTransaction {
     fn drop(&mut self) {
-        if !self.keep_candidate && ensure_recovery_mount_tree_isolated(&self.candidate).is_ok() {
-            let _result = fs::remove_dir_all(&self.candidate);
+        if !self.keep_candidate
+            && remove_recovery_directory(&self.candidate, self.candidate_identity).is_ok()
+        {
             let _result = fs::remove_file(recovery_candidate_owner_path(&self.candidate));
-            let _result = fs::remove_file(&self.backup_pointer);
         }
     }
 }
@@ -2147,6 +2179,231 @@ fn ensure_recovery_mount_tree_isolated(root: &Path) -> Result<(), GitError> {
 }
 
 #[cfg(target_os = "linux")]
+fn remove_recovery_directory(path: &Path, expected_identity: (u64, u64)) -> Result<(), GitError> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+
+    let parent = path.parent().ok_or_else(|| {
+        recovery_transaction_blocked("recovery cleanup path has no parent directory")
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        recovery_transaction_blocked("recovery cleanup path has no directory name")
+    })?;
+    let name = CString::new(name.as_encoded_bytes()).map_err(|_| {
+        recovery_transaction_blocked("recovery cleanup path contains an invalid directory name")
+    })?;
+    let parent_fd = openat(
+        CWD,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| recovery_cleanup_error("open recovery cleanup parent", source))?;
+    let root_fd = match openat(
+        &parent_fd,
+        name.as_c_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(root_fd) => root_fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(source) => {
+            return Err(recovery_cleanup_error(
+                "open recovery cleanup directory",
+                source,
+            ));
+        }
+    };
+    if recovery_fd_identity(&root_fd)? != expected_identity {
+        return Err(recovery_transaction_blocked(
+            "recovery cleanup directory identity changed; refusing to remove it",
+        ));
+    }
+    let root_mount_id = recovery_fd_mount_id(&root_fd)?;
+    run_recovery_cleanup_hook(path);
+    let mut entries = 0_usize;
+    let mut path_bytes = 0_usize;
+    remove_recovery_directory_contents(&root_fd, root_mount_id, &mut entries, &mut path_bytes)?;
+    ensure_recovery_cleanup_entry(
+        &parent_fd,
+        name.as_c_str(),
+        expected_identity,
+        root_mount_id,
+    )?;
+    rustix::fs::unlinkat(&parent_fd, name.as_c_str(), rustix::fs::AtFlags::REMOVEDIR)
+        .map_err(|source| recovery_cleanup_error("remove recovery cleanup directory", source))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_recovery_directory_contents(
+    directory: &impl std::os::fd::AsFd,
+    root_mount_id: u64,
+    entries: &mut usize,
+    path_bytes: &mut usize,
+) -> Result<(), GitError> {
+    use rustix::fs::{FileType, Mode, OFlags, openat};
+
+    let names = rustix::fs::Dir::read_from(directory)
+        .map_err(|source| recovery_cleanup_error("read recovery cleanup directory", source))?
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_name().to_bytes() == b"." => None,
+            Ok(entry) if entry.file_name().to_bytes() == b".." => None,
+            Ok(entry) => Some(Ok(entry.file_name().to_owned())),
+            Err(source) => Some(Err(source)),
+        })
+        .collect::<Result<Vec<CString>, _>>()
+        .map_err(|source| recovery_cleanup_error("read recovery cleanup entry", source))?;
+    for name in names {
+        *entries = entries.saturating_add(1);
+        *path_bytes = path_bytes.saturating_add(name.as_bytes().len());
+        if *entries > MAX_RECOVERY_GENERATION_ENTRIES
+            || *path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
+        {
+            return Err(recovery_transaction_blocked(
+                "recovery cleanup exceeds atomic recovery entry or path bounds",
+            ));
+        }
+        let entry_fd = match openat(
+            directory,
+            name.as_c_str(),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(entry_fd) => entry_fd,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(source) => {
+                return Err(recovery_cleanup_error(
+                    "open recovery cleanup entry",
+                    source,
+                ));
+            }
+        };
+        let identity = recovery_fd_identity(&entry_fd)?;
+        let mount_id = recovery_fd_mount_id(&entry_fd)?;
+        if mount_id != root_mount_id {
+            return Err(recovery_transaction_blocked(format!(
+                "atomic recovery cleanup refuses mounted filesystem entry {}",
+                name.to_string_lossy()
+            )));
+        }
+        let file_type = FileType::from_raw_mode(
+            rustix::fs::fstat(&entry_fd)
+                .map_err(|source| recovery_cleanup_error("inspect recovery cleanup entry", source))?
+                .st_mode,
+        );
+        if file_type == FileType::Directory {
+            let child = openat(
+                directory,
+                name.as_c_str(),
+                OFlags::RDONLY
+                    | OFlags::DIRECTORY
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|source| recovery_cleanup_error("open recovery cleanup child", source))?;
+            if recovery_fd_identity(&child)? != identity
+                || recovery_fd_mount_id(&child)? != root_mount_id
+            {
+                return Err(recovery_transaction_blocked(
+                    "recovery cleanup entry changed while it was opened",
+                ));
+            }
+            remove_recovery_directory_contents(&child, root_mount_id, entries, path_bytes)?;
+            ensure_recovery_cleanup_entry(directory, name.as_c_str(), identity, root_mount_id)?;
+            rustix::fs::unlinkat(directory, name.as_c_str(), rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(|source| {
+                    recovery_cleanup_error("remove recovery cleanup child", source)
+                })?;
+        } else {
+            ensure_recovery_cleanup_entry(directory, name.as_c_str(), identity, root_mount_id)?;
+            rustix::fs::unlinkat(directory, name.as_c_str(), rustix::fs::AtFlags::empty())
+                .map_err(|source| {
+                    recovery_cleanup_error("remove recovery cleanup entry", source)
+                })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_recovery_cleanup_entry(
+    parent: &impl std::os::fd::AsFd,
+    name: &CStr,
+    expected_identity: (u64, u64),
+    root_mount_id: u64,
+) -> Result<(), GitError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let entry = openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| recovery_cleanup_error("recheck recovery cleanup entry", source))?;
+    if recovery_fd_identity(&entry)? != expected_identity {
+        return Err(recovery_transaction_blocked(format!(
+            "recovery cleanup entry {} changed before removal",
+            name.to_string_lossy()
+        )));
+    }
+    if recovery_fd_mount_id(&entry)? != root_mount_id {
+        return Err(recovery_transaction_blocked(format!(
+            "atomic recovery cleanup refuses mounted filesystem entry {}",
+            name.to_string_lossy()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_fd_identity(fd: &impl std::os::fd::AsFd) -> Result<(u64, u64), GitError> {
+    let metadata = rustix::fs::fstat(fd)
+        .map_err(|source| recovery_cleanup_error("identify opened recovery entry", source))?;
+    Ok((metadata.st_dev, metadata.st_ino))
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_fd_mount_id(fd: &impl std::os::fd::AsFd) -> Result<u64, GitError> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+
+    let result = statx(
+        fd,
+        c"",
+        AtFlags::EMPTY_PATH | AtFlags::NO_AUTOMOUNT | AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::MNT_ID,
+    )
+    .map_err(|source| {
+        recovery_capability_unavailable(format!(
+            "an opened recovery entry mount identity could not be inspected: {source}"
+        ))
+    })?;
+    if result.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        return Err(recovery_capability_unavailable(
+            "Linux mount identity inspection is not available",
+        ));
+    }
+    Ok(result.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_cleanup_error(action: &str, source: rustix::io::Errno) -> GitError {
+    recovery_transaction_io(
+        action,
+        std::io::Error::from_raw_os_error(source.raw_os_error()),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_recovery_directory(_path: &Path, _expected_identity: (u64, u64)) -> Result<(), GitError> {
+    Err(recovery_transaction_blocked(
+        "safe recovery cleanup is not supported on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn recovery_inode_flags(
     path: &Path,
     relative: &Path,
@@ -2367,6 +2624,7 @@ fn recovery_backup_pointer_path(root: &Path) -> Result<PathBuf, GitError> {
 
 struct RecoveryBackup {
     path: PathBuf,
+    identity: (u64, u64),
     generation_digest: [u8; RECOVERY_GENERATION_DIGEST_BYTES],
 }
 
@@ -2443,6 +2701,18 @@ fn recovery_backup_record_from_pointer(
     digest.copy_from_slice(generation_digest);
     Ok(Some(RecoveryBackup {
         path: backup,
+        identity: (
+            u64::from_le_bytes(
+                identity[..8]
+                    .try_into()
+                    .map_err(|_| invalid_recovery_backup_pointer())?,
+            ),
+            u64::from_le_bytes(
+                identity[8..16]
+                    .try_into()
+                    .map_err(|_| invalid_recovery_backup_pointer())?,
+            ),
+        ),
         generation_digest: digest,
     }))
 }
@@ -2500,17 +2770,7 @@ fn remove_previous_recovery_backup(root: &Path) -> Result<(), GitError> {
         Err(_) if !backup.path.exists() => {}
         Err(error) => return Err(error),
     }
-    if backup.path.exists() {
-        ensure_recovery_mount_tree_isolated(&backup.path)?;
-    }
-    if let Err(source) = fs::remove_dir_all(&backup.path)
-        && source.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(recovery_transaction_io(
-            "remove the previous retained recovery backup",
-            source,
-        ));
-    }
+    remove_recovery_directory(&backup.path, backup.identity)?;
     fs::remove_file(recovery_backup_pointer_path(root)?)
         .map_err(|source| recovery_transaction_io("remove the previous backup pointer", source))?;
     let _result = fs::remove_file(recovery_candidate_owner_path(&backup.path));
@@ -2693,6 +2953,23 @@ fn run_recovery_promotion_hook(root: &Path) {
 fn run_recovery_promotion_hook(_root: &Path) {}
 
 #[cfg(test)]
+static RECOVERY_CLEANUP_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_cleanup_hook(root: &Path) {
+    if let Ok(mut hooks) = RECOVERY_CLEANUP_HOOKS.lock()
+        && let Some(index) = hooks.iter().position(|(target, _)| target == root)
+    {
+        let (_, hook) = hooks.swap_remove(index);
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_cleanup_hook(_root: &Path) {}
+
+#[cfg(test)]
 static RECOVERY_SIDECAR_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -2847,13 +3124,26 @@ fn run_bounded_recovery_command(
         args: args.clone(),
         source: std::io::Error::other("recovery command could not capture stderr"),
     })?;
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(source) = configure_recovery_pipe_nonblocking(&stdout)
+            .and_then(|()| configure_recovery_pipe_nonblocking(&stderr))
+        {
+            let _ = terminate_recovery_process_group(&mut child);
+            let _ = child.wait();
+            return Err(GitError::Io { args, source });
+        }
+    }
     let output_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop_readers = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stdout_bytes = std::sync::Arc::clone(&output_bytes);
     let stderr_bytes = std::sync::Arc::clone(&output_bytes);
+    let stdout_stop = std::sync::Arc::clone(&stop_readers);
+    let stderr_stop = std::sync::Arc::clone(&stop_readers);
     let stdout_reader =
-        std::thread::spawn(move || read_bounded_recovery_output(stdout, stdout_bytes));
+        std::thread::spawn(move || read_bounded_recovery_output(stdout, stdout_bytes, stdout_stop));
     let stderr_reader =
-        std::thread::spawn(move || read_bounded_recovery_output(stderr, stderr_bytes));
+        std::thread::spawn(move || read_bounded_recovery_output(stderr, stderr_bytes, stderr_stop));
     let status = loop {
         if output_bytes.load(std::sync::atomic::Ordering::Relaxed) > MAX_RECOVERY_OUTPUT_BYTES {
             #[cfg(target_os = "linux")]
@@ -2861,19 +3151,20 @@ fn run_bounded_recovery_command(
             #[cfg(not(target_os = "linux"))]
             let termination = child.kill();
             let status = child.wait();
-            termination.map_err(|source| GitError::Io {
-                args: args.clone(),
-                source,
-            })?;
-            break status;
+            break termination.and(status);
         }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
             Err(source) => break Err(source),
         }
-    }
-    .map_err(|source| GitError::Io {
+    };
+    #[cfg(target_os = "linux")]
+    let post_exit_termination = terminate_recovery_process_group(&mut child);
+    #[cfg(not(target_os = "linux"))]
+    let post_exit_termination = Ok(());
+    stop_readers.store(true, std::sync::atomic::Ordering::Release);
+    let status = status.map_err(|source| GitError::Io {
         args: args.clone(),
         source,
     })?;
@@ -2887,6 +3178,10 @@ fn run_bounded_recovery_command(
             args: args.clone(),
             source,
         })?;
+    post_exit_termination.map_err(|source| GitError::Io {
+        args: args.clone(),
+        source,
+    })?;
     let stderr = stderr_reader
         .join()
         .map_err(|_| GitError::Io {
@@ -2928,11 +3223,23 @@ fn terminate_recovery_process_group(child: &mut std::process::Child) -> std::io:
 fn read_bounded_recovery_output(
     mut stream: impl Read,
     total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<Vec<u8>> {
     let mut retained = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let read = stream.read(&mut buffer)?;
+        let read = match stream.read(&mut buffer) {
+            Ok(read) => read,
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(retained);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            Err(source) => return Err(source),
+        };
         if read == 0 {
             return Ok(retained);
         }
@@ -2945,6 +3252,14 @@ fn read_bounded_recovery_output(
             return Ok(retained);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_recovery_pipe_nonblocking(pipe: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe)
+        .map_err(|source| std::io::Error::from_raw_os_error(source.raw_os_error()))?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|source| std::io::Error::from_raw_os_error(source.raw_os_error()))
 }
 
 fn recovery_bound_error(detail: String) -> GitError {
@@ -3020,6 +3335,17 @@ fn recovery_file_identity(metadata: &fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
 
     (metadata.dev(), metadata.ino())
+}
+
+fn recovery_path_identity(path: &Path) -> Result<(u64, u64), GitError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| recovery_transaction_io("identify recovery directory", source))?;
+    if !metadata.file_type().is_dir() {
+        return Err(recovery_transaction_blocked(
+            "recovery directory changed before its identity could be verified",
+        ));
+    }
+    Ok(recovery_file_identity(&metadata))
 }
 
 #[cfg(not(unix))]
@@ -4754,13 +5080,17 @@ mod tests {
 
         let root = clone.path().canonicalize()?;
         let baseline = RecoveryGeneration::capture(&root)?;
+        let root_identity = recovery_path_identity(&root)?;
         let parent = root.parent().ok_or("local clone has no parent")?;
         let (candidate, _) = create_recovery_candidate(parent, &root)?;
+        let candidate_identity = recovery_path_identity(&candidate)?;
         let mut transaction = RecoveryTransaction {
             root: root.clone(),
             backup_pointer: recovery_backup_pointer_path(&candidate)?,
             candidate,
             baseline,
+            root_identity,
+            candidate_identity,
             keep_candidate: false,
         };
         transaction.copy_repository()?;
@@ -4976,6 +5306,69 @@ mod tests {
         assert!(!late_side_effect.exists());
         assert_eq!(git.recovery_state()?, expected);
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        fs::remove_file(hook_pid)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_terminates_quiet_hook_descendants_after_git_exits() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        let hook_pid = repo.path().with_extension("quiet-hook-pid");
+        let late_side_effect = repo.path().with_extension("quiet-hook-late-effect");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n(sh -c 'printf \"%s\\n\" \"$$\" > {}; sleep 30; touch {}') &\nwhile [ ! -s {} ]; do sleep 0.01; done\n",
+                shell_quote(&hook_pid.to_string_lossy()),
+                shell_quote(&late_side_effect.to_string_lossy()),
+                shell_quote(&hook_pid.to_string_lossy())
+            ),
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        )? {
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
+        git.recover_exact(
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        )?;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "recovery waited for a quiet hook descendant holding its output pipe"
+        );
+        let pid = fs::read_to_string(&hook_pid)?.trim().parse::<i32>()?;
+        let pid = rustix::process::Pid::from_raw(pid).ok_or("invalid quiet hook pid")?;
+        for _ in 0..200 {
+            if rustix::process::test_kill_process(pid).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "quiet recovery hook descendant survived post-exit termination"
+        );
+        assert!(!late_side_effect.exists());
+        assert_eq!(git.status()?.operation, None);
         fs::remove_file(hook_pid)?;
         Ok(())
     }
@@ -5299,13 +5692,27 @@ mod tests {
         let backup = recovery_backup_from_pointer(&root)?.ok_or("missing retained backup")?;
         repo.run_allow_failure(["merge", "other"])?;
         let expected = git.recovery_state()?;
-        let mut guard = bind_mount(&backup.join("nested-mount"))?;
+        let late_mount_target = backup.join("nested-mount");
+        let hook_source = source.clone();
+        let hook_target = late_mount_target.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let _result = Command::new("mount")
+                .args(["--bind"])
+                .arg(hook_source)
+                .arg(hook_target)
+                .status();
+        });
+        RECOVERY_CLEANUP_HOOKS
+            .lock()
+            .map_err(|_| "recovery cleanup hook lock poisoned")?
+            .push((backup.clone(), hook));
 
         let Err(error) =
             git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
         else {
             return Err("nested backup mount was not blocked before later recovery cleanup".into());
         };
+        let mut guard = BindMountGuard(Some(late_mount_target));
         assert!(
             error.to_string().contains("mounted filesystem entry"),
             "{error}"
@@ -5671,6 +6078,173 @@ mod tests {
             return Err("expected hard-linked files to block atomic recovery".into());
         };
         assert!(error.to_string().contains("hard-linked file"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_rejects_hook_created_special_entry_before_promotion() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        fs::write(&hook, "#!/bin/sh\nmkfifo hook-created-special-entry\n")?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        )? {
+            return Ok(());
+        }
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        ) else {
+            return Err("expected hook-created special entry to block promotion".into());
+        };
+
+        assert!(
+            error.to_string().contains("special filesystem entry"),
+            "{error}"
+        );
+        assert_eq!(git.recovery_state()?, expected);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert!(!repo.path().join("hook-created-special-entry").exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_promotion_rejects_replaced_candidate_identity() -> Result<(), Box<dyn Error>> {
+        use std::sync::{Arc, Mutex};
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let root = repo.path().canonicalize()?;
+        let parent = root
+            .parent()
+            .ok_or("test repository has no parent")?
+            .to_owned();
+        let root_identity = recovery_path_identity(&root)?;
+        let replaced = Arc::new(Mutex::new(None));
+        let hook_replaced = Arc::clone(&replaced);
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let Ok(entries) = fs::read_dir(&parent) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                let owner = recovery_candidate_owner_path(&candidate);
+                let mut expected_owner = Vec::with_capacity(16);
+                expected_owner.extend_from_slice(&root_identity.0.to_le_bytes());
+                expected_owner.extend_from_slice(&root_identity.1.to_le_bytes());
+                if !fs::read(&owner).is_ok_and(|bytes| bytes.starts_with(&expected_owner)) {
+                    continue;
+                }
+                let displaced = candidate.with_extension("displaced");
+                if fs::rename(&candidate, &displaced).is_err()
+                    || fs::create_dir(&candidate).is_err()
+                    || fs::create_dir(candidate.join(".git")).is_err()
+                    || fs::write(candidate.join("replacement-sentinel"), "preserve\n").is_err()
+                {
+                    return;
+                }
+                if let Ok(mut paths) = hook_replaced.lock() {
+                    *paths = Some((candidate, displaced, owner));
+                }
+                return;
+            }
+        });
+        RECOVERY_PROMOTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery promotion hook lock poisoned")?
+            .push((root, hook));
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected replaced recovery candidate to block promotion".into());
+        };
+
+        assert!(error.to_string().contains("candidate changed"), "{error}");
+        assert_eq!(git.recovery_state()?, expected);
+        let (candidate, displaced, owner) = replaced
+            .lock()
+            .map_err(|_| "replaced candidate path lock poisoned")?
+            .take()
+            .ok_or("promotion hook did not replace the candidate")?;
+        assert_eq!(
+            fs::read_to_string(candidate.join("replacement-sentinel"))?,
+            "preserve\n"
+        );
+        fs::remove_dir_all(candidate)?;
+        fs::remove_dir_all(displaced)?;
+        let _ = fs::remove_file(owner);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_cleanup_rejects_synchronized_path_replacement() -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        let root = repo.path().canonicalize()?;
+        let parent = root.parent().ok_or("test repository has no parent")?;
+        let (candidate, _) = create_recovery_candidate(parent, &root)?;
+        fs::write(
+            candidate.join("owned-data"),
+            "remove only this generation\n",
+        )?;
+        let identity = recovery_path_identity(&candidate)?;
+        let displaced = candidate.with_extension("cleanup-displaced");
+        let hook_candidate = candidate.clone();
+        let hook_displaced = displaced.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            if fs::rename(&hook_candidate, &hook_displaced).is_ok()
+                && fs::create_dir(&hook_candidate).is_ok()
+            {
+                let _ = fs::write(hook_candidate.join("replacement-sentinel"), "preserve\n");
+            }
+        });
+        RECOVERY_CLEANUP_HOOKS
+            .lock()
+            .map_err(|_| "recovery cleanup hook lock poisoned")?
+            .push((candidate.clone(), hook));
+
+        let Err(error) = remove_recovery_directory(&candidate, identity) else {
+            return Err("expected synchronized cleanup replacement to be rejected".into());
+        };
+
+        assert!(
+            error.to_string().contains("changed before removal"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(candidate.join("replacement-sentinel"))?,
+            "preserve\n"
+        );
+        fs::remove_dir_all(&candidate)?;
+        fs::remove_dir_all(&displaced)?;
+        let _ = fs::remove_file(recovery_candidate_owner_path(&candidate));
         Ok(())
     }
 
