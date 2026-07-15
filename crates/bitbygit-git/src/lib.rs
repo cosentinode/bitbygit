@@ -2225,6 +2225,10 @@ where
         }
         thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
     };
+    if let Err(error) = ensure_capture_limits(&mut stdout, &mut stderr, capture_limit, &args) {
+        kill_process_tree(&mut child);
+        return Err(error);
+    }
     // Hooks may leave background children behind. End the command's process group
     // before reading finite file snapshots; detached children cannot hold these
     // captures open as they could inherited pipes.
@@ -2331,6 +2335,7 @@ fn bounded_capture_file(_capacity: usize, args: &[String]) -> Result<fs::File, G
     tempfile::tempfile().map_err(|source| recovery_output_io(args, source))
 }
 
+#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
 fn captured_file_position(
     file: &mut fs::File,
     capacity: usize,
@@ -2348,6 +2353,27 @@ fn captured_file_position(
         });
     }
     Ok(position)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "freebsd", target_os = "linux")))]
+fn captured_file_position(
+    file: &mut fs::File,
+    capacity: usize,
+    args: &[String],
+) -> Result<u64, GitError> {
+    let length = file
+        .metadata()
+        .map_err(|source| recovery_output_io(args, source))?
+        .len();
+    if length > capacity as u64 {
+        return Err(GitError::Blocked {
+            message: format!(
+                "git {} output exceeded the bounded capture limit",
+                args.join(" ")
+            ),
+        });
+    }
+    Ok(length)
 }
 
 fn recovery_output_io(args: &[String], source: io::Error) -> GitError {
@@ -2543,7 +2569,7 @@ fn recovery_lock_error(
     action: RecoveryAction,
     source: io::Error,
 ) -> GitError {
-    if source.kind() == io::ErrorKind::WouldBlock {
+    if source.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
         GitError::Blocked {
             message: format!(
                 "{} {} is blocked because another BitByGit recovery is active for this repository",
@@ -4700,7 +4726,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", windows))]
     #[test]
-    fn recovery_command_output_is_bounded() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_command_output_is_bounded() -> Result<(), Box<dyn Error>> {
         #[cfg(unix)]
         let mut command = {
             let mut command = Command::new("sh");
@@ -4710,7 +4736,7 @@ mod tests {
         #[cfg(windows)]
         let mut command = {
             let mut command = Command::new("cmd");
-            command.args(["/C", "for /L %i in (1,1,10000) do @echo 0123456789"]);
+            command.args(["/C", "for /L %i in (1,1,1000000) do @echo 0123456789"]);
             command
         };
         configure_process_group(&mut command);
@@ -5237,7 +5263,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_timeout_kills_descendants() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_timeout_kills_descendants() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         let marker = repo.path().join("descendant-ran");
         let mut command = Command::new("sh");
@@ -5266,7 +5292,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn recovery_timeout_kills_windows_job_descendants() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_timeout_kills_windows_job_descendants() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         let marker = repo.path().join("windows-descendant-ran");
         let script = format!(
@@ -5365,7 +5391,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn recovery_lock_serializes_bitbygit_execution() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_lock_serializes_bitbygit_execution() -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_merge_conflict()?;
         let storage = TempRepo::new()?;
         let git = Git::new(repo.path()).with_recovery_data_dir(storage.path());
@@ -5477,7 +5503,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_lock_key_and_path_are_safe() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_lock_key_and_path_are_safe() -> Result<(), Box<dyn Error>> {
         let repo = initialized_repo()?;
         let storage = TempRepo::new()?;
         let git = Git::new(repo.path()).with_recovery_data_dir(storage.path());
@@ -5485,7 +5511,7 @@ mod tests {
         let path =
             git.recovery_lock_path(RepositoryOperation::Merge, RecoveryAction::Abort, &root)?;
         let key = recovery_lock_key_from_path(&path).ok_or("unsafe recovery lock name")?;
-        let expected_parent = storage.path().join(RECOVERY_LOCK_DIRECTORY);
+        let expected_parent = fs::canonicalize(storage.path().join(RECOVERY_LOCK_DIRECTORY))?;
 
         assert_eq!(key.len(), 64);
         assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));

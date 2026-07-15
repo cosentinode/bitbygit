@@ -68,7 +68,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Test recovery support
-        run: cargo test --locked -p bitbygit-git recovery_
+        run: cargo test --locked -p bitbygit-git recovery_platform_
 
       - name: Build workspace
         run: cargo build --locked --workspace
