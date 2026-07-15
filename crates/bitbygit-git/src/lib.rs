@@ -4,13 +4,25 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::string::FromUtf8Error;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+use rustix::process::{Pid, Signal, kill_process_group};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -21,12 +33,37 @@ const COMMIT_HOOKS: &[&str] = &[
     "commit-msg",
     "post-commit",
 ];
+const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(10);
+const RECOVERY_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
+const RECOVERY_OUTPUT_LIMIT: usize = 256 * 1024;
+const RECOVERY_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
+const RECOVERY_STATE_ENTRY_LIMIT: usize = 100_000;
+const RECOVERY_CONTROL_PATHS: &[&str] = &[
+    "HEAD",
+    "index",
+    "ORIG_HEAD",
+    "MERGE_HEAD",
+    "MERGE_MSG",
+    "MERGE_MODE",
+    "AUTO_MERGE",
+    "SQUASH_MSG",
+    "REBASE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_HEAD",
+    "rebase-apply",
+    "rebase-merge",
+    "sequencer",
+];
 static NEXT_STAGED_FETCH_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct Git {
     cwd: PathBuf,
     ssh_executable: Option<PathBuf>,
+    recovery_plan_timeout: Duration,
+    recovery_execution_timeout: Duration,
+    recovery_output_limit: usize,
 }
 
 impl Git {
@@ -34,6 +71,9 @@ impl Git {
         Self {
             cwd: cwd.into(),
             ssh_executable: None,
+            recovery_plan_timeout: RECOVERY_PLAN_TIMEOUT,
+            recovery_execution_timeout: RECOVERY_EXECUTION_TIMEOUT,
+            recovery_output_limit: RECOVERY_OUTPUT_LIMIT,
         }
     }
 
@@ -44,6 +84,25 @@ impl Git {
         Self {
             cwd: cwd.into(),
             ssh_executable: Some(ssh_executable.into()),
+            recovery_plan_timeout: RECOVERY_PLAN_TIMEOUT,
+            recovery_execution_timeout: RECOVERY_EXECUTION_TIMEOUT,
+            recovery_output_limit: RECOVERY_OUTPUT_LIMIT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_recovery_limits(
+        cwd: impl Into<PathBuf>,
+        plan_timeout: Duration,
+        execution_timeout: Duration,
+        output_limit: usize,
+    ) -> Self {
+        Self {
+            cwd: cwd.into(),
+            ssh_executable: None,
+            recovery_plan_timeout: plan_timeout,
+            recovery_execution_timeout: execution_timeout,
+            recovery_output_limit: output_limit,
         }
     }
 
@@ -215,14 +274,92 @@ impl Git {
         operation: RepositoryOperation,
         action: RecoveryAction,
     ) -> Result<GitOutput, GitError> {
-        if operation == RepositoryOperation::Merge && action == RecoveryAction::Skip {
-            return Err(GitError::Blocked {
-                message: "merge skip is blocked because Git does not support it".to_owned(),
-            });
-        }
+        let deadline = Instant::now() + self.recovery_execution_timeout;
+        self.validate_recovery_until(operation, action, deadline)?;
+        self.run_recovery_args_until(operation, action, deadline)
+    }
 
-        let status = self.status()?;
-        match status.operation {
+    pub fn recovery_state(&self) -> Result<RecoveryState, GitError> {
+        self.recovery_state_until(Instant::now() + self.recovery_plan_timeout)
+    }
+
+    pub fn prepare_recovery(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+    ) -> Result<RecoveryState, GitError> {
+        let deadline = Instant::now() + self.recovery_plan_timeout;
+        self.validate_recovery_until(operation, action, deadline)?;
+        self.recovery_state_until(deadline)
+    }
+
+    pub fn validate_recovery(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+    ) -> Result<(), GitError> {
+        self.validate_recovery_until(
+            operation,
+            action,
+            Instant::now() + self.recovery_plan_timeout,
+        )
+    }
+
+    pub fn recover_exact(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        expected_state: &RecoveryState,
+    ) -> Result<GitOutput, GitError> {
+        self.recover_exact_with(operation, action, expected_state, || Ok(()))
+    }
+
+    fn recover_exact_with<F>(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        expected_state: &RecoveryState,
+        before_final_check: F,
+    ) -> Result<GitOutput, GitError>
+    where
+        F: FnOnce() -> Result<(), GitError>,
+    {
+        self.validate_recovery_action(operation, action)?;
+        let deadline = Instant::now() + self.recovery_execution_timeout;
+        self.ensure_recovery_state(expected_state, operation, action, deadline)?;
+        before_final_check()?;
+        self.ensure_recovery_state(expected_state, operation, action, deadline)?;
+        self.run_recovery_args_until(operation, action, deadline)
+    }
+
+    fn ensure_recovery_state(
+        &self,
+        expected_state: &RecoveryState,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        deadline: Instant,
+    ) -> Result<(), GitError> {
+        if self.recovery_state_until(deadline)? == *expected_state {
+            return Ok(());
+        }
+        Err(GitError::Blocked {
+            message: format!(
+                "{} {} is blocked because repository state changed after preview",
+                operation.label(),
+                action.label()
+            ),
+        })
+    }
+
+    fn validate_recovery_until(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        deadline: Instant,
+    ) -> Result<(), GitError> {
+        self.validate_recovery_action(operation, action)?;
+        let active = self.repository_operation_until(deadline)?;
+        match active {
             Some(active) if active == operation => {}
             Some(active) => {
                 return Err(GitError::Blocked {
@@ -245,7 +382,7 @@ impl Git {
                 });
             }
         }
-        if action == RecoveryAction::Continue && !status.conflicted_files().is_empty() {
+        if action == RecoveryAction::Continue && self.has_unresolved_conflicts_until(deadline)? {
             return Err(GitError::Blocked {
                 message: format!(
                     "{} continue is blocked while unresolved conflicts are present",
@@ -253,43 +390,20 @@ impl Git {
                 ),
             });
         }
-
-        self.run_recovery_args(vec![
-            operation.label().to_owned(),
-            format!("--{}", action.label()),
-        ])
+        Ok(())
     }
 
-    pub fn recovery_state(&self) -> Result<RecoveryState, GitError> {
-        Ok(RecoveryState {
-            operation: self.repository_operation()?,
-            head: self.head_target()?,
-            status: self
-                .run_raw(["status", "--porcelain=v2", "--branch", "-z"])?
-                .stdout,
-            index: self.run_raw(["ls-files", "--stage", "-z"])?.stdout,
-            worktree: self
-                .run_raw(["diff", "--binary", "--no-ext-diff", "--full-index", "--"])?
-                .stdout,
-        })
-    }
-
-    pub fn recover_exact(
+    fn validate_recovery_action(
         &self,
         operation: RepositoryOperation,
         action: RecoveryAction,
-        expected_state: &RecoveryState,
-    ) -> Result<GitOutput, GitError> {
-        if self.recovery_state()? != *expected_state {
+    ) -> Result<(), GitError> {
+        if operation == RepositoryOperation::Merge && action == RecoveryAction::Skip {
             return Err(GitError::Blocked {
-                message: format!(
-                    "{} {} is blocked because repository state changed after preview",
-                    operation.label(),
-                    action.label()
-                ),
+                message: "merge skip is blocked because Git does not support it".to_owned(),
             });
         }
-        self.recover(operation, action)
+        Ok(())
     }
 
     pub fn push_current_branch(
@@ -1037,12 +1151,240 @@ impl Git {
         })
     }
 
+    fn recovery_state_until(&self, deadline: Instant) -> Result<RecoveryState, GitError> {
+        let mut hasher = Sha256::new();
+        for args in [
+            vec![
+                "status".to_owned(),
+                "--porcelain=v2".to_owned(),
+                "--branch".to_owned(),
+                "--untracked-files=all".to_owned(),
+                "-z".to_owned(),
+            ],
+            vec![
+                "diff".to_owned(),
+                "--binary".to_owned(),
+                "--no-ext-diff".to_owned(),
+                "--no-textconv".to_owned(),
+                "--full-index".to_owned(),
+                "--".to_owned(),
+            ],
+            vec![
+                "diff".to_owned(),
+                "--cached".to_owned(),
+                "--binary".to_owned(),
+                "--no-ext-diff".to_owned(),
+                "--no-textconv".to_owned(),
+                "--full-index".to_owned(),
+                "--".to_owned(),
+            ],
+            vec![
+                "for-each-ref".to_owned(),
+                "--sort=refname".to_owned(),
+                "--format=%(refname)%00%(objectname)%00%(symref)%00".to_owned(),
+            ],
+            vec![
+                "config".to_owned(),
+                "--null".to_owned(),
+                "--list".to_owned(),
+                "--show-origin".to_owned(),
+                "--show-scope".to_owned(),
+            ],
+        ] {
+            let output = self.run_bounded_git(args.clone(), deadline, true)?;
+            if !output.status.success() {
+                return Err(output.git_error(args));
+            }
+            hash_field(&mut hasher, &output.stdout.digest);
+        }
+
+        let mut entries = 0;
+        for relative in RECOVERY_CONTROL_PATHS {
+            let path = self.git_path_until(relative, deadline)?;
+            hash_recovery_path(
+                &mut hasher,
+                relative.as_bytes(),
+                &path,
+                deadline,
+                &mut entries,
+            )?;
+        }
+        let hooks = self.recovery_hooks_path_until(deadline)?;
+        hash_recovery_path(&mut hasher, b"hooks", &hooks, deadline, &mut entries)?;
+
+        Ok(RecoveryState {
+            fingerprint: hasher.finalize().into(),
+        })
+    }
+
+    fn repository_operation_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<RepositoryOperation>, GitError> {
+        let rebase_apply = self.git_path_until("rebase-apply", deadline)?;
+        if self.git_path_until("rebase-merge", deadline)?.exists()
+            || (rebase_apply.exists() && !rebase_apply.join("applying").exists())
+        {
+            return Ok(Some(RepositoryOperation::Rebase));
+        }
+        if self.git_path_until("MERGE_HEAD", deadline)?.exists() {
+            return Ok(Some(RepositoryOperation::Merge));
+        }
+        Ok(None)
+    }
+
+    fn has_unresolved_conflicts_until(&self, deadline: Instant) -> Result<bool, GitError> {
+        let args = vec![
+            "diff".to_owned(),
+            "--quiet".to_owned(),
+            "--diff-filter=U".to_owned(),
+            "--".to_owned(),
+        ];
+        let output = self.run_bounded_git(args.clone(), deadline, true)?;
+        match output.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(output.git_error(args)),
+        }
+    }
+
+    fn git_path_until(&self, path: &str, deadline: Instant) -> Result<PathBuf, GitError> {
+        let args = vec![
+            "rev-parse".to_owned(),
+            "--path-format=absolute".to_owned(),
+            "--git-path".to_owned(),
+            path.to_owned(),
+        ];
+        let output = self.run_bounded_git(args.clone(), deadline, true)?;
+        if !output.status.success() {
+            return Err(output.git_error(args));
+        }
+        if output.stdout.truncated {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "recovery planning is blocked because Git path {path} is too long"
+                ),
+            });
+        }
+        Ok(path_from_bytes(strip_byte_line_ending(
+            &output.stdout.bytes,
+        )))
+    }
+
+    fn recovery_hooks_path_until(&self, deadline: Instant) -> Result<PathBuf, GitError> {
+        let args = vec![
+            "config".to_owned(),
+            "--path".to_owned(),
+            "--get".to_owned(),
+            "core.hooksPath".to_owned(),
+        ];
+        let output = self.run_bounded_git(args.clone(), deadline, true)?;
+        if output.status.success() {
+            if output.stdout.truncated {
+                return Err(GitError::Blocked {
+                    message: "recovery planning is blocked because core.hooksPath is too long"
+                        .to_owned(),
+                });
+            }
+            let path = path_from_bytes(strip_byte_line_ending(&output.stdout.bytes));
+            return Ok(if path.is_absolute() {
+                path
+            } else {
+                let root = self.repo_root_until(deadline)?;
+                root.join(path)
+            });
+        }
+        if output.status.code() == Some(1) {
+            return self.git_path_until("hooks", deadline);
+        }
+        Err(output.git_error(args))
+    }
+
+    fn repo_root_until(&self, deadline: Instant) -> Result<PathBuf, GitError> {
+        let args = vec!["rev-parse".to_owned(), "--show-toplevel".to_owned()];
+        let output = self.run_bounded_git(args.clone(), deadline, true)?;
+        if !output.status.success() {
+            return Err(output.git_error(args));
+        }
+        if output.stdout.truncated {
+            return Err(GitError::Blocked {
+                message: "recovery planning is blocked because the repository path is too long"
+                    .to_owned(),
+            });
+        }
+        Ok(path_from_bytes(strip_byte_line_ending(
+            &output.stdout.bytes,
+        )))
+    }
+
     fn run_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
         self.run_args_with_editor(args, false)
     }
 
-    fn run_recovery_args(&self, args: Vec<String>) -> Result<GitOutput, GitError> {
-        self.run_args_with_editor(args, true)
+    fn run_recovery_args_until(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        deadline: Instant,
+    ) -> Result<GitOutput, GitError> {
+        let args = vec![
+            operation.label().to_owned(),
+            format!("--{}", action.label()),
+        ];
+        let output = self.run_bounded_git(args.clone(), deadline, false)?;
+        let stdout = output.stdout.lossy_text();
+        let stderr = output.stderr.lossy_text();
+        if !output.status.success() {
+            return Err(GitError::GitFailed {
+                args,
+                status: output.status,
+                stdout,
+                stderr,
+            });
+        }
+        Ok(GitOutput {
+            status: output.status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn run_bounded_git(
+        &self,
+        args: Vec<String>,
+        deadline: Instant,
+        optional_locks: bool,
+    ) -> Result<BoundedCommandOutput, GitError> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(&self.cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(&args);
+        if optional_locks {
+            command.env("GIT_OPTIONAL_LOCKS", "0");
+        }
+        if self.ssh_executable.is_some() || env::var_os("GIT_SSH_COMMAND").is_none() {
+            let ssh_executable = self
+                .ssh_executable
+                .as_ref()
+                .map(|path| shell_quote(&path.to_string_lossy()))
+                .unwrap_or_else(|| "ssh".to_owned());
+            command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
+        }
+        configure_process_group(&mut command);
+        let output_limit = if optional_locks {
+            RECOVERY_DIAGNOSTIC_LIMIT
+        } else {
+            self.recovery_output_limit
+        };
+        run_bounded_command(command, args, deadline, output_limit)
     }
 
     fn run_args_with_editor(
@@ -1253,6 +1595,218 @@ impl Git {
     }
 }
 
+fn run_bounded_command(
+    mut command: Command,
+    args: Vec<String>,
+    deadline: Instant,
+    output_limit: usize,
+) -> Result<BoundedCommandOutput, GitError> {
+    if Instant::now() >= deadline {
+        return Err(GitError::TimedOut { args });
+    }
+    let mut child = command.spawn().map_err(|source| GitError::Io {
+        args: args.clone(),
+        source,
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| GitError::Io {
+        args: args.clone(),
+        source: io::Error::other("failed to capture git stdout"),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| GitError::Io {
+        args: args.clone(),
+        source: io::Error::other("failed to capture git stderr"),
+    })?;
+    let stdout_reader = thread::spawn(move || read_captured_stream(stdout, output_limit));
+    let stderr_reader = thread::spawn(move || read_captured_stream(stderr, output_limit));
+
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|source| GitError::Io {
+            args: args.clone(),
+            source,
+        })? {
+            break status;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            kill_process_tree(&mut child);
+            let _result = child.wait();
+            let _stdout = join_captured_stream(stdout_reader, &args);
+            let _stderr = join_captured_stream(stderr_reader, &args);
+            return Err(GitError::TimedOut { args });
+        }
+        thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
+    };
+
+    Ok(BoundedCommandOutput {
+        status,
+        stdout: join_captured_stream(stdout_reader, &args)?,
+        stderr: join_captured_stream(stderr_reader, &args)?,
+    })
+}
+
+fn read_captured_stream(mut stream: impl Read, output_limit: usize) -> io::Result<CapturedStream> {
+    let mut hasher = Sha256::new();
+    let mut bytes = Vec::with_capacity(output_limit.min(8192));
+    let mut truncated = false;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        let remaining = output_limit.saturating_sub(bytes.len());
+        let retained = remaining.min(count);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < count;
+    }
+    Ok(CapturedStream {
+        bytes,
+        digest: hasher.finalize().into(),
+        truncated,
+    })
+}
+
+fn join_captured_stream(
+    reader: thread::JoinHandle<io::Result<CapturedStream>>,
+    args: &[String],
+) -> Result<CapturedStream, GitError> {
+    reader
+        .join()
+        .map_err(|_| GitError::Io {
+            args: args.to_vec(),
+            source: io::Error::other("git output reader stopped unexpectedly"),
+        })?
+        .map_err(|source| GitError::Io {
+            args: args.to_vec(),
+            source,
+        })
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_process_tree(child: &mut Child) {
+    if let Some(pid) = Pid::from_raw(child.id() as i32) {
+        let _result = kill_process_group(pid, Signal::Kill);
+    }
+    let _result = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(child: &mut Child) {
+    let _result = child.kill();
+}
+
+fn hash_recovery_path(
+    hasher: &mut Sha256,
+    label: &[u8],
+    path: &Path,
+    deadline: Instant,
+    entries: &mut usize,
+) -> Result<(), GitError> {
+    ensure_recovery_fingerprint_capacity(deadline, entries)?;
+    hash_field(hasher, label);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            hash_field(hasher, b"missing");
+            return Ok(());
+        }
+        Err(source) => return Err(recovery_state_io(path, source)),
+    };
+    *entries += 1;
+    hash_field(hasher, &metadata.len().to_le_bytes());
+    #[cfg(unix)]
+    hash_field(hasher, &metadata.mode().to_le_bytes());
+    #[cfg(not(unix))]
+    hash_field(hasher, &[u8::from(metadata.permissions().readonly())]);
+
+    if metadata.file_type().is_symlink() {
+        hash_field(hasher, b"symlink");
+        let target = fs::read_link(path).map_err(|source| recovery_state_io(path, source))?;
+        hash_field(hasher, target.as_os_str().as_encoded_bytes());
+    } else if metadata.is_file() {
+        hash_field(hasher, b"file");
+        let mut file = fs::File::open(path).map_err(|source| recovery_state_io(path, source))?;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            if Instant::now() >= deadline {
+                return Err(GitError::TimedOut {
+                    args: vec!["recovery-state".to_owned()],
+                });
+            }
+            let count = file
+                .read(&mut buffer)
+                .map_err(|source| recovery_state_io(path, source))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+    } else if metadata.is_dir() {
+        hash_field(hasher, b"directory");
+        let mut children = Vec::new();
+        for child in fs::read_dir(path).map_err(|source| recovery_state_io(path, source))? {
+            ensure_recovery_fingerprint_capacity(deadline, entries)?;
+            if children.len() + *entries >= RECOVERY_STATE_ENTRY_LIMIT {
+                return Err(GitError::Blocked {
+                    message:
+                        "recovery planning is blocked because recovery state has too many entries"
+                            .to_owned(),
+                });
+            }
+            children.push(child.map_err(|source| recovery_state_io(path, source))?);
+        }
+        children.sort_by_key(fs::DirEntry::file_name);
+        for child in children {
+            let mut child_label = label.to_vec();
+            child_label.push(b'/');
+            child_label.extend_from_slice(child.file_name().as_encoded_bytes());
+            hash_recovery_path(hasher, &child_label, &child.path(), deadline, entries)?;
+        }
+    } else {
+        hash_field(hasher, b"special");
+    }
+    Ok(())
+}
+
+fn ensure_recovery_fingerprint_capacity(
+    deadline: Instant,
+    entries: &usize,
+) -> Result<(), GitError> {
+    if Instant::now() >= deadline {
+        return Err(GitError::TimedOut {
+            args: vec!["recovery-state".to_owned()],
+        });
+    }
+    if *entries >= RECOVERY_STATE_ENTRY_LIMIT {
+        return Err(GitError::Blocked {
+            message: "recovery planning is blocked because recovery state has too many entries"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn recovery_state_io(path: &Path, source: io::Error) -> GitError {
+    GitError::Io {
+        args: vec![format!("recovery-state {}", path.display())],
+        source,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
     pub root: PathBuf,
@@ -1312,6 +1866,44 @@ struct RawProcessOutput {
 }
 
 #[derive(Debug)]
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+}
+
+impl BoundedCommandOutput {
+    fn git_error(self, args: Vec<String>) -> GitError {
+        GitError::GitFailed {
+            args,
+            status: self.status,
+            stdout: self.stdout.lossy_text(),
+            stderr: self.stderr.lossy_text(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CapturedStream {
+    bytes: Vec<u8>,
+    digest: [u8; 32],
+    truncated: bool,
+}
+
+impl CapturedStream {
+    fn lossy_text(self) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.truncated {
+            if !text.ends_with('\n') && !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[output truncated by bitbygit]\n");
+        }
+        text
+    }
+}
+
+#[derive(Debug)]
 pub enum GitError {
     Io {
         args: Vec<String>,
@@ -1327,6 +1919,9 @@ pub enum GitError {
         status: ExitStatus,
         stdout: String,
         stderr: String,
+    },
+    TimedOut {
+        args: Vec<String>,
     },
     Blocked {
         message: String,
@@ -1371,6 +1966,9 @@ impl Display for GitError {
                     args.join(" ")
                 )
             }
+            Self::TimedOut { args } => {
+                write!(formatter, "git {} timed out", args.join(" "))
+            }
             Self::Blocked { message } => formatter.write_str(message),
             Self::Parse { message } => write!(formatter, "failed to parse git output: {message}"),
         }
@@ -1382,7 +1980,10 @@ impl Error for GitError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Utf8 { source, .. } => Some(source),
-            Self::GitFailed { .. } | Self::Blocked { .. } | Self::Parse { .. } => None,
+            Self::GitFailed { .. }
+            | Self::TimedOut { .. }
+            | Self::Blocked { .. }
+            | Self::Parse { .. } => None,
         }
     }
 }
@@ -1454,11 +2055,7 @@ pub enum RecoveryAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryState {
-    operation: Option<RepositoryOperation>,
-    head: HeadTarget,
-    status: Vec<u8>,
-    index: Vec<u8>,
-    worktree: Vec<u8>,
+    fingerprint: [u8; 32],
 }
 
 impl RecoveryAction {
@@ -2605,6 +3202,241 @@ mod tests {
         assert!(format!("{}{}", output.stdout, output.stderr).contains('\u{fffd}'));
         assert_eq!(git.status()?.operation, None);
         repo.run(["rev-parse", "--verify", "HEAD^2"])?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_fingerprint_tracks_refs_index_config_hooks_and_progress()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let baseline = git.recovery_state()?;
+
+        repo.run(["update-ref", "refs/heads/preview-race", "HEAD"])?;
+        assert_ne!(git.recovery_state()?, baseline);
+        repo.run(["update-ref", "-d", "refs/heads/preview-race"])?;
+        assert_eq!(git.recovery_state()?, baseline);
+
+        repo.run(["config", "user.name", "changed after preview"])?;
+        assert_ne!(git.recovery_state()?, baseline);
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        assert_eq!(git.recovery_state()?, baseline);
+
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        fs::write(&hook, "#!/bin/sh\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&hook)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook, permissions)?;
+        }
+        assert_ne!(git.recovery_state()?, baseline);
+        fs::remove_file(hook)?;
+        assert_eq!(git.recovery_state()?, baseline);
+
+        repo.write("staged-after-preview.txt", "unexpected\n")?;
+        repo.run(["add", "staged-after-preview.txt"])?;
+        assert_ne!(git.recovery_state()?, baseline);
+
+        let (rebase_repo, _original_head) = prepare_rebase_conflict()?;
+        let rebase_git = Git::new(rebase_repo.path());
+        let rebase_baseline = rebase_git.recovery_state()?;
+        let orig_head = rebase_git.git_path("rebase-merge/orig-head")?;
+        fs::write(orig_head, format!("{ZERO_OID}\n"))?;
+        assert_ne!(rebase_git.recovery_state()?, rebase_baseline);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_changed_merge_control_input() -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(repo.path());
+        let expected =
+            git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Continue)?;
+        fs::write(git.git_path("MERGE_MSG")?, "substituted message\n")?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        ) else {
+            return Err("expected changed merge metadata to block recovery".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_detects_synchronized_change_at_spawn_boundary() -> Result<(), Box<dyn Error>>
+    {
+        let (repo, original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(repo.path());
+        let expected =
+            git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Continue)?;
+
+        let Err(error) = git.recover_exact_with(
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+            || {
+                fs::write(repo.path().join("late.txt"), "late staged content\n").map_err(
+                    |source| GitError::Io {
+                        args: vec!["write synchronized mutation".to_owned()],
+                        source,
+                    },
+                )?;
+                let output = Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["add", "late.txt"])
+                    .output()
+                    .map_err(|source| GitError::Io {
+                        args: vec!["add synchronized mutation".to_owned()],
+                        source,
+                    })?;
+                if !output.status.success() {
+                    return Err(GitError::Blocked {
+                        message: "synchronized mutation failed".to_owned(),
+                    });
+                }
+                Ok(())
+            },
+        ) else {
+            return Err("expected final spawn-boundary check to block recovery".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_fingerprint_streams_large_binary_diffs_into_fixed_state()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        fs::write(
+            repo.path().join("conflict.txt"),
+            vec![0xa5; 8 * 1024 * 1024],
+        )?;
+        let git = Git::with_recovery_limits(
+            repo.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            4096,
+        );
+
+        let state = git.recovery_state()?;
+
+        assert_eq!(std::mem::size_of_val(&state), 32);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_planning_times_out_hanging_status_hook() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let hook = repo.path().join("fsmonitor");
+        fs::write(&hook, "#!/bin/sh\nsleep 30\n")?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        repo.run_args(&["config", "core.fsmonitor", &hook.to_string_lossy()])?;
+        let git = Git::with_recovery_limits(
+            repo.path(),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            4096,
+        );
+        let started = Instant::now();
+
+        let Err(error) = git.recovery_state() else {
+            return Err("expected hanging recovery planning hook to time out".into());
+        };
+
+        assert!(matches!(error, GitError::TimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_caps_noisy_hook_output() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        fs::write(
+            &hook,
+            "#!/bin/sh\ndd if=/dev/zero bs=1024 count=1024 2>/dev/null\n",
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::with_recovery_limits(
+            repo.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            4096,
+        );
+
+        let output = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue)?;
+
+        assert!(
+            format!("{}{}", output.stdout, output.stderr).contains("output truncated by bitbygit")
+        );
+        assert!(output.stdout.len() < 5000);
+        assert!(output.stderr.len() < 5000);
+        assert_eq!(git.status()?.operation, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_times_out_quiet_hanging_hook() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        fs::write(&hook, "#!/bin/sh\nsleep 30\n")?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::with_recovery_limits(
+            repo.path(),
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            4096,
+        );
+        let started = Instant::now();
+
+        let Err(error) = git.recover(RepositoryOperation::Merge, RecoveryAction::Continue) else {
+            return Err("expected hanging recovery hook to time out".into());
+        };
+
+        assert!(matches!(error, GitError::TimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         Ok(())
     }
 

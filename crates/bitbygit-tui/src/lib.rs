@@ -1912,7 +1912,9 @@ impl OperationPlanner {
     }
 
     fn plan_request(&self, request: OperationRequest) -> Result<PreparedOperation, String> {
-        self.ensure_conflict_mode_allowed(std::slice::from_ref(&request))?;
+        if !matches!(request, OperationRequest::Recover(_)) {
+            self.ensure_conflict_mode_allowed(std::slice::from_ref(&request))?;
+        }
         if let Some(operation) = self.preflight_blocked_request(&request)? {
             return Ok(operation);
         }
@@ -2363,26 +2365,23 @@ impl OperationPlanner {
 
     fn plan_recovery(&self, request: RecoveryRequest) -> Result<PreparedOperation, String> {
         let git = self.git();
-        let status = git
-            .status()
-            .map_err(|error| format!("Unable to prepare recovery plan: {error}"))?;
         let operation = recovery_git_operation(request);
-        if status.operation != Some(operation) {
-            return Err(recovery_state_error(request, status.operation));
-        }
-        if matches!(
-            request,
-            RecoveryRequest::MergeContinue | RecoveryRequest::RebaseContinue
-        ) && !status.conflicted_files().is_empty()
-        {
-            return Err(format!(
-                "{} continue blocked: resolve and stage all conflicts first.",
-                capitalize(request.operation_label())
-            ));
-        }
         let state = git
-            .recovery_state()
-            .map_err(|error| format!("Unable to snapshot recovery state: {error}"))?;
+            .prepare_recovery(operation, recovery_git_action(request))
+            .map_err(|error| {
+                if matches!(
+                    request,
+                    RecoveryRequest::MergeContinue | RecoveryRequest::RebaseContinue
+                ) && error.to_string().contains("unresolved conflicts")
+                {
+                    format!(
+                        "{} continue blocked: resolve and stage all conflicts first.",
+                        capitalize(request.operation_label())
+                    )
+                } else {
+                    format!("Unable to snapshot recovery state: {error}")
+                }
+            })?;
         Ok(PreparedOperation::new(
             recovery_plan(request),
             ExecutionContext::from_payload(PendingPayload::Recovery { state }),
@@ -2574,28 +2573,48 @@ fn validate_conflict_mode(git: &Git, requests: &[OperationRequest]) -> Result<()
     }) {
         return Ok(());
     }
-    let status = git
-        .status()
-        .map_err(|error| format!("Unable to validate conflict-mode policy: {error}"))?;
-    let operation = status.operation;
+    let recoveries = requests
+        .iter()
+        .filter_map(|request| match request {
+            OperationRequest::Recover(recovery) => Some(*recovery),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if recoveries.len() > 1 {
+        return Err(
+            "Recovery sequence blocked: only one recovery action can be preflighted because it changes the active operation state."
+                .to_owned(),
+        );
+    }
+    let operation = if let Some(recovery) = recoveries.first().copied() {
+        let operation = recovery_git_operation(recovery);
+        git.validate_recovery(operation, recovery_git_action(recovery))
+            .map_err(|error| {
+                if matches!(
+                    recovery,
+                    RecoveryRequest::MergeContinue | RecoveryRequest::RebaseContinue
+                ) && error.to_string().contains("unresolved conflicts")
+                {
+                    format!(
+                        "{} continue blocked: resolve and stage all conflicts first.",
+                        capitalize(recovery.operation_label())
+                    )
+                } else {
+                    format!("Unable to validate conflict-mode policy: {error}")
+                }
+            })?;
+        Some(operation)
+    } else {
+        git.status()
+            .map_err(|error| format!("Unable to validate conflict-mode policy: {error}"))?
+            .operation
+    };
 
     for request in requests {
         if let OperationRequest::Recover(recovery) = request
             && operation != Some(recovery_git_operation(*recovery))
         {
             return Err(recovery_state_error(*recovery, operation));
-        }
-        if let OperationRequest::Recover(recovery) = request
-            && matches!(
-                recovery,
-                RecoveryRequest::MergeContinue | RecoveryRequest::RebaseContinue
-            )
-            && !status.conflicted_files().is_empty()
-        {
-            return Err(format!(
-                "{} continue blocked: resolve and stage all conflicts first.",
-                capitalize(recovery.operation_label())
-            ));
         }
         if let Some(active) = operation
             && !conflict_mode_allows(request)
@@ -4863,6 +4882,7 @@ fn truncate_audit_message(message: &str) -> String {
 fn sanitized_git_error(error: &GitError) -> String {
     match error {
         GitError::GitFailed { status, .. } => format!("git failed with status {status}"),
+        GitError::TimedOut { .. } => "git timed out".to_owned(),
         GitError::Io { .. } => "git failed before execution".to_owned(),
         GitError::Utf8 { stream, .. } => format!("git returned non-UTF-8 {stream}"),
         GitError::Blocked { message } => format!("operation blocked: {message}"),
@@ -5781,7 +5801,7 @@ mod tests {
     fn recovery_planner_matches_active_state_and_continue_prerequisites()
     -> Result<(), Box<dyn Error>> {
         let repo = merge_conflict_repo("recovery-planner")?;
-        let planner = OperationPlanner::new(repo);
+        let planner = OperationPlanner::new(&repo);
 
         let Err(error) = planner.plan_prompt_sequence(vec![
             OperationRequest::Fetch,
@@ -5810,7 +5830,21 @@ mod tests {
         assert!(
             planner
                 .plan_request(OperationRequest::Recover(RecoveryRequest::RebaseAbort))
-                .is_err_and(|error| error.contains("does not match"))
+                .is_err_and(|error| error.contains("merge operation is active"))
+        );
+
+        let head_before = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let Err(error) = planner.plan_prompt_sequence(vec![
+            OperationRequest::Recover(RecoveryRequest::MergeAbort),
+            OperationRequest::Recover(RecoveryRequest::MergeAbort),
+        ]) else {
+            return Err("dependent recovery sequence should fail full preflight".into());
+        };
+        assert!(error.contains("only one recovery action can be preflighted"));
+        assert_eq!(git_stdout(&repo, &["rev-parse", "HEAD"])?, head_before);
+        assert_eq!(
+            Git::new(repo).status()?.operation,
+            Some(RepositoryOperation::Merge)
         );
         Ok(())
     }
