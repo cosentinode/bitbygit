@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive_extension: tar.gz
+            max_glibc: "2.35"
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_extension: tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive_extension: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_extension: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Read release metadata
+        id: release
+        shell: bash
+        run: |
+          version="$(cargo pkgid --locked -p bitbygit)"
+          version="${version##*#}"
+          package="bitbygit-${version}-${{ matrix.target }}"
+          archive="${package}.${{ matrix.archive_extension }}"
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "package=${package}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate release tag
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_TAG: v${{ steps.release.outputs.version }}
+        run: |
+          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "::error title=Release tag mismatch::Expected ${EXPECTED_TAG}, got ${RELEASE_TAG}"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --locked --release -p bitbygit --target ${{ matrix.target }}
+
+      - name: Validate Linux glibc baseline
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/bitbygit"
+          required="$(readelf --version-info "${binary}" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -Vu | tail -n 1)"
+          baseline="GLIBC_${{ matrix.max_glibc }}"
+          [[ "$(printf '%s\n' "${required}" "${baseline}" | sort -V | tail -n 1)" == "${baseline}" ]]
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ steps.release.outputs.package }}"
+          cp "target/${{ matrix.target }}/release/bitbygit" "dist/${{ steps.release.outputs.package }}/"
+          tar -C dist -czf "dist/${{ steps.release.outputs.archive }}" "${{ steps.release.outputs.package }}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "dist/${{ steps.release.outputs.package }}"
+          Copy-Item "target/${{ matrix.target }}/release/bitbygit.exe" "dist/${{ steps.release.outputs.package }}/"
+          Compress-Archive -Path "dist/${{ steps.release.outputs.package }}" -DestinationPath "dist/${{ steps.release.outputs.archive }}"
+
+      - name: Smoke-test Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir smoke
+          tar -C smoke -xzf "dist/${{ steps.release.outputs.archive }}"
+          output="$("smoke/${{ steps.release.outputs.package }}/bitbygit" --version)"
+          [[ "${output}" == "bitbygit ${{ steps.release.outputs.version }}" ]]
+
+      - name: Smoke-test Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive -Path "dist/${{ steps.release.outputs.archive }}" -DestinationPath smoke
+          $output = & "smoke/${{ steps.release.outputs.package }}/bitbygit.exe" --version
+          if ($output -ne "bitbygit ${{ steps.release.outputs.version }}") {
+            throw "Unexpected version output: $output"
+          }
+
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.release.outputs.archive }}
+          path: dist/${{ steps.release.outputs.archive }}
+          if-no-files-found: error
