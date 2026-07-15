@@ -233,7 +233,7 @@ fn line_column(contents: &str, offset: usize) -> Option<(usize, usize)> {
     Some((line, column))
 }
 
-fn valid_branch_pattern(pattern: &str) -> bool {
+pub(crate) fn valid_branch_pattern(pattern: &str) -> bool {
     pattern.strip_suffix("/*").map_or_else(
         || valid_branch_name(pattern),
         |prefix| valid_branch_name(&format!("{prefix}/branch")),
