@@ -145,6 +145,16 @@ $Output = & $InstalledBinary --version
 if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $Output"
 }
+$MachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+$MachineCommand = $MachinePath -split ";" | ForEach-Object {
+    $Entry = [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"'))
+    if (-not [string]::IsNullOrWhiteSpace($Entry)) {
+        Join-Path $Entry "bitbygit.exe"
+    }
+} | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ($MachineCommand) {
+    throw "Machine PATH already contains $MachineCommand. User PATH cannot override it in new shells. Remove or update that machine-level installation, then rerun; until then invoke $InstalledBinary explicitly."
+}
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $UserPathEntries = @($UserPath -split ";" | Where-Object {
     -not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir
@@ -163,7 +173,18 @@ bitbygit --version
 }
 ```
 
-New shells will use the updated user `PATH`.
+Windows places machine `PATH` entries before user entries in new processes. The
+block therefore refuses to update user `PATH` when a machine entry already
+contains `bitbygit.exe`; otherwise an older machine-level installation could
+silently win after restarting PowerShell. Remove or update that machine-level
+installation and rerun the block. The selected file is still available through
+the unambiguous explicit invocation:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\bitbygit\bitbygit.exe" --version
+```
+
+When no machine-level conflict exists, new shells use the updated user `PATH`.
 
 ## Build from source
 
@@ -254,6 +275,16 @@ $InstalledBinary = Join-Path $InstallDir "bitbygit.exe"
 $InstalledOutput = & $InstalledBinary --version
 if ($LASTEXITCODE -ne 0 -or $InstalledOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version, got $InstalledOutput"
+}
+$MachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+$MachineCommand = $MachinePath -split ";" | ForEach-Object {
+    $Entry = [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"'))
+    if (-not [string]::IsNullOrWhiteSpace($Entry)) {
+        Join-Path $Entry "bitbygit.exe"
+    }
+} | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ($MachineCommand) {
+    throw "Machine PATH already contains $MachineCommand. User PATH cannot override it in new shells. Remove or update that machine-level installation, then rerun; until then invoke $InstalledBinary explicitly."
 }
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $UserPathEntries = @($UserPath -split ";" | Where-Object {

@@ -18,15 +18,18 @@ function Get-Block([string] $Heading, [string] $Language) {
 
 function ConvertTo-IsolatedPathBlock([string] $Block) {
     $GetUserPath = 'GetEnvironmentVariable("Path", "User")'
+    $GetMachinePath = 'GetEnvironmentVariable("Path", "Machine")'
     $SetUserPath = '[Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")'
-    if (-not $Block.Contains($GetUserPath) -or -not $Block.Contains($SetUserPath)) {
-        Fail "Windows block does not contain the expected user PATH operations"
+    if (-not $Block.Contains($GetUserPath) -or -not $Block.Contains($GetMachinePath) -or
+        -not $Block.Contains($SetUserPath)) {
+        Fail "Windows block does not contain the expected PATH operations"
     }
 
     $Isolated = $Block.Replace($GetUserPath, 'GetEnvironmentVariable("BITBYGIT_TEST_USER_PATH", "Process")')
+    $Isolated = $Isolated.Replace($GetMachinePath, 'GetEnvironmentVariable("BITBYGIT_TEST_MACHINE_PATH", "Process")')
     $Isolated = $Isolated.Replace($SetUserPath, '$script:CapturedUserPath = $NewUserPath')
-    if ($Isolated.Contains('"User"')) {
-        Fail "Windows block still accesses persistent user PATH"
+    if ($Isolated.Contains('"User"') -or $Isolated.Contains('"Machine"')) {
+        Fail "Windows block still accesses persistent PATH state"
     }
     return $Isolated
 }
@@ -64,6 +67,11 @@ if ([regex]::Matches($DocsText, [regex]::Escape($ProcessPathOrder)).Count -ne 2)
 $PathEntryFilter = '-not [string]::IsNullOrEmpty($_) -and $_ -ne $InstallDir'
 if ([regex]::Matches($DocsText, [regex]::Escape($PathEntryFilter)).Count -ne 4) {
     Fail "Windows examples do not remove empty and duplicate install directory PATH entries"
+}
+$MachinePathLookup = 'GetEnvironmentVariable("Path", "Machine")'
+if ([regex]::Matches($DocsText, [regex]::Escape($MachinePathLookup)).Count -ne 2 -or
+    [regex]::Matches($DocsText, [regex]::Escape('User PATH cannot override it in new shells')).Count -ne 2) {
+    Fail "Windows examples do not reject machine-level PATH shadowing"
 }
 if ([regex]::Matches($DocsText, '(?m)^bitbygit --version\r?$').Count -ne 2) {
     Fail "Windows examples do not finish with PATH-resolved version output"
@@ -124,7 +132,9 @@ try {
     $Package = "bitbygit-$SelectedVersion-$Target"
     $Assets = Join-Path $Temp "assets"
     $PackageDir = Join-Path $Assets $Package
+    $MachinePathDir = Join-Path $Temp "machine-bin"
     New-Item -ItemType Directory -Path $PackageDir | Out-Null
+    New-Item -ItemType Directory -Path $MachinePathDir | Out-Null
     Copy-Item $FixtureBinary (Join-Path $PackageDir "bitbygit.exe")
     Compress-Archive -Path $PackageDir -DestinationPath (Join-Path $Assets $Archive)
     $Digest = (Get-FileHash -Algorithm SHA256 (Join-Path $Assets $Archive)).Hash
@@ -137,6 +147,7 @@ try {
     $env:LOCALAPPDATA = Join-Path $SuccessDir "local-app-data"
     $env:Path = $null
     Remove-Item Env:BITBYGIT_TEST_USER_PATH -ErrorAction SilentlyContinue
+    $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
     $CapturedUserPath = $null
     $env:MOCK_DOWNLOAD_DIR = $Assets
     $ErrorActionPreference = "Continue"
@@ -165,6 +176,50 @@ try {
     if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $SelectedVersion") {
         Fail "archive block installed the wrong version"
     }
+    $env:Path = "$($env:BITBYGIT_TEST_MACHINE_PATH);$CapturedUserPath"
+    $NewShellResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
+    if ($NewShellResolvedBinary -ne $InstalledBinary) { Fail "archive new shell PATH did not resolve the installed command" }
+    $NewShellOutput = bitbygit --version
+    if ($LASTEXITCODE -ne 0 -or $NewShellOutput -ne "bitbygit $SelectedVersion") {
+        Fail "archive new shell PATH resolved the wrong version"
+    }
+
+    $MachineConflictDir = Join-Path $Temp "machine-conflict"
+    $MachineOldBinaryDir = Join-Path $MachineConflictDir "machine-bin"
+    New-Item -ItemType Directory -Path $MachineOldBinaryDir -Force | Out-Null
+    Copy-Item $WorkspaceBinary (Join-Path $MachineOldBinaryDir "bitbygit.exe")
+    $MachineConflictScript = Join-Path $MachineConflictDir "install.ps1"
+    Set-Content -Path $MachineConflictScript -Value $InstallBlock
+    $env:LOCALAPPDATA = Join-Path $MachineConflictDir "local-app-data"
+    $env:Path = "$MachineOldBinaryDir;$OriginalProcessPath"
+    $env:BITBYGIT_TEST_MACHINE_PATH = $MachineOldBinaryDir
+    Remove-Item Env:BITBYGIT_TEST_USER_PATH -ErrorAction SilentlyContinue
+    $CapturedUserPath = $null
+    $env:MOCK_DOWNLOAD_DIR = $Assets
+    $MachineConflictStartingPath = $env:Path
+    $OldMachineOutput = bitbygit --version
+    if ($LASTEXITCODE -ne 0 -or $OldMachineOutput -ne "bitbygit $WorkspaceVersion") {
+        Fail "older machine-level bitbygit.exe fixture reported the wrong version"
+    }
+    $MachineConflictFailed = $false
+    Push-Location $MachineConflictDir
+    try {
+        try {
+            . $MachineConflictScript
+        } catch {
+            $MachineConflictFailed = $_.Exception.Message.Contains("User PATH cannot override it in new shells")
+        }
+    } finally {
+        Pop-Location
+    }
+    if (-not $MachineConflictFailed) { Fail "archive block did not reject machine-level PATH shadowing" }
+    if ($null -ne $CapturedUserPath) { Fail "machine-level conflict changed persistent user PATH" }
+    if ($env:Path -ne $MachineConflictStartingPath) { Fail "machine-level conflict changed process PATH" }
+    $ConflictInstalledBinary = Join-Path $env:LOCALAPPDATA "Programs\bitbygit\bitbygit.exe"
+    $ConflictOutput = & $ConflictInstalledBinary --version
+    if ($LASTEXITCODE -ne 0 -or $ConflictOutput -ne "bitbygit $SelectedVersion") {
+        Fail "machine-level conflict did not leave the selected binary available by explicit path"
+    }
 
     $FailureAssets = Join-Path $Temp "failure-assets"
     $FailureDir = Join-Path $Temp "failure"
@@ -175,6 +230,7 @@ try {
     Set-Content -Path $FailureScript -Value $InstallBlock
     $env:LOCALAPPDATA = Join-Path $FailureDir "local-app-data"
     $env:Path = $OriginalProcessPath
+    $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
     $env:MOCK_DOWNLOAD_DIR = $FailureAssets
     $env:MOCK_SIDE_EFFECT = Join-Path $FailureDir "expanded"
     $ErrorActionPreference = "Continue"
@@ -250,13 +306,13 @@ try {
     $OldBinaryDir = Join-Path $SourceSuccessDir "old-bin"
     New-Item -ItemType Directory -Path $OldBinaryDir | Out-Null
     Copy-Item $WorkspaceBinary (Join-Path $OldBinaryDir "bitbygit.exe")
-    $SourceStartingPath = "$OldBinaryDir;$OriginalProcessPath;$SourceInstallDir;$SourceInstallDir"
-    $SourceExpectedEntries = @($OldBinaryDir) + @($OriginalProcessPath -split ";" | Where-Object {
-        -not [string]::IsNullOrEmpty($_)
-    })
-    $SourceExpectedPath = (@($SourceInstallDir) + $SourceExpectedEntries) -join ";"
+    $SourceUserPath = "$OldBinaryDir;$SourceInstallDir;$SourceInstallDir"
+    $SourceStartingPath = "$MachinePathDir;$SourceUserPath"
+    $SourceExpectedPath = "$SourceInstallDir;$MachinePathDir;$OldBinaryDir"
+    $SourceExpectedUserPath = "$SourceInstallDir;$OldBinaryDir"
     $env:Path = $SourceStartingPath
-    $env:BITBYGIT_TEST_USER_PATH = $SourceStartingPath
+    $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
+    $env:BITBYGIT_TEST_USER_PATH = $SourceUserPath
     $OldResolvedBinary = (Get-Command bitbygit -CommandType Application | Select-Object -First 1).Source
     if ($OldResolvedBinary -ne (Join-Path $OldBinaryDir "bitbygit.exe")) { Fail "older bitbygit.exe fixture was not first on PATH" }
     $OldOutput = bitbygit --version
@@ -282,7 +338,7 @@ try {
     if ($ErrorActionPreference -ne "Continue") { Fail "source block changed the caller error preference" }
     if ($env:Path -ne $SourceExpectedPath) { Fail "source block did not prioritize and deduplicate the process PATH entry" }
     if (($env:Path -split ';' | Where-Object { $_ -eq $SourceInstallDir }).Count -ne 1) { Fail "source block duplicated the process PATH entry" }
-    if ($CapturedUserPath -ne $SourceExpectedPath) { Fail "source block did not prioritize and deduplicate the user PATH entry" }
+    if ($CapturedUserPath -ne $SourceExpectedUserPath) { Fail "source block did not prioritize and deduplicate the user PATH entry" }
     if (($CapturedUserPath -split ';' | Where-Object { $_ -eq $SourceInstallDir }).Count -ne 1) { Fail "source block duplicated the user PATH entry" }
     if (-not $FetchedExactTag -or -not $CheckedOutExactTag) { Fail "source block did not check out the exact tag" }
     if (-not (Test-Path $SourceInstalledBinary)) { Fail "source block did not install bitbygit.exe" }
@@ -292,7 +348,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $SelectedVersion") {
         Fail "source block installed the wrong version"
     }
-    $env:Path = $CapturedUserPath
+    $env:Path = "$($env:BITBYGIT_TEST_MACHINE_PATH);$CapturedUserPath"
     $NewShellResolvedBinary = (Get-Command bitbygit -CommandType Application | Select-Object -First 1).Source
     if ($NewShellResolvedBinary -ne $SourceInstalledBinary) { Fail "new shell PATH resolved the older bitbygit.exe" }
     $NewShellOutput = bitbygit --version
@@ -306,6 +362,7 @@ try {
     Set-Content -Path $SourceFailureScript -Value $SourceBlock
     $env:LOCALAPPDATA = Join-Path $SourceFailureDir "local-app-data"
     $env:Path = $OriginalProcessPath
+    $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
     $FetchedExactTag = $false
     $CheckedOutExactTag = $false
     $env:MOCK_CARGO_FAILURE = "1"
