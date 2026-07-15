@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use bitbygit_core::{
     ConfirmationRequirement, OperationKind, OperationPlan, OperationRequest, OperationStep,
     RiskLevel,
+    policy::EffectivePolicy,
     prompt_parser::{ParsedPrompt, parse_prompt},
 };
 use bitbygit_gh::{CreatePullRequest, GhError, GitHub};
@@ -46,7 +47,7 @@ const AUDIT_SECRET_MARKERS: &[&str] = &[
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
-    let mut app = App::new();
+    let mut app = App::with_policy(effective_policy_from_environment());
     app.load_current_dir();
 
     loop {
@@ -63,6 +64,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         if event::poll(Duration::from_millis(100))? {
+            app.policy = effective_policy_from_environment();
             app.handle_event(event::read()?);
         }
     }
@@ -136,12 +138,17 @@ pub struct App {
     file_scroll: usize,
     details: String,
     operation_queue: OperationQueue,
+    policy: EffectivePolicy,
     should_quit: bool,
     last_viewport: Viewport,
 }
 
 impl App {
     pub fn new() -> Self {
+        Self::with_policy(EffectivePolicy::default())
+    }
+
+    fn with_policy(policy: EffectivePolicy) -> Self {
         Self {
             focus: Focus::Repos,
             prompt: String::new(),
@@ -158,6 +165,7 @@ impl App {
             file_scroll: 0,
             details: "No repository status loaded yet.".to_owned(),
             operation_queue: OperationQueue::default(),
+            policy,
             should_quit: false,
             last_viewport: Viewport::default(),
         }
@@ -388,7 +396,9 @@ impl App {
             return;
         }
         let pathspecs = file.pathspecs.clone();
-        self.submit_prepared_operation(OperationPlanner::current().plan_stage_pathspecs(pathspecs));
+        self.submit_prepared_operation(
+            OperationPlanner::current(self.policy.clone()).plan_stage_pathspecs(pathspecs),
+        );
     }
 
     fn unstage_selected_file(&mut self) {
@@ -401,12 +411,12 @@ impl App {
         }
         let pathspecs = file.pathspecs.clone();
         self.submit_prepared_operation(
-            OperationPlanner::current().plan_unstage_pathspecs(pathspecs),
+            OperationPlanner::current(self.policy.clone()).plan_unstage_pathspecs(pathspecs),
         );
     }
 
     fn submit_operation_request(&mut self, request: OperationRequest) {
-        match OperationPlanner::current().plan_request(request) {
+        match OperationPlanner::current(self.policy.clone()).plan_request(request) {
             Ok(operation) => self.submit_prepared_operation(operation),
             Err(error) => self.details = error,
         }
@@ -431,7 +441,7 @@ impl App {
     }
 
     fn execute_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
-        let message = execute_typed_plan(&plan, context);
+        let message = execute_typed_plan(&plan, context, self.policy.clone());
         if should_refresh_status_after(&plan) {
             self.refresh_status();
         }
@@ -443,14 +453,19 @@ impl App {
             return;
         };
         if let Some(sequence) = operation.sequence {
-            self.execute_prompt_sequence(sequence);
+            self.execute_prompt_sequence(sequence, operation.plan.confirmation.requirement);
         } else {
             self.execute_operation(operation.plan, operation.context);
         }
     }
 
-    fn execute_prompt_sequence(&mut self, sequence: QueuedPromptSequence) {
-        let result = PromptSequenceExecutor::current().execute(sequence);
+    fn execute_prompt_sequence(
+        &mut self,
+        sequence: QueuedPromptSequence,
+        confirmed_requirement: ConfirmationRequirement,
+    ) {
+        let result = PromptSequenceExecutor::current(self.policy.clone())
+            .execute_confirmed(sequence, confirmed_requirement);
         if result.should_refresh_status() {
             self.refresh_status();
         }
@@ -467,7 +482,7 @@ impl App {
         };
         match parsed {
             ParsedPrompt::Single(request) => {
-                match OperationPlanner::current().plan_request(request) {
+                match OperationPlanner::current(self.policy.clone()).plan_request(request) {
                     Ok(operation) => {
                         self.prompt.clear();
                         self.submit_prepared_operation(operation);
@@ -476,7 +491,8 @@ impl App {
                 }
             }
             ParsedPrompt::Sequence(requests) => {
-                match OperationPlanner::current().plan_prompt_sequence(requests) {
+                match OperationPlanner::current(self.policy.clone()).plan_prompt_sequence(requests)
+                {
                     Ok(sequence) => {
                         self.prompt.clear();
                         self.details = sequence.plan.preview_text();
@@ -1291,6 +1307,55 @@ fn compare_url_ref(reference: &str) -> String {
     encoded
 }
 
+fn apply_policy_to_plan(policy: &EffectivePolicy, plan: &mut OperationPlan, branch: Option<&str>) {
+    let previous_requirement = plan.confirmation.requirement;
+    let mut requirement = previous_requirement;
+    let mut reasons = Vec::new();
+    for step in &plan.steps {
+        let evaluation = policy.evaluate_confirmation(step.risk_level, step.kind, branch);
+        requirement = requirement.max(evaluation.requirement);
+        for reason in evaluation.reasons {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+    }
+    plan.confirmation.requirement = requirement;
+    plan.confirmation.reason = (!reasons.is_empty()).then(|| reasons.join("; "));
+    if requirement != previous_requirement {
+        plan.confirmation.prompt = confirmation_prompt(requirement);
+    }
+}
+
+fn confirmation_prompt(requirement: ConfirmationRequirement) -> String {
+    match requirement {
+        ConfirmationRequirement::NormalSelection => String::new(),
+        ConfirmationRequirement::VisiblePlan => "Press y to confirm or n to cancel.".to_owned(),
+        ConfirmationRequirement::ExplicitConfirmation => {
+            "Explicit confirmation required: press uppercase Y to confirm or n to cancel."
+                .to_owned()
+        }
+        ConfirmationRequirement::Blocked => "Blocked by policy; press n to dismiss.".to_owned(),
+    }
+}
+
+fn confirmation_requirement_label(requirement: ConfirmationRequirement) -> &'static str {
+    match requirement {
+        ConfirmationRequirement::NormalSelection => "normal selection",
+        ConfirmationRequirement::VisiblePlan => "a visible plan",
+        ConfirmationRequirement::ExplicitConfirmation => "explicit uppercase-Y confirmation",
+        ConfirmationRequirement::Blocked => "the operation to be blocked",
+    }
+}
+
+fn confirmation_covers(
+    plan: &OperationPlan,
+    confirmed_requirement: ConfirmationRequirement,
+) -> bool {
+    plan.confirmation.requirement != ConfirmationRequirement::Blocked
+        && plan.confirmation.requirement <= confirmed_requirement
+}
+
 fn prompt_sequence_plan(
     requests: &[OperationRequest],
     first: &PreparedOperation,
@@ -1571,15 +1636,17 @@ fn short_oid(oid: &str) -> String {
 struct OperationPlanner {
     repo_root: PathBuf,
     github_executable: Option<PathBuf>,
+    policy: EffectivePolicy,
     #[cfg(test)]
     ssh_executable: Option<PathBuf>,
 }
 
 impl OperationPlanner {
-    fn current() -> Self {
+    fn current(policy: EffectivePolicy) -> Self {
         Self {
             repo_root: current_dir(),
             github_executable: None,
+            policy,
             #[cfg(test)]
             ssh_executable: None,
         }
@@ -1590,54 +1657,70 @@ impl OperationPlanner {
         Self {
             repo_root: repo_root.into(),
             github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_policy(repo_root: impl Into<PathBuf>, policy: EffectivePolicy) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+            github_executable: None,
+            policy,
             ssh_executable: None,
         }
     }
 
     fn plan_request(&self, request: OperationRequest) -> Result<PreparedOperation, String> {
-        match request {
+        let operation = match request {
             OperationRequest::RefreshStatus => {
-                Err("Refresh status is handled directly by the UI.".to_owned())
+                return Err("Refresh status is handled directly by the UI.".to_owned());
             }
             OperationRequest::ViewDiff { .. } => {
-                Err("View diff is handled directly by the UI.".to_owned())
+                return Err("View diff is handled directly by the UI.".to_owned());
             }
-            OperationRequest::StagePaths { paths } => {
-                Ok(self.plan_stage_pathspecs(paths.into_iter().map(PathBuf::from).collect()))
-            }
-            OperationRequest::UnstagePaths { paths } => {
-                Ok(self.plan_unstage_pathspecs(paths.into_iter().map(PathBuf::from).collect()))
-            }
-            OperationRequest::StageAll => Ok(PreparedOperation::new(
+            OperationRequest::StagePaths { paths } => PreparedOperation::new(
+                stage_paths_plan(paths.clone()),
+                ExecutionContext::from_payload(PendingPayload::StagePaths {
+                    paths: paths.into_iter().map(PathBuf::from).collect(),
+                }),
+            ),
+            OperationRequest::UnstagePaths { paths } => PreparedOperation::new(
+                unstage_paths_plan(paths.clone()),
+                ExecutionContext::from_payload(PendingPayload::UnstagePaths {
+                    paths: paths.into_iter().map(PathBuf::from).collect(),
+                }),
+            ),
+            OperationRequest::StageAll => PreparedOperation::new(
                 stage_all_plan(),
                 ExecutionContext::from_payload(PendingPayload::StageAll),
-            )),
-            OperationRequest::UnstageAll => Ok(PreparedOperation::new(
+            ),
+            OperationRequest::UnstageAll => PreparedOperation::new(
                 unstage_all_plan(),
                 ExecutionContext::from_payload(PendingPayload::UnstageAll),
-            )),
-            OperationRequest::Commit { message } => self.plan_commit(message),
-            OperationRequest::Fetch => Ok(PreparedOperation::new(
-                fetch_plan(),
-                ExecutionContext::default(),
-            )),
-            OperationRequest::Push => self.plan_push(),
-            OperationRequest::Pull { rebase } => self.plan_pull(rebase),
-            OperationRequest::Branches => Ok(PreparedOperation::new(
-                branches_plan(),
-                ExecutionContext::default(),
-            )),
-            OperationRequest::Checkout { branch } => self.plan_checkout(branch),
+            ),
+            OperationRequest::Commit { message } => self.plan_commit(message)?,
+            OperationRequest::Fetch => {
+                PreparedOperation::new(fetch_plan(), ExecutionContext::default())
+            }
+            OperationRequest::Push => self.plan_push()?,
+            OperationRequest::Pull { rebase } => self.plan_pull(rebase)?,
+            OperationRequest::Branches => {
+                PreparedOperation::new(branches_plan(), ExecutionContext::default())
+            }
+            OperationRequest::Checkout { branch } => self.plan_checkout(branch)?,
             OperationRequest::CreateBranch { branch, base } => {
-                self.plan_create_branch(branch, base)
+                self.plan_create_branch(branch, base)?
             }
-            OperationRequest::Merge { branch } => self.plan_merge(branch),
-            OperationRequest::Rebase { base } => self.plan_rebase(base),
-            OperationRequest::OpenPullRequest { base } => self.plan_open_pull_request(base),
+            OperationRequest::Merge { branch } => self.plan_merge(branch)?,
+            OperationRequest::Rebase { base } => self.plan_rebase(base)?,
+            OperationRequest::OpenPullRequest { base } => self.plan_open_pull_request(base)?,
             OperationRequest::PromptSequence { .. } => {
-                Err("Prompt sequences are handled by prompt submission.".to_owned())
+                return Err("Prompt sequences are handled by prompt submission.".to_owned());
             }
-        }
+        };
+        Ok(self.apply_policy(operation))
     }
 
     fn plan_prompt_sequence(
@@ -1657,7 +1740,16 @@ impl OperationPlanner {
             .cloned()
             .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
         let first = self.plan_request(first_request)?;
-        let plan = prompt_sequence_plan(&requests, &first)?;
+        let mut plan = prompt_sequence_plan(&requests, &first)?;
+        let branch = policy_branch(&first.context)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.git()
+                    .status()
+                    .ok()
+                    .and_then(|status| branch_name(&status.branch).ok())
+            });
+        apply_policy_to_plan(&self.policy, &mut plan, branch.as_deref());
         let remaining_requests = requests.into_iter().skip(1).collect();
         Ok(PreparedPromptSequence::new(
             plan,
@@ -1666,17 +1758,23 @@ impl OperationPlanner {
     }
 
     fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
-        PreparedOperation::new(
+        self.apply_policy(PreparedOperation::new(
             stage_paths_plan(file_path_labels(&paths)),
             ExecutionContext::from_payload(PendingPayload::StagePaths { paths }),
-        )
+        ))
     }
 
     fn plan_unstage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
-        PreparedOperation::new(
+        self.apply_policy(PreparedOperation::new(
             unstage_paths_plan(file_path_labels(&paths)),
             ExecutionContext::from_payload(PendingPayload::UnstagePaths { paths }),
-        )
+        ))
+    }
+
+    fn apply_policy(&self, mut operation: PreparedOperation) -> PreparedOperation {
+        let branch = policy_branch(&operation.context);
+        apply_policy_to_plan(&self.policy, &mut operation.plan, branch);
+        operation
     }
 
     fn plan_commit(&self, message: String) -> Result<PreparedOperation, String> {
@@ -2480,15 +2578,36 @@ fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
         ];
     };
     let plan = &operation.plan;
-    vec![
+    let mut lines = vec![
         format!(
             "Pending: {} | Risk: {}",
             plan.title,
             risk_label(plan.confirmation.risk_level)
         ),
         format!("Steps: {}", plan_steps_summary(plan)),
-        format!("Confirm: {}", confirmation_copy(plan)),
-    ]
+        format!("Policy: {}", policy_reason(plan)),
+        format!("Accepted keys: {}", accepted_confirmation_keys(plan)),
+    ];
+    lines.push(format!("Confirm: {}", confirmation_copy(plan)));
+    lines
+}
+
+fn policy_reason(plan: &OperationPlan) -> &str {
+    plan.confirmation
+        .reason
+        .as_deref()
+        .unwrap_or("safe default confirmation policy")
+}
+
+fn accepted_confirmation_keys(plan: &OperationPlan) -> &'static str {
+    match plan.confirmation.requirement {
+        ConfirmationRequirement::NormalSelection => "none; runs after normal selection",
+        ConfirmationRequirement::VisiblePlan => "y to confirm; n or Esc to cancel",
+        ConfirmationRequirement::ExplicitConfirmation => {
+            "uppercase Y to confirm; n or Esc to cancel"
+        }
+        ConfirmationRequirement::Blocked => "n or Esc to dismiss; confirmation is disabled",
+    }
 }
 
 fn plan_steps_summary(plan: &OperationPlan) -> String {
@@ -2508,17 +2627,7 @@ fn plan_steps_summary(plan: &OperationPlan) -> String {
 }
 
 fn confirmation_copy(plan: &OperationPlan) -> String {
-    if !plan.confirmation.prompt.is_empty() {
-        return plan.confirmation.prompt.clone();
-    }
-    match plan.confirmation.requirement {
-        ConfirmationRequirement::NormalSelection => "Runs after normal selection.".to_owned(),
-        ConfirmationRequirement::VisiblePlan => "Press y to confirm or n to cancel.".to_owned(),
-        ConfirmationRequirement::ExplicitConfirmation => {
-            "Press uppercase Y to confirm or n to cancel.".to_owned()
-        }
-        ConfirmationRequirement::Blocked => "Blocked by policy.".to_owned(),
-    }
+    confirmation_prompt(plan.confirmation.requirement)
 }
 
 fn risk_label(risk: RiskLevel) -> &'static str {
@@ -2575,6 +2684,14 @@ fn current_dir() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_error| std::path::PathBuf::from("."))
 }
 
+fn effective_policy_from_environment() -> EffectivePolicy {
+    StorePaths::from_environment()
+        .ok()
+        .and_then(|paths| LocalStore::open(paths).ok())
+        .map(|store| EffectivePolicy::new(&store.load_config().settings))
+        .unwrap_or_default()
+}
+
 fn operation_message(action: &str, result: Result<(), String>) -> String {
     match result {
         Ok(()) => format!("{action} succeeded"),
@@ -2582,8 +2699,14 @@ fn operation_message(action: &str, result: Result<(), String>) -> String {
     }
 }
 
-fn execute_typed_plan(plan: &OperationPlan, context: ExecutionContext) -> String {
-    PlanExecutor::current().execute(plan, context).message()
+fn execute_typed_plan(
+    plan: &OperationPlan,
+    context: ExecutionContext,
+    policy: EffectivePolicy,
+) -> String {
+    PlanExecutor::current(policy)
+        .execute(plan, context)
+        .message()
 }
 
 fn should_refresh_status_after(plan: &OperationPlan) -> bool {
@@ -2603,19 +2726,44 @@ impl ExecutionContext {
     }
 }
 
+fn policy_branch(context: &ExecutionContext) -> Option<&str> {
+    match context.payload.as_ref()? {
+        PendingPayload::Commit { target, .. }
+        | PendingPayload::Rebase { target, .. }
+        | PendingPayload::Merge { target, .. } => head_target_branch(target),
+        PendingPayload::Push { local_branch, .. }
+        | PendingPayload::Pull { local_branch, .. }
+        | PendingPayload::PullRebase { local_branch, .. } => Some(local_branch),
+        PendingPayload::PushSetUpstream { branch, .. } => Some(branch),
+        PendingPayload::StagePaths { .. }
+        | PendingPayload::UnstagePaths { .. }
+        | PendingPayload::StageAll
+        | PendingPayload::UnstageAll
+        | PendingPayload::Checkout { .. }
+        | PendingPayload::CreateBranch { .. }
+        | PendingPayload::OpenPullRequest { .. } => None,
+    }
+}
+
+fn head_target_branch(target: &HeadTarget) -> Option<&str> {
+    target.reference.as_deref()?.strip_prefix("refs/heads/")
+}
+
 #[derive(Debug, Clone)]
 struct PlanExecutor {
     repo_root: PathBuf,
     audit: AuditDestination,
+    policy: EffectivePolicy,
     #[cfg(test)]
     ssh_executable: Option<PathBuf>,
 }
 
 impl PlanExecutor {
-    fn current() -> Self {
+    fn current(policy: EffectivePolicy) -> Self {
         Self {
             repo_root: current_dir(),
             audit: AuditDestination::Environment,
+            policy,
             #[cfg(test)]
             ssh_executable: None,
         }
@@ -2626,6 +2774,7 @@ impl PlanExecutor {
         Self {
             repo_root: repo_root.into(),
             audit: AuditDestination::Paths(paths),
+            policy: EffectivePolicy::default(),
             ssh_executable: None,
         }
     }
@@ -2639,6 +2788,7 @@ impl PlanExecutor {
         Self {
             repo_root: repo_root.into(),
             audit: AuditDestination::Paths(paths),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh_executable.into()),
         }
     }
@@ -2649,6 +2799,14 @@ impl PlanExecutor {
                 planned_step_count: 0,
                 step_results: Vec::new(),
                 plan_error: Some("operation plan has no steps".to_owned()),
+            };
+        }
+
+        if let Err(error) = self.validate_policy(plan, &context) {
+            return PlanExecutionResult {
+                planned_step_count: plan.steps.len(),
+                step_results: Vec::new(),
+                plan_error: Some(error),
             };
         }
 
@@ -2667,6 +2825,33 @@ impl PlanExecutor {
             step_results,
             plan_error: None,
         }
+    }
+
+    fn validate_policy(
+        &self,
+        plan: &OperationPlan,
+        context: &ExecutionContext,
+    ) -> Result<(), String> {
+        if plan.confirmation.requirement == ConfirmationRequirement::Blocked {
+            return Err("operation is blocked by the policy captured in the preview".to_owned());
+        }
+        let current_requirement = plan
+            .steps
+            .iter()
+            .map(|step| {
+                self.policy
+                    .evaluate_confirmation(step.risk_level, step.kind, policy_branch(context))
+                    .requirement
+            })
+            .max()
+            .unwrap_or(ConfirmationRequirement::NormalSelection);
+        if current_requirement > plan.confirmation.requirement {
+            return Err(format!(
+                "policy now requires {}; review the updated plan before execution",
+                confirmation_requirement_label(current_requirement)
+            ));
+        }
+        Ok(())
     }
 
     fn execute_step(
@@ -3204,16 +3389,18 @@ struct PromptSequenceExecutor {
     repo_root: PathBuf,
     audit: AuditDestination,
     github_executable: Option<PathBuf>,
+    policy: EffectivePolicy,
     #[cfg(test)]
     ssh_executable: Option<PathBuf>,
 }
 
 impl PromptSequenceExecutor {
-    fn current() -> Self {
+    fn current(policy: EffectivePolicy) -> Self {
         Self {
             repo_root: current_dir(),
             audit: AuditDestination::Environment,
             github_executable: None,
+            policy,
             #[cfg(test)]
             ssh_executable: None,
         }
@@ -3225,6 +3412,7 @@ impl PromptSequenceExecutor {
             repo_root: repo_root.into(),
             audit: AuditDestination::Paths(paths),
             github_executable: None,
+            policy: EffectivePolicy::default(),
             ssh_executable: None,
         }
     }
@@ -3240,26 +3428,46 @@ impl PromptSequenceExecutor {
             repo_root: repo_root.into(),
             audit: AuditDestination::Paths(paths),
             github_executable: Some(github_executable.into()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh_executable.into()),
         }
     }
 
+    #[cfg(test)]
     fn execute(&self, sequence: QueuedPromptSequence) -> PromptSequenceExecutionResult {
+        self.execute_confirmed(sequence, ConfirmationRequirement::ExplicitConfirmation)
+    }
+
+    fn execute_confirmed(
+        &self,
+        sequence: QueuedPromptSequence,
+        confirmed_requirement: ConfirmationRequirement,
+    ) -> PromptSequenceExecutionResult {
         let total_steps = sequence.total_steps();
         let planner = OperationPlanner {
             repo_root: self.repo_root.clone(),
             github_executable: self.github_executable.clone(),
+            policy: self.policy.clone(),
             #[cfg(test)]
             ssh_executable: self.ssh_executable.clone(),
         };
         let executor = PlanExecutor {
             repo_root: self.repo_root.clone(),
             audit: self.audit.clone(),
+            policy: self.policy.clone(),
             #[cfg(test)]
             ssh_executable: self.ssh_executable.clone(),
         };
         let mut step_results = Vec::with_capacity(total_steps);
 
+        if !confirmation_covers(&sequence.first.plan, confirmed_requirement) {
+            step_results.push(PromptSequenceStepResult::planning_failed(
+                1,
+                sequence.first.plan.title.clone(),
+                "policy requires a new sequence preview and confirmation".to_owned(),
+            ));
+            return PromptSequenceExecutionResult::new(total_steps, step_results);
+        }
         let first = Self::execute_prepared_step(&executor, 1, sequence.first);
         let first_succeeded = first.succeeded;
         step_results.push(first);
@@ -3280,6 +3488,14 @@ impl PromptSequenceExecutor {
                     return PromptSequenceExecutionResult::new(total_steps, step_results);
                 }
             };
+            if !confirmation_covers(&operation.plan, confirmed_requirement) {
+                step_results.push(PromptSequenceStepResult::planning_failed(
+                    step_number,
+                    operation.plan.title.clone(),
+                    "policy requires a new sequence preview and confirmation".to_owned(),
+                ));
+                return PromptSequenceExecutionResult::new(total_steps, step_results);
+            }
             let step = Self::execute_prepared_step(&executor, step_number, operation);
             let succeeded = step.succeeded;
             step_results.push(step);
@@ -3911,6 +4127,7 @@ fn sanitized_github_error(error: &GhError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitbygit_core::config::{AppConfig, ConfirmationSetting};
     use crossterm::event::{KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;
 
@@ -4087,7 +4304,7 @@ mod tests {
             (KeyCode::Char('a'), OperationRequest::StageAll),
             (KeyCode::Char('A'), OperationRequest::UnstageAll),
         ] {
-            let expected = OperationPlanner::current()
+            let expected = OperationPlanner::current(EffectivePolicy::default())
                 .plan_request(request)
                 .map_err(std::io::Error::other)?;
             let mut app = App::new();
@@ -4251,6 +4468,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh.clone()),
         };
         let sequence = planner
@@ -4341,6 +4559,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh.clone()),
         };
 
@@ -4406,6 +4625,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(missing_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh.clone()),
         };
         let sequence = planner
@@ -4446,6 +4666,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh.clone()),
         };
         let sequence = planner
@@ -4480,7 +4701,7 @@ mod tests {
 
     #[test]
     fn parsed_low_risk_prompts_match_manual_planner_output() -> Result<(), Box<dyn Error>> {
-        let planner = OperationPlanner::current();
+        let planner = OperationPlanner::current(EffectivePolicy::default());
         for (prompt, request) in [
             ("fetch", OperationRequest::Fetch),
             ("branches", OperationRequest::Branches),
@@ -4544,6 +4765,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4608,6 +4830,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh("open-pr-private-https", false)?),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4637,6 +4860,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4690,6 +4914,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4747,6 +4972,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4791,6 +5017,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
@@ -4821,6 +5048,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
@@ -4867,6 +5095,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4905,6 +5134,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4934,6 +5164,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo,
             github_executable: Some(fake_gh),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -4955,6 +5186,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
@@ -5014,6 +5246,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
@@ -5055,6 +5288,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
         let operation = planner
@@ -5097,6 +5331,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -5182,6 +5417,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -5241,6 +5477,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -5286,6 +5523,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -5325,6 +5563,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -5422,6 +5661,7 @@ mod tests {
         let planner = OperationPlanner {
             repo_root: repo,
             github_executable: Some(fake_gh),
+            policy: EffectivePolicy::default(),
             ssh_executable: Some(test_ssh_command()?),
         };
         let error =
@@ -5714,12 +5954,169 @@ mod tests {
         assert!(queue_text[0].contains("Stage all plan"));
         assert!(queue_text[0].contains("Risk: medium"));
         assert!(queue_text[1].contains("stage all working tree changes"));
-        assert!(queue_text[2].contains("Press y to stage all changes"));
+        assert!(queue_text[2].contains("medium risk policy requires visible-plan"));
+        assert!(queue_text[3].contains("y to confirm; n or Esc to cancel"));
+        assert!(queue_text[4].contains("Press y to confirm"));
 
         app.handle_key(key(KeyCode::Char('n')));
 
         assert_eq!(app.operation_queue.pending(), None);
         assert_eq!(app.details, "Operation cancelled.");
+    }
+
+    #[test]
+    fn custom_policy_is_shared_by_manual_prompt_and_deferred_plans() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("custom-policy-planners")?;
+        configure_git_identity(&repo)?;
+        git_stdout(&repo, &["symbolic-ref", "HEAD", "refs/heads/production"])?;
+        std::fs::write(repo.join("file.txt"), "ready\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        let mut config = AppConfig::default();
+        config.policy.additional_protected_branches = vec!["production".to_owned()];
+        config.policy.confirmation.medium = ConfirmationSetting::ExplicitConfirmation;
+        let planner = OperationPlanner::with_policy(&repo, EffectivePolicy::new(&config));
+
+        let ParsedPrompt::Single(prompt_request) = parse_prompt("commit -m ready")? else {
+            return Err(std::io::Error::other("expected single prompt").into());
+        };
+        let prompt = planner
+            .plan_request(prompt_request)
+            .map_err(std::io::Error::other)?;
+        let manual = planner
+            .plan_request(OperationRequest::Commit {
+                message: "ready".to_owned(),
+            })
+            .map_err(std::io::Error::other)?;
+        assert_eq!(prompt, manual);
+        assert_eq!(
+            manual.plan.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        let reason = manual
+            .plan
+            .confirmation
+            .reason
+            .as_deref()
+            .unwrap_or_default();
+        assert!(reason.contains("protected branch production"));
+        assert!(reason.contains("medium risk policy requires explicit"));
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Commit {
+                    message: "ready".to_owned(),
+                },
+                OperationRequest::Branches,
+            ])
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("protected branch production"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn executor_never_weakens_previewed_policy_and_rejects_stricter_policy()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("policy-revalidation")?;
+        let context = ExecutionContext::from_payload(PendingPayload::StageAll);
+        let mut strict_config = AppConfig::default();
+        strict_config.policy.confirmation.medium = ConfirmationSetting::ExplicitConfirmation;
+        let strict_policy = EffectivePolicy::new(&strict_config);
+        let mut strict_preview = stage_all_plan();
+        apply_policy_to_plan(&strict_policy, &mut strict_preview, None);
+
+        let default_executor = PlanExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(isolated_store_paths("policy-revalidation-default")?),
+            policy: EffectivePolicy::default(),
+            ssh_executable: None,
+        };
+        assert_eq!(
+            strict_preview.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        assert!(
+            default_executor
+                .validate_policy(&strict_preview, &context)
+                .is_ok()
+        );
+
+        let default_preview = stage_all_plan();
+        let strict_executor = PlanExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(isolated_store_paths("policy-revalidation-strict")?),
+            policy: strict_policy,
+            ssh_executable: None,
+        };
+        let error = match strict_executor.validate_policy(&default_preview, &context) {
+            Ok(()) => {
+                return Err(std::io::Error::other(
+                    "stricter current policy must require a new preview",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("review the updated plan"));
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_prompt_step_revalidates_stricter_policy_before_execution()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("deferred-policy-revalidation")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let base = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        git_stdout(&repo, &["checkout", "-b", "feature/policy"])?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![
+                OperationRequest::Branches,
+                OperationRequest::Rebase { base },
+            ])
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        let mut config = AppConfig::default();
+        config.policy.confirmation.high = ConfirmationSetting::Blocked;
+        let executor = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(isolated_store_paths(
+                "deferred-policy-revalidation-audit",
+            )?),
+            github_executable: None,
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: None,
+        };
+
+        let result = executor.execute_confirmed(
+            sequence.sequence,
+            ConfirmationRequirement::ExplicitConfirmation,
+        );
+
+        assert!(
+            result
+                .message()
+                .contains("Prompt sequence stopped before step 2 of 2.")
+        );
+        assert!(result.message().contains("new sequence preview"));
+        Ok(())
     }
 
     #[test]
