@@ -10,8 +10,49 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Read release metadata
+        id: release
+        shell: bash
+        run: |
+          version="$(cargo pkgid --locked -p bitbygit)"
+          version="${version##*#}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate release tag
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_TAG: v${{ steps.release.outputs.version }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Invalid release tag::Expected a vX.Y.Z tag, got ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "::error title=Release tag mismatch::Expected ${EXPECTED_TAG}, got ${RELEASE_TAG}"
+            exit 1
+          fi
+
   build:
     name: ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -45,26 +86,13 @@ jobs:
         id: release
         shell: bash
         run: |
-          version="$(cargo pkgid --locked -p bitbygit)"
-          version="${version##*#}"
+          version="${{ needs.validate.outputs.version }}"
           package="bitbygit-${version}-${{ matrix.target }}"
           archive="${package}.${{ matrix.archive_extension }}"
 
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "package=${package}" >> "${GITHUB_OUTPUT}"
           echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
-
-      - name: Validate release tag
-        if: github.event_name == 'push'
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          EXPECTED_TAG: v${{ steps.release.outputs.version }}
-        run: |
-          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
-            echo "::error title=Release tag mismatch::Expected ${EXPECTED_TAG}, got ${RELEASE_TAG}"
-            exit 1
-          fi
 
       - name: Build
         run: cargo build --locked --release -p bitbygit --target ${{ matrix.target }}
@@ -119,3 +147,56 @@ jobs:
           name: ${{ steps.release.outputs.archive }}
           path: dist/${{ steps.release.outputs.archive }}
           if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bitbygit-${{ needs.validate.outputs.version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify and publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          archives=(
+            "bitbygit-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "bitbygit-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "bitbygit-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "bitbygit-${VERSION}-x86_64-pc-windows-msvc.zip"
+          )
+          assets=()
+
+          for archive in "${archives[@]}"; do
+            asset="dist/${archive}"
+            if [[ ! -f "${asset}" ]]; then
+              echo "::error title=Missing release archive::Expected ${archive}"
+              exit 1
+            fi
+            assets+=("${asset}")
+          done
+
+          (
+            cd dist
+            sha256sum "${archives[@]}" > SHA256SUMS
+          )
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "${assets[@]}" \
+            dist/SHA256SUMS
