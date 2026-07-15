@@ -685,7 +685,15 @@ struct QueuedPromptSequence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeferredPullRequestTarget {
     repository: GitHubRepository,
+    head_repository: GitHubRepository,
+    head: String,
     base: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SequenceBranch {
+    name: String,
+    push_target: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1715,13 +1723,23 @@ fn prompt_sequence_deferred_step(
 ) -> Result<OperationStep, String> {
     let mut preview = prompt_sequence_request_preview(request)?;
     if let Some(target) = pull_request_target {
-        preview
-            .details
-            .retain(|detail| !detail.starts_with("base: "));
+        preview.details.retain(|detail| {
+            !detail.starts_with("base: ") && !detail.starts_with("re-plan branch, remote, base")
+        });
         preview
             .details
             .push(format!("repository: {}", target.repository.0));
+        preview.details.push(format!("head: {}", target.head));
         preview.details.push(format!("base: {}", target.base));
+        preview.details.push(format!(
+            "target: https://{}/compare/{}...{}?expand=1",
+            target.repository.0,
+            compare_url_ref(&target.base),
+            compare_url_ref(&target.head)
+        ));
+        preview.details.push(
+            "revalidate the bound provider, repository, head, and base before execution".to_owned(),
+        );
     }
     let mut step = OperationStep::new(
         preview.kind,
@@ -2160,14 +2178,17 @@ impl OperationPlanner {
         initial_branch: Option<String>,
     ) -> Result<Vec<Option<DeferredPullRequestTarget>>, String> {
         let git = self.git();
-        let mut branch = initial_branch;
+        let mut branch = initial_branch.map(|name| SequenceBranch {
+            name,
+            push_target: None,
+        });
         let mut targets = Vec::with_capacity(requests.len().saturating_sub(1));
 
         for (index, request) in requests.iter().enumerate() {
             if index > 0 {
                 let target = match request {
                     OperationRequest::OpenPullRequest { base } => {
-                        let branch = branch.as_deref().ok_or_else(|| {
+                        let branch = branch.as_ref().ok_or_else(|| {
                             "Open pull request blocked: unable to resolve the deferred branch."
                                 .to_owned()
                         })?;
@@ -2180,12 +2201,46 @@ impl OperationPlanner {
 
             match request {
                 OperationRequest::Checkout { branch: target }
-                    if branch.as_deref() != Some(target) =>
+                    if branch.as_ref().map(|branch| &branch.name) != Some(target) =>
                 {
-                    branch = Some(sequence_checkout_resulting_branch(&git, target)?);
+                    let target = git
+                        .branch_target(target)
+                        .map_err(|error| format!("Unable to resolve sequence checkout: {error}"))?
+                        .ok_or_else(|| {
+                            format!(
+                                "Prompt sequence blocked: checkout target {target} cannot be validated during preflight; create a new sequence preview."
+                            )
+                        })?;
+                    git.ensure_remote_checkout_target_available(&target)
+                        .map_err(|error| {
+                            format!(
+                                "Prompt sequence blocked: checkout target cannot be validated during preflight: {error}; create a new sequence preview."
+                            )
+                        })?;
+                    let name = checkout_resulting_branch(&target)?;
+                    let push_target = if target.kind == BranchKind::Remote {
+                        Some(
+                            target
+                                .name
+                                .split_once('/')
+                                .map(|(remote, branch)| (remote.to_owned(), branch.to_owned()))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "Prompt sequence blocked: remote checkout target {} cannot be bound during preflight; create a new sequence preview.",
+                                        target.name
+                                    )
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    branch = Some(SequenceBranch { name, push_target });
                 }
                 OperationRequest::CreateBranch { branch: target, .. } => {
-                    branch = Some(target.clone());
+                    branch = Some(SequenceBranch {
+                        name: target.clone(),
+                        push_target: None,
+                    });
                 }
                 _ => {}
             }
@@ -2197,15 +2252,22 @@ impl OperationPlanner {
     fn deferred_pull_request_target(
         &self,
         git: &Git,
-        branch: &str,
+        branch: &SequenceBranch,
         requested_base: Option<&str>,
     ) -> Result<DeferredPullRequestTarget, String> {
-        let remote = git
-            .push_target(branch)
-            .map_err(|error| format!("Unable to prepare pull request target: {error}"))?
-            .map(|(remote, _branch)| remote)
-            .or_else(|| self.default_remote_name())
-            .ok_or_else(|| "Open pull request blocked: no remotes are configured.".to_owned())?;
+        let (remote, upstream_branch) = match &branch.push_target {
+            Some(target) => target.clone(),
+            None => git
+                .push_target(&branch.name)
+                .map_err(|error| format!("Unable to prepare pull request target: {error}"))?
+                .or_else(|| {
+                    self.default_remote_name()
+                        .map(|remote| (remote, branch.name.clone()))
+                })
+                .ok_or_else(|| {
+                    "Open pull request blocked: no remotes are configured.".to_owned()
+                })?,
+        };
         let remote_urls = git
             .remote_push_urls(&remote)
             .map_err(|error| format!("Unable to prepare pull request remote: {error}"))?;
@@ -2224,6 +2286,23 @@ impl OperationPlanner {
         }
         let github = self.github(&github_repository);
         let repository = github.repository().map_err(open_pull_request_gh_error)?;
+        let canonical_github_repository =
+            GitHubRepository::new(github_repository.hostname(), &repository.name_with_owner);
+        let canonical_head_repository = if head_repository.eq_ignore_ascii_case(&github_repository)
+        {
+            canonical_github_repository.clone()
+        } else {
+            let head = self
+                .github(&head_repository)
+                .repository()
+                .map_err(open_pull_request_gh_error)?;
+            GitHubRepository::new(head_repository.hostname(), &head.name_with_owner)
+        };
+        let head = pull_request_head(
+            &canonical_head_repository,
+            &canonical_github_repository,
+            &upstream_branch,
+        )?;
         let configured_base =
             requested_base.is_none() && self.policy.default_pull_request_base().is_some();
         let base = requested_base
@@ -2251,10 +2330,9 @@ impl OperationPlanner {
         }
 
         Ok(DeferredPullRequestTarget {
-            repository: GitHubRepository::new(
-                github_repository.hostname(),
-                &repository.name_with_owner,
-            ),
+            repository: canonical_github_repository,
+            head_repository: canonical_head_repository,
+            head,
             base,
         })
     }
@@ -3464,6 +3542,9 @@ fn prepared_pull_request_target(
         base,
         repository,
         github_repository,
+        head_github_repository,
+        head_repository,
+        head,
         ..
     } = operation.context.payload.as_ref()?
     else {
@@ -3471,6 +3552,8 @@ fn prepared_pull_request_target(
     };
     Some(DeferredPullRequestTarget {
         repository: GitHubRepository::new(github_repository.hostname(), repository),
+        head_repository: GitHubRepository::new(head_github_repository.hostname(), head_repository),
+        head: head.clone(),
         base: base.clone(),
     })
 }
@@ -5626,6 +5709,100 @@ mod tests {
                 .filter(|entry| entry.operation == "open_pull_request")
                 .all(|entry| !entry.message.contains("pull/43")
                     && !entry.message.contains("feature/open-pr"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_checkout_push_pr_revalidates_target_before_any_step() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-remote-checkout-pr")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-remote-checkout-pr-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let original_branch = git_stdout(&repo, &["branch", "--show-current"])?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        add_github_remote(&repo, "fork", &fork)?;
+        git_stdout(&repo, &["update-ref", "refs/remotes/fork/topic", "HEAD"])?;
+        let fake_gh = fake_gh("prompt-sequence-remote-checkout-pr", false)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Checkout {
+                    branch: "fork/topic".to_owned(),
+                },
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(preview.contains("repository: github.com/upstream/repo"));
+        assert!(preview.contains("head: octo:topic"));
+        assert!(preview.contains(
+            "target: https://github.com/upstream/repo/compare/main...octo%3Atopic?expand=1"
+        ));
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "fork",
+                "ssh://git@github.com/bob/repo.git",
+            ],
+        )?;
+        let paths = isolated_store_paths("prompt-sequence-remote-checkout-pr-audit")?;
+
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 1 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        assert_eq!(
+            git_stdout(&repo, &["branch", "--show-current"])?,
+            original_branch
+        );
+        assert!(LocalStore::open(paths)?.list_audit_entries()?.is_empty());
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&fork)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/topic"])
+                .status()?
+                .success(),
+            "push must not run before the changed pull request target is rejected"
         );
         Ok(())
     }
