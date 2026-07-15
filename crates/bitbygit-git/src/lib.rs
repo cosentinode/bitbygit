@@ -21,6 +21,8 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
+use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create};
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, kill_process_group};
 #[cfg(unix)]
@@ -42,6 +44,8 @@ const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOVERY_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 const RECOVERY_OUTPUT_LIMIT: usize = 256 * 1024;
 const RECOVERY_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
+const RECOVERY_EXECUTION_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+const RECOVERY_DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
 const RECOVERY_STATE_ENTRY_LIMIT: usize = 100_000;
 const RECOVERY_CONTROL_PATHS: &[&str] = &[
     "HEAD",
@@ -1740,14 +1744,13 @@ where
     if Instant::now() >= deadline {
         return Err(GitError::TimedOut { args });
     }
-    let mut stdout = tempfile::tempfile().map_err(|source| GitError::Io {
-        args: args.clone(),
-        source,
-    })?;
-    let mut stderr = tempfile::tempfile().map_err(|source| GitError::Io {
-        args: args.clone(),
-        source,
-    })?;
+    let capture_limit = if digest_all_output {
+        RECOVERY_DIAGNOSTIC_CAPTURE_LIMIT
+    } else {
+        RECOVERY_EXECUTION_CAPTURE_LIMIT.max(output_limit.saturating_add(1))
+    };
+    let mut stdout = bounded_capture_file(capture_limit, &args)?;
+    let mut stderr = bounded_capture_file(capture_limit, &args)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
@@ -1790,11 +1793,14 @@ where
     // before reading finite file snapshots; detached children cannot hold these
     // captures open as they could inherited pipes.
     kill_process_tree(&mut child);
+    let stdout_len = captured_file_position(&mut stdout, capture_limit, &args)?;
+    let stderr_len = captured_file_position(&mut stderr, capture_limit, &args)?;
 
     Ok(BoundedCommandOutput {
         status,
         stdout: read_captured_file(
             &mut stdout,
+            stdout_len,
             output_limit,
             digest_all_output,
             deadline,
@@ -1802,6 +1808,7 @@ where
         )?,
         stderr: read_captured_file(
             &mut stderr,
+            stderr_len,
             output_limit,
             digest_all_output,
             deadline,
@@ -1812,6 +1819,7 @@ where
 
 fn read_captured_file(
     file: &mut fs::File,
+    snapshot_len: u64,
     output_limit: usize,
     digest_all_output: bool,
     deadline: Instant,
@@ -1819,10 +1827,6 @@ fn read_captured_file(
 ) -> Result<CapturedStream, GitError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| recovery_output_io(args, source))?;
-    let snapshot_len = file
-        .metadata()
-        .map_err(|source| recovery_output_io(args, source))?
-        .len();
     let read_limit = if digest_all_output {
         snapshot_len
     } else {
@@ -1856,6 +1860,47 @@ fn read_captured_file(
         digest: hasher.finalize().into(),
         truncated: snapshot_len > output_limit as u64,
     })
+}
+
+#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
+fn bounded_capture_file(capacity: usize, args: &[String]) -> Result<fs::File, GitError> {
+    let descriptor = memfd_create(
+        "bitbygit-recovery-output",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(|source| recovery_output_io(args, source.into()))?;
+    ftruncate(&descriptor, capacity as u64)
+        .map_err(|source| recovery_output_io(args, source.into()))?;
+    fcntl_add_seals(
+        &descriptor,
+        SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL,
+    )
+    .map_err(|source| recovery_output_io(args, source.into()))?;
+    Ok(fs::File::from(descriptor))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "freebsd", target_os = "linux")))]
+fn bounded_capture_file(_capacity: usize, args: &[String]) -> Result<fs::File, GitError> {
+    tempfile::tempfile().map_err(|source| recovery_output_io(args, source))
+}
+
+fn captured_file_position(
+    file: &mut fs::File,
+    capacity: usize,
+    args: &[String],
+) -> Result<u64, GitError> {
+    let position = file
+        .stream_position()
+        .map_err(|source| recovery_output_io(args, source))?;
+    if position > capacity as u64 {
+        return Err(GitError::Blocked {
+            message: format!(
+                "git {} output exceeded the bounded capture limit",
+                args.join(" ")
+            ),
+        });
+    }
+    Ok(position)
 }
 
 fn recovery_output_io(args: &[String], source: io::Error) -> GitError {
@@ -3713,6 +3758,19 @@ mod tests {
                 .contains("not a regular file or directory")
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
+    #[test]
+    fn recovery_output_file_has_a_hard_growth_limit() -> Result<(), Box<dyn Error>> {
+        use std::io::Write;
+
+        let args = ["merge".to_owned(), "--continue".to_owned()];
+        let mut capture = bounded_capture_file(4096, &args)?;
+        capture.write_all(&vec![b'x'; 4096])?;
+
+        assert!(capture.write_all(b"x").is_err());
         Ok(())
     }
 
