@@ -2691,11 +2691,19 @@ impl OperationPlanner {
     }
 
     fn git(&self) -> Git {
+        let git = {
+            #[cfg(test)]
+            if let Some(executable) = &self.ssh_executable {
+                Git::with_ssh_executable(self.repo_root.clone(), executable)
+            } else {
+                Git::new(self.repo_root.clone())
+            }
+            #[cfg(not(test))]
+            Git::new(self.repo_root.clone())
+        };
         #[cfg(test)]
-        if let Some(executable) = &self.ssh_executable {
-            return Git::with_ssh_executable(self.repo_root.clone(), executable);
-        }
-        Git::new(self.repo_root.clone())
+        let git = git.with_isolated_test_config();
+        git
     }
 
     fn github(&self, repository: &GitHubRepository) -> GitHub {
@@ -3749,11 +3757,19 @@ impl PlanExecutor {
     }
 
     fn git(&self) -> Git {
+        let git = {
+            #[cfg(test)]
+            if let Some(executable) = &self.ssh_executable {
+                Git::with_ssh_executable(self.repo_root.clone(), executable)
+            } else {
+                Git::new(self.repo_root.clone())
+            }
+            #[cfg(not(test))]
+            Git::new(self.repo_root.clone())
+        };
         #[cfg(test)]
-        if let Some(executable) = &self.ssh_executable {
-            return Git::with_ssh_executable(self.repo_root.clone(), executable);
-        }
-        Git::new(self.repo_root.clone())
+        let git = git.with_isolated_test_config();
+        git
     }
 
     fn audit_repo_id(&self) -> Option<RepoId> {
@@ -4327,6 +4343,8 @@ impl PromptSequenceExecutor {
 
         let mut current_policy = self.load_policy(&self.policy);
         let git = Git::new(self.repo_root.clone());
+        #[cfg(test)]
+        let git = git.with_isolated_test_config();
         let requests = std::iter::once(first.plan.request.clone())
             .chain(remaining_requests.iter().cloned())
             .collect::<Vec<_>>();

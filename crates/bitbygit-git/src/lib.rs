@@ -49,6 +49,7 @@ const RECOVERY_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 const RECOVERY_EXECUTION_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 const RECOVERY_DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
 const RECOVERY_STATE_ENTRY_LIMIT: usize = 100_000;
+const RECOVERY_UNTRACKED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
 const RECOVERY_IGNORED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
 const RECOVERY_REBASE_TODO_LIMIT: u64 = 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -114,6 +115,9 @@ pub struct Git {
     recovery_plan_timeout: Duration,
     recovery_execution_timeout: Duration,
     recovery_output_limit: usize,
+    isolated_test_config: bool,
+    #[cfg(test)]
+    test_global_config: Option<PathBuf>,
 }
 
 impl Git {
@@ -124,6 +128,9 @@ impl Git {
             recovery_plan_timeout: RECOVERY_PLAN_TIMEOUT,
             recovery_execution_timeout: RECOVERY_EXECUTION_TIMEOUT,
             recovery_output_limit: RECOVERY_OUTPUT_LIMIT,
+            isolated_test_config: cfg!(test),
+            #[cfg(test)]
+            test_global_config: None,
         }
     }
 
@@ -137,6 +144,9 @@ impl Git {
             recovery_plan_timeout: RECOVERY_PLAN_TIMEOUT,
             recovery_execution_timeout: RECOVERY_EXECUTION_TIMEOUT,
             recovery_output_limit: RECOVERY_OUTPUT_LIMIT,
+            isolated_test_config: cfg!(test),
+            #[cfg(test)]
+            test_global_config: None,
         }
     }
 
@@ -153,7 +163,22 @@ impl Git {
             recovery_plan_timeout: plan_timeout,
             recovery_execution_timeout: execution_timeout,
             recovery_output_limit: output_limit,
+            isolated_test_config: true,
+            test_global_config: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_isolated_test_config(mut self) -> Self {
+        self.isolated_test_config = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_global_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.isolated_test_config = true;
+        self.test_global_config = Some(path.into());
+        self
     }
 
     pub fn repository(&self) -> Result<Repository, GitError> {
@@ -1287,6 +1312,22 @@ impl Git {
             }
         }
         let root = self.repo_root_until(deadline)?;
+        let mut untracked_bytes_remaining = Some(RECOVERY_UNTRACKED_DATA_LIMIT);
+        for relative in self.untracked_worktree_paths_until(deadline)? {
+            let path = root.join(&relative);
+            let mut label = b"untracked-worktree/".to_vec();
+            label.extend_from_slice(relative.as_os_str().as_encoded_bytes());
+            let mut context = RecoveryHashContext {
+                deadline,
+                entries: &mut entries,
+                follow_symlinks: false,
+                byte_budget: &mut untracked_bytes_remaining,
+                byte_budget_error: "recovery planning is blocked because untracked worktree data exceeds the 64 MiB fingerprint limit",
+            };
+            hash_recovery_path_inner(&mut hasher, &label, &path, 0, &mut context, &mut |_, _| {
+                Ok(())
+            })?;
+        }
         let mut ignored_bytes_remaining = Some(RECOVERY_IGNORED_DATA_LIMIT);
         for relative in self.ignored_worktree_paths_until(deadline)? {
             let path = root.join(&relative);
@@ -1297,6 +1338,7 @@ impl Git {
                 entries: &mut entries,
                 follow_symlinks: false,
                 byte_budget: &mut ignored_bytes_remaining,
+                byte_budget_error: "recovery planning is blocked because ignored worktree data exceeds the 64 MiB fingerprint limit",
             };
             hash_recovery_path_inner(&mut hasher, &label, &path, 0, &mut context, &mut |_, _| {
                 Ok(())
@@ -1353,34 +1395,32 @@ impl Git {
             "config".to_owned(),
             "--name-only".to_owned(),
             "--null".to_owned(),
-            "--get-regexp".to_owned(),
-            r"^(filter\..*\.(clean|smudge|process)|merge\..*\.driver)$".to_owned(),
+            "--list".to_owned(),
         ];
         let output = self.run_bounded_git(args.clone(), deadline, true)?;
-        if output.status.success() {
-            if output.stdout.truncated {
-                return Err(GitError::Blocked {
-                    message: "recovery is blocked because external Git process configuration exceeds the bounded diagnostic limit"
-                        .to_owned(),
-                });
-            }
-            let names = output
-                .stdout
-                .bytes
-                .split(|byte| *byte == 0)
-                .filter(|name| !name.is_empty())
-                .map(|name| String::from_utf8_lossy(name).into_owned())
-                .collect::<Vec<_>>();
-            if self.recovery_uses_external_attributes_until(deadline)? {
-                return Err(GitError::Blocked {
-                    message: format!(
-                        "recovery is blocked because active external filter or merge-driver configuration may start uncontained processes: {}; disable it and preview recovery again, or run Git manually",
-                        names.join(", ")
-                    ),
-                });
-            }
-        } else if output.status.code() != Some(1) {
+        if !output.status.success() {
             return Err(output.git_error(args));
+        }
+        if output.stdout.truncated {
+            return Err(GitError::Blocked {
+                message: "recovery is blocked because Git configuration exceeds the bounded diagnostic limit, so external drivers cannot be ruled out"
+                    .to_owned(),
+            });
+        }
+        let names = output
+            .stdout
+            .bytes
+            .split(|byte| *byte == 0)
+            .filter(|name| is_recovery_external_driver_config(name))
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "recovery is blocked because configured external Git drivers may be activated by a recovery target tree and start uncontained processes: {}; remove them from every Git config scope, preview recovery again, or run Git manually",
+                    names.join(", ")
+                ),
+            });
         }
 
         let hooks = self.recovery_hooks_path_until(deadline)?;
@@ -1421,34 +1461,6 @@ impl Git {
         Ok(())
     }
 
-    fn recovery_uses_external_attributes_until(&self, deadline: Instant) -> Result<bool, GitError> {
-        let root = self.repo_root_until(deadline)?;
-        let mut paths = self
-            .worktree_attributes_until(deadline)?
-            .into_iter()
-            .map(|path| root.join(path))
-            .collect::<Vec<_>>();
-        paths.push(self.git_path_until("info/attributes", deadline)?);
-        for variable in ["GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"] {
-            if let Some(path) = self.git_var_path_until(variable, deadline)? {
-                paths.push(path);
-            }
-        }
-        for path in paths {
-            let Some(contents) =
-                read_bounded_optional_file(&path, RECOVERY_REBASE_TODO_LIMIT, deadline)?
-            else {
-                continue;
-            };
-            if contents.split_ascii_whitespace().any(|attribute| {
-                attribute.starts_with("filter=") || attribute.starts_with("merge=")
-            }) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     fn bounded_config_is_enabled(&self, key: &str, deadline: Instant) -> Result<bool, GitError> {
         let args = vec!["config".to_owned(), "--get".to_owned(), key.to_owned()];
         let output = self.run_bounded_git(args.clone(), deadline, true)?;
@@ -1467,24 +1479,39 @@ impl Git {
         Ok(!matches!(value.trim(), "" | "0" | "false" | "no" | "off"))
     }
 
+    fn untracked_worktree_paths_until(&self, deadline: Instant) -> Result<Vec<PathBuf>, GitError> {
+        self.other_worktree_paths_until(false, deadline)
+    }
+
     fn ignored_worktree_paths_until(&self, deadline: Instant) -> Result<Vec<PathBuf>, GitError> {
-        let args = vec![
-            "ls-files".to_owned(),
-            "--others".to_owned(),
-            "--ignored".to_owned(),
+        self.other_worktree_paths_until(true, deadline)
+    }
+
+    fn other_worktree_paths_until(
+        &self,
+        ignored: bool,
+        deadline: Instant,
+    ) -> Result<Vec<PathBuf>, GitError> {
+        let kind = if ignored { "ignored" } else { "untracked" };
+        let mut args = vec!["ls-files".to_owned(), "--others".to_owned()];
+        if ignored {
+            args.push("--ignored".to_owned());
+        }
+        args.extend([
             "--exclude-standard".to_owned(),
             "--full-name".to_owned(),
             "-z".to_owned(),
             "--".to_owned(),
-        ];
+        ]);
         let output = self.run_bounded_git(args.clone(), deadline, true)?;
         if !output.status.success() {
             return Err(output.git_error(args));
         }
         if output.stdout.truncated {
             return Err(GitError::Blocked {
-                message: "recovery planning is blocked because ignored worktree paths exceed the bounded output limit"
-                    .to_owned(),
+                message: format!(
+                    "recovery planning is blocked because {kind} worktree paths exceed the bounded output limit"
+                ),
             });
         }
         let mut paths = BTreeSet::new();
@@ -1499,8 +1526,9 @@ impl Git {
                     .any(|component| matches!(component, std::path::Component::ParentDir))
             {
                 return Err(GitError::Blocked {
-                    message: "recovery planning is blocked by an invalid ignored worktree path"
-                        .to_owned(),
+                    message: format!(
+                        "recovery planning is blocked by an invalid {kind} worktree path"
+                    ),
                 });
             }
             paths.insert(path);
@@ -1817,6 +1845,14 @@ impl Git {
             .env("SSH_ASKPASS_REQUIRE", "never")
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true");
+        if self.isolated_test_config {
+            let global_config = self.cwd.join(".bitbygit-test-global-config");
+            #[cfg(test)]
+            let global_config = self.test_global_config.clone().unwrap_or(global_config);
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", global_config);
+        }
         if optional_locks {
             command.env("GIT_OPTIONAL_LOCKS", "0");
         } else {
@@ -2053,6 +2089,20 @@ impl Git {
             stdout: output.stdout,
         })
     }
+}
+
+fn is_recovery_external_driver_config(name: &[u8]) -> bool {
+    let name = String::from_utf8_lossy(name).to_ascii_lowercase();
+    name == "diff.external"
+        || (name.starts_with("filter.")
+            && [".clean", ".smudge", ".process"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)))
+        || (name.starts_with("diff.")
+            && [".command", ".textconv"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)))
+        || (name.starts_with("merge.") && name.ends_with(".driver"))
 }
 
 fn run_bounded_command<F>(
@@ -2472,6 +2522,7 @@ where
         entries,
         follow_symlinks: true,
         byte_budget: &mut byte_budget,
+        byte_budget_error: "recovery planning is blocked because recovery input data exceeds its fingerprint limit",
     };
     hash_recovery_path_inner(hasher, label, path, 0, &mut context, after_contents)
 }
@@ -2481,6 +2532,7 @@ struct RecoveryHashContext<'a> {
     entries: &'a mut usize,
     follow_symlinks: bool,
     byte_budget: &'a mut Option<u64>,
+    byte_budget_error: &'static str,
 }
 
 fn hash_recovery_path_inner<F>(
@@ -2582,8 +2634,7 @@ where
             if let Some(remaining) = context.byte_budget.as_mut() {
                 let Some(updated) = remaining.checked_sub(count as u64) else {
                     return Err(GitError::Blocked {
-                        message: "recovery planning is blocked because ignored worktree data exceeds the 64 MiB fingerprint limit"
-                            .to_owned(),
+                        message: context.byte_budget_error.to_owned(),
                     });
                 };
                 *remaining = updated;
@@ -4570,6 +4621,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_recovery_rejects_changed_untracked_contents() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("untracked.txt", "at preview\n")?;
+        let git = Git::new(repo.path());
+        let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+        repo.write("untracked.txt", "changed after preview\n")?;
+
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected changed untracked content to block abort".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(
+            fs::read_to_string(repo.path().join("untracked.txt"))?,
+            "changed after preview\n"
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_fingerprint_bounds_untracked_data() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let untracked = fs::File::create(repo.path().join("large.untracked"))?;
+        untracked.set_len(RECOVERY_UNTRACKED_DATA_LIMIT + 1)?;
+
+        let Err(error) = Git::new(repo.path()).recovery_state() else {
+            return Err("expected oversized untracked data to block planning".into());
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("untracked worktree data exceeds")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn recovery_fingerprint_bounds_ignored_data() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
         repo.write(".gitignore", "large.ignored\n")?;
@@ -4741,7 +4833,6 @@ mod tests {
         let (repo, _original_head) = prepare_merge_conflict()?;
         let attributes = Git::new(repo.path()).git_path("info/attributes")?;
         assert!(Command::new("mkfifo").arg(&attributes).status()?.success());
-        repo.run(["config", "filter.unsafe.smudge", "cat"])?;
         let git = Git::with_recovery_limits(
             repo.path(),
             Duration::from_millis(200),
@@ -4754,8 +4845,9 @@ mod tests {
             return Err("expected FIFO attributes to fail closed".into());
         };
 
+        let error = error.to_string();
         assert!(
-            error.to_string().contains("not a regular file"),
+            error.contains("not a regular file") || error.contains("timed out"),
             "unexpected error: {error}"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -4763,22 +4855,84 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_active_external_filter_configuration() -> Result<(), Box<dyn Error>> {
+    fn recovery_rejects_all_configured_external_driver_kinds() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
-        let marker = repo.path().join("filter-ran");
+        let git = Git::new(repo.path());
+        for key in [
+            "filter.unsafe.clean",
+            "filter.unsafe.smudge",
+            "filter.unsafe.process",
+            "diff.external",
+            "diff.unsafe.command",
+            "diff.unsafe.textconv",
+            "merge.unsafe.driver",
+        ] {
+            repo.run(["config", key, "cat"])?;
+            let Err(error) = git.recovery_state() else {
+                return Err(format!("expected {key} to fail closed").into());
+            };
+            assert!(error.to_string().contains("external Git drivers"));
+            assert!(error.to_string().contains(key));
+            repo.run(["config", "--unset", key])?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_external_driver_from_global_scope() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let config_dir = TempRepo::new()?;
+        let global_config = config_dir.path().join("global-config");
+        fs::write(&global_config, "[diff]\n\texternal = global-diff-command\n")?;
+        let git = Git::new(repo.path()).with_test_global_config(global_config);
+
+        let Err(error) = git.recovery_state() else {
+            return Err("expected a global external diff driver to fail closed".into());
+        };
+
+        assert!(error.to_string().contains("diff.external"));
+        assert!(error.to_string().contains("every Git config scope"));
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_abort_rejects_filter_selected_only_by_target_tree() -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write(".gitattributes", "*.txt text\n")?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.run(["add", ".gitattributes", "conflict.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "topic"])?;
         repo.write(".gitattributes", "*.txt filter=unsafe\n")?;
+        repo.write("conflict.txt", "topic\n")?;
+        repo.run(["commit", "-am", "topic"])?;
+        let target = repo.git_stdout(["rev-parse", "HEAD"])?.trim().to_owned();
+        repo.run(["switch", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.run(["commit", "-am", "main"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "main"])?;
+        repo.write(".gitattributes", "*.txt text\n")?;
+        assert_eq!(
+            repo.git_stdout_args(&["show", &format!("{target}:.gitattributes")])?,
+            "*.txt filter=unsafe\n"
+        );
+
+        let marker = repo.path().join("filter-ran");
         repo.run_args(&[
             "config",
             "filter.unsafe.smudge",
             &format!("touch '{}'", marker.display()),
         ])?;
-
-        let Err(error) = Git::new(repo.path()).recovery_state() else {
-            return Err("expected external filter configuration to fail closed".into());
+        let git = Git::new(repo.path());
+        let Err(error) = git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Abort)
+        else {
+            return Err("expected target-tree filter configuration to fail closed".into());
         };
 
-        assert!(error.to_string().contains("active external filter"));
+        assert!(error.to_string().contains("recovery target tree"));
         assert!(!marker.exists());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
         Ok(())
     }
 
