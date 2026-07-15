@@ -31,13 +31,27 @@ function ConvertTo-IsolatedPathBlock([string] $Block) {
     return $Isolated
 }
 
+function ConvertTo-SelectedVersionBlock([string] $Block, [string] $Heading) {
+    $DocumentedAssignment = '$Version = "{0}"' -f $script:WorkspaceVersion
+    if (-not $Block.Contains($DocumentedAssignment)) {
+        Fail "missing selected version in $Heading powershell block"
+    }
+
+    $SelectedAssignment = '$Version = "{0}"' -f $script:SelectedVersion
+    return $Block.Replace($DocumentedAssignment, $SelectedAssignment)
+}
+
 $DocsText = Get-Content -Raw $DocsPath
 $CargoText = Get-Content -Raw $CargoPath
 $VersionMatch = [regex]::Match($CargoText, '(?ms)^\[workspace\.package\]\r?\n.*?^version = "([^"]+)"')
 if (-not $VersionMatch.Success) { Fail "workspace version was not found" }
-$Version = $VersionMatch.Groups[1].Value
-if (-not $DocsText.Contains("`$Version = `"$Version`"")) {
-    Fail "PowerShell examples do not use workspace version $Version"
+$WorkspaceVersion = $VersionMatch.Groups[1].Value
+$SelectedVersion = "2.3.4"
+if ($SelectedVersion -eq $WorkspaceVersion -or $SelectedVersion -eq "0.1.0") {
+    Fail "selected validator version must differ from the documented example"
+}
+if (-not $DocsText.Contains("`$Version = `"$WorkspaceVersion`"")) {
+    Fail "PowerShell examples do not use workspace version $WorkspaceVersion"
 }
 $EmptyPathGuard = '$NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }'
 if ([regex]::Matches($DocsText, [regex]::Escape($EmptyPathGuard)).Count -ne 2) {
@@ -62,14 +76,18 @@ foreach ($Match in [regex]::Matches($DocsText, '(?ms)^```powershell\r?\n(.*?)^``
     if ($Errors.Count -ne 0) { Fail "PowerShell snippet has syntax errors: $($Errors -join '; ')" }
 }
 
-$InstallBlock = ConvertTo-IsolatedPathBlock (Get-Block "Windows x86-64 archive" "powershell")
+$InstallBlock = Get-Block "Windows x86-64 archive" "powershell"
+$InstallBlock = ConvertTo-SelectedVersionBlock $InstallBlock "Windows x86-64 archive"
+$InstallBlock = ConvertTo-IsolatedPathBlock $InstallBlock
 if (-not $InstallBlock.Contains('$Package = "bitbygit-$Version-$Target"')) {
     Fail "Windows package directory does not match the release layout"
 }
 if (-not $InstallBlock.Contains('& $InstalledBinary --version')) {
     Fail "Windows installation does not validate the installed path"
 }
-$SourceBlock = ConvertTo-IsolatedPathBlock (Get-Block "Build from source" "powershell")
+$SourceBlock = Get-Block "Build from source" "powershell"
+$SourceBlock = ConvertTo-SelectedVersionBlock $SourceBlock "Build from source"
+$SourceBlock = ConvertTo-IsolatedPathBlock $SourceBlock
 if (-not $SourceBlock.Contains('git -C $SourceDir fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${Tag}:${Tag}"') -or
     -not $SourceBlock.Contains('git -C $SourceDir checkout --detach $TagCommit') -or
     -not $SourceBlock.Contains('$HeadCommit -ne $TagCommit')) {
@@ -84,13 +102,26 @@ try {
     cargo build --locked --release -p bitbygit
     if ($LASTEXITCODE -ne 0) { Fail "cargo build failed" }
 
+    $WorkspaceBinary = Join-Path $Root "target/release/bitbygit.exe"
+    $WorkspaceOutput = & $WorkspaceBinary --version
+    if ($LASTEXITCODE -ne 0 -or $WorkspaceOutput -ne "bitbygit $WorkspaceVersion") {
+        Fail "workspace binary reported the wrong version"
+    }
+
+    $FixtureSource = Join-Path $Temp "selected-version-fixture.rs"
+    $FixtureBinary = Join-Path $Temp "selected-version-bitbygit.exe"
+    $FixtureSourceText = 'fn main() {{ println!("bitbygit {0}"); }}' -f $SelectedVersion
+    Set-Content -Path $FixtureSource -Value $FixtureSourceText
+    rustc --crate-name selected_version_fixture $FixtureSource -o $FixtureBinary
+    if ($LASTEXITCODE -ne 0) { Fail "selected-version fixture build failed" }
+
     $Target = "x86_64-pc-windows-msvc"
-    $Archive = "bitbygit-$Version-$Target.zip"
-    $Package = "bitbygit-$Version-$Target"
+    $Archive = "bitbygit-$SelectedVersion-$Target.zip"
+    $Package = "bitbygit-$SelectedVersion-$Target"
     $Assets = Join-Path $Temp "assets"
     $PackageDir = Join-Path $Assets $Package
     New-Item -ItemType Directory -Path $PackageDir | Out-Null
-    Copy-Item (Join-Path $Root "target/release/bitbygit.exe") $PackageDir
+    Copy-Item $FixtureBinary (Join-Path $PackageDir "bitbygit.exe")
     Compress-Archive -Path $PackageDir -DestinationPath (Join-Path $Assets $Archive)
     $Digest = (Get-FileHash -Algorithm SHA256 (Join-Path $Assets $Archive)).Hash
     Set-Content -Path (Join-Path $Assets "SHA256SUMS") -Value "$Digest  $Archive"
@@ -127,7 +158,7 @@ try {
     $ResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
     if ($ResolvedBinary -ne $InstalledBinary) { Fail "archive block did not resolve the installed command through PATH" }
     $Output = bitbygit --version
-    if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
+    if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $SelectedVersion") {
         Fail "archive block installed the wrong version"
     }
 
@@ -168,12 +199,12 @@ try {
     function git {
         param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments)
 
-        $ExpectedTag = "refs/tags/v$Version"
+        $ExpectedTag = "refs/tags/v$SelectedVersion"
         if ($Arguments.Count -eq 3 -and $Arguments[0] -eq "-C" -and
             $Arguments[2] -eq "init") {
             $BuildDir = Join-Path $Arguments[1] "target/release"
             New-Item -ItemType Directory -Path $BuildDir | Out-Null
-            Copy-Item (Join-Path $Root "target/release/bitbygit.exe") $BuildDir
+            Copy-Item $FixtureBinary (Join-Path $BuildDir "bitbygit.exe")
         } elseif ($Arguments.Count -eq 7 -and $Arguments[0] -eq "-C" -and
             $Arguments[2] -eq "fetch" -and $Arguments[3] -eq "--depth" -and
             $Arguments[4] -eq "1" -and
@@ -240,7 +271,7 @@ try {
     $SourceResolvedBinary = (Get-Command bitbygit -CommandType Application).Source
     if ($SourceResolvedBinary -ne $SourceInstalledBinary) { Fail "source block did not resolve the installed command through PATH" }
     $SourceOutput = bitbygit --version
-    if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $Version") {
+    if ($LASTEXITCODE -ne 0 -or $SourceOutput -ne "bitbygit $SelectedVersion") {
         Fail "source block installed the wrong version"
     }
 
