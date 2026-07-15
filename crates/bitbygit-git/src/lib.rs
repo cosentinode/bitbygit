@@ -356,7 +356,8 @@ impl Git {
         let recovery_lock = self.acquire_recovery_lock_until(operation, action, deadline)?;
         self.run_recovery_args_until_with(operation, action, deadline, || {
             recovery_lock.ensure_identity(operation, action)?;
-            self.validate_recovery_until(operation, action, deadline)
+            self.validate_recovery_until(operation, action, deadline)?;
+            recovery_lock.ensure_identity(operation, action)
         })
     }
 
@@ -417,7 +418,8 @@ impl Git {
         self.run_recovery_args_until_with(operation, action, deadline, || {
             before_spawn_check()?;
             recovery_lock.ensure_identity(operation, action)?;
-            self.ensure_recovery_state(expected_state, operation, action, deadline)
+            self.ensure_recovery_state(expected_state, operation, action, deadline)?;
+            recovery_lock.ensure_identity(operation, action)
         })
     }
 
@@ -1448,10 +1450,10 @@ impl Git {
             else {
                 continue;
             };
-            if contents.lines().any(|line| {
-                let line = line.trim_start();
-                line.starts_with("exec ") || line.starts_with("x ")
-            }) {
+            if contents
+                .lines()
+                .any(|line| matches!(line.split_ascii_whitespace().next(), Some("exec" | "x")))
+            {
                 return Err(GitError::Blocked {
                     message: "recovery is blocked because the remaining rebase plan contains an exec command that may start uncontained processes; remove it and preview recovery again, or run Git manually"
                         .to_owned(),
@@ -1738,31 +1740,31 @@ impl Git {
         action: RecoveryAction,
         deadline: Instant,
     ) -> Result<RecoveryLock, GitError> {
-        let path = self
-            .git_common_dir_until(deadline)?
-            .join(RECOVERY_LOCK_NAME);
+        let common_dir = self.git_common_dir_until(deadline)?;
+        let common_dir_descriptor = open(
+            &common_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|source| recovery_lock_io(operation, action, source.into()))?;
+        flock(
+            &common_dir_descriptor,
+            FlockOperation::NonBlockingLockExclusive,
+        )
+        .map_err(|source| recovery_lock_error(operation, action, source))?;
+        let path = common_dir.join(RECOVERY_LOCK_NAME);
         let descriptor = open(
             &path,
             OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::from_bits_truncate(0o600),
         )
         .map_err(|source| recovery_lock_io(operation, action, source.into()))?;
-        flock(&descriptor, FlockOperation::NonBlockingLockExclusive).map_err(|source| {
-            if source == Errno::AGAIN {
-                GitError::Blocked {
-                    message: format!(
-                        "{} {} is blocked because another BitByGit recovery is active for this repository",
-                        operation.label(),
-                        action.label()
-                    ),
-                }
-            } else {
-                recovery_lock_io(operation, action, source.into())
-            }
-        })?;
+        flock(&descriptor, FlockOperation::NonBlockingLockExclusive)
+            .map_err(|source| recovery_lock_error(operation, action, source))?;
         let lock = RecoveryLock {
             path,
             file: fs::File::from(descriptor),
+            common_dir: fs::File::from(common_dir_descriptor),
         };
         lock.ensure_identity(operation, action)?;
         Ok(lock)
@@ -2356,6 +2358,8 @@ struct RecoveryLock {
     path: PathBuf,
     #[cfg(target_os = "linux")]
     file: fs::File,
+    #[cfg(target_os = "linux")]
+    common_dir: fs::File,
 }
 
 impl RecoveryLock {
@@ -2369,9 +2373,14 @@ impl RecoveryLock {
             .file
             .metadata()
             .map_err(|source| recovery_lock_io(operation, action, source))?;
+        let common_dir = self
+            .common_dir
+            .metadata()
+            .map_err(|source| recovery_lock_io(operation, action, source))?;
         let current = fs::symlink_metadata(&self.path)
             .map_err(|source| recovery_lock_io(operation, action, source))?;
-        if !opened.is_file()
+        if !common_dir.is_dir()
+            || !opened.is_file()
             || opened.nlink() != 1
             || current.file_type().is_symlink()
             || !same_recovery_file(&opened, &current)
@@ -2394,6 +2403,25 @@ impl RecoveryLock {
         action: RecoveryAction,
     ) -> Result<(), GitError> {
         ensure_recovery_execution_supported(operation, action)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_lock_error(
+    operation: RepositoryOperation,
+    action: RecoveryAction,
+    source: Errno,
+) -> GitError {
+    if source == Errno::AGAIN {
+        GitError::Blocked {
+            message: format!(
+                "{} {} is blocked because another BitByGit recovery is active for this repository",
+                operation.label(),
+                action.label()
+            ),
+        }
+    } else {
+        recovery_lock_io(operation, action, source.into())
     }
 }
 
@@ -5065,6 +5093,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn recovery_rejects_tab_delimited_rebase_exec_commands_before_spawn()
+    -> Result<(), Box<dyn Error>> {
+        for (index, command) in ["exec", "x"].into_iter().enumerate() {
+            let (repo, _original_head) = prepare_rebase_conflict()?;
+            repo.write("conflict.txt", "resolved\n")?;
+            repo.run(["add", "conflict.txt"])?;
+            let git = Git::new(repo.path());
+            let todo = git.git_path("rebase-merge/git-rebase-todo")?;
+            let marker = repo.path().join(format!("tab-exec-{index}-ran"));
+            fs::write(&todo, format!("{command}\ttouch '{}'\n", marker.display()))?;
+
+            let Err(error) = git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue)
+            else {
+                return Err(format!("expected tab-delimited {command} to fail closed").into());
+            };
+
+            assert!(error.to_string().contains("rebase plan contains an exec"));
+            assert!(!marker.exists(), "{command} process started");
+            assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn recovery_lock_serializes_bitbygit_execution() -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_merge_conflict()?;
         let git = Git::new(repo.path());
@@ -5094,10 +5147,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn recovery_lock_rejects_replaced_lock_identity() -> Result<(), Box<dyn Error>> {
+    fn recovery_lock_replacement_cannot_enable_concurrent_recovery() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
         let git = Git::new(repo.path());
+        let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
         let lock = git.acquire_recovery_lock_until(
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            Instant::now() + Duration::from_secs(2),
+        )?;
+        git.ensure_recovery_state(
+            &expected,
             RepositoryOperation::Merge,
             RecoveryAction::Abort,
             Instant::now() + Duration::from_secs(2),
@@ -5105,6 +5165,17 @@ mod tests {
         let replaced = lock.path.with_extension("replaced");
         fs::rename(&lock.path, &replaced)?;
         fs::write(&lock.path, "replacement\n")?;
+
+        let Err(concurrent_error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected stable repository lock to block concurrent recovery".into());
+        };
+        assert!(
+            concurrent_error
+                .to_string()
+                .contains("another BitByGit recovery")
+        );
 
         let Err(error) = lock.ensure_identity(RepositoryOperation::Merge, RecoveryAction::Abort)
         else {
