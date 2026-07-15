@@ -94,9 +94,11 @@ jobs:
           package="bitbygit-${version}-${{ matrix.target }}"
           archive="${package}.${{ matrix.archive_extension }}"
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "package=${package}" >> "${GITHUB_OUTPUT}"
-          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "version=${version}"
+            echo "package=${package}"
+            echo "archive=${archive}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Build
         run: cargo build --locked --release -p bitbygit --target ${{ matrix.target }}
