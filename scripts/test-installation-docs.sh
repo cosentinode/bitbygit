@@ -46,6 +46,12 @@ extract_selected_block() {
   printf '%s' "${block/VERSION=${workspace_version}/VERSION=${selected_version}}"
 }
 
+extract_selected_path_block() {
+  extract_selected_block "$1" bash | perl -0777 -ne '
+    if (/^BITBYGIT_INSTALL\n(.*)\z/ms) { print $1 }
+  '
+}
+
 release_artifacts=()
 while IFS= read -r artifact; do
   release_artifacts+=("${artifact}")
@@ -125,6 +131,7 @@ check_unix_success() {
   ln -s protected-file "${case_dir}/SHA256SUMS"
   ln -s protected-package "${case_dir}/${package}"
   extract_selected_block "${heading}" bash > "${case_dir}/snippet.bash"
+  extract_selected_path_block "${heading}" > "${case_dir}/path-snippet.bash"
   [[ -s "${case_dir}/snippet.bash" ]] || fail "missing ${heading} Bash block"
 
   (
@@ -175,6 +182,11 @@ check_unix_success() {
     resolved_binary="$(type -P bitbygit)"
     [[ "${resolved_binary}" -ef "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not resolve the installed application through PATH"
     [[ "$(command bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} resolved the wrong version through PATH"
+    default_path="$(command -p getconf PATH)"
+    unset PATH
+    source "${case_dir}/path-snippet.bash" || fail "${heading} failed with an originally unset PATH"
+    [[ "${PATH}" == "${HOME}/.local/bin:${default_path}" ]] || fail "${heading} did not retain default command lookup for an originally unset PATH"
+    [[ -n "$(type -P ls)" ]] || fail "${heading} lost standard command lookup for an originally unset PATH"
     if compgen -G "${TMPDIR}/*" >/dev/null; then
       fail "${heading} left temporary installation files behind"
     fi
@@ -245,6 +257,49 @@ extract_selected_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
   fi
 )
 [[ ! -e "${failure_dir}/side-effects" ]] || fail "${failure_heading} extracted or installed after checksum failure"
+
+collision_dir="${tmp}/checksum-collision-${failure_target}"
+collision_assets="${tmp}/checksum-collision-assets"
+mkdir -p "${collision_dir}/home" "${collision_dir}/temp" "${collision_dir}/mock-bin" "${collision_assets}"
+collision_archive="bitbygit-${selected_version}-${failure_target}.tar.gz"
+cp "${tmp}/assets/${collision_archive}" "${collision_assets}/${collision_archive}"
+printf 'malicious sidecar\n' > "${collision_assets}/${collision_archive}.sig"
+if command -v sha256sum >/dev/null; then
+  collision_digest="$(sha256sum "${collision_assets}/${collision_archive}.sig")"
+else
+  collision_digest="$(shasum -a 256 "${collision_assets}/${collision_archive}.sig")"
+fi
+printf '%s  %s.sig\n' "${collision_digest%% *}" "${collision_archive}" > "${collision_assets}/SHA256SUMS"
+cp "${tmp}/failure-bin/uname" "${tmp}/failure-bin/tar" "${tmp}/failure-bin/install" "${collision_dir}/mock-bin/"
+cat > "${collision_dir}/mock-bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+for source in "$@"; do :; done
+name="${source##*/}"
+cp "${MOCK_DOWNLOAD_DIR}/${name}" .
+if [[ -f "${MOCK_DOWNLOAD_DIR}/${name}.sig" ]]; then
+  cp "${MOCK_DOWNLOAD_DIR}/${name}.sig" .
+fi
+MOCK
+chmod +x "${collision_dir}/mock-bin/"*
+extract_selected_block "${failure_heading}" bash > "${collision_dir}/snippet.bash"
+(
+  cd "${collision_dir}"
+  original_path="${collision_dir}/mock-bin:${PATH}"
+  export HOME="${collision_dir}/home"
+  export TMPDIR="${collision_dir}/temp"
+  export MOCK_DOWNLOAD_DIR="${collision_assets}"
+  export MOCK_SIDE_EFFECTS="${collision_dir}/side-effects"
+  export MOCK_UNAME_MACHINE="${failure_machine}"
+  export PATH="${original_path}"
+  if source "${collision_dir}/snippet.bash"; then
+    fail "${failure_heading} accepted a checksum for a similarly named file"
+  fi
+  [[ "${PATH}" == "${original_path}" ]] || fail "checksum collision changed the caller PATH"
+  if compgen -G "${TMPDIR}/*" >/dev/null; then
+    fail "checksum collision left temporary installation files behind"
+  fi
+)
+[[ ! -e "${collision_dir}/side-effects" ]] || fail "${failure_heading} extracted or installed without an exact checksum entry"
 
 cleanup_failure_dir="${tmp}/cleanup-failure-${failure_target}"
 mkdir -p "${cleanup_failure_dir}/home" "${cleanup_failure_dir}/temp" "${cleanup_failure_dir}/mock-bin"
@@ -320,6 +375,7 @@ chmod +x "${source_dir}/mock-bin/"*
 source_snippet="$(extract_selected_block "Build from source" bash)"
 source_snippet="${source_snippet/https:\/\/github.com\/cosentinode\/bitbygit.git/${source_remote}}"
 printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
+extract_selected_path_block "Build from source" > "${source_dir}/path-snippet.bash"
 (
   cd "${source_dir}"
   export HOME="${source_dir}/home"
@@ -368,6 +424,11 @@ printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
   resolved_binary="$(type -P bitbygit)"
   [[ "${resolved_binary}" -ef "${HOME}/.local/bin/bitbygit" ]] || fail "Bash source block did not resolve the installed application through PATH"
   [[ "$(command bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "Bash source block resolved the wrong version through PATH"
+  default_path="$(command -p getconf PATH)"
+  unset PATH
+  source "${source_dir}/path-snippet.bash" || fail "Bash source block failed with an originally unset PATH"
+  [[ "${PATH}" == "${HOME}/.local/bin:${default_path}" ]] || fail "Bash source block did not retain default command lookup for an originally unset PATH"
+  [[ -n "$(type -P git)" ]] || fail "Bash source block lost standard command lookup for an originally unset PATH"
   if compgen -G "${TMPDIR}/*" >/dev/null; then
     fail "Bash source block left temporary build files behind"
   fi

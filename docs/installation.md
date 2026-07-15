@@ -33,7 +33,7 @@ or `$Version` to an available release version without the leading `v`.
 
 ## Linux x86-64 archive
 
-Run these commands in Bash. They require `curl`, `tar`, `grep`, and GNU
+Run these commands in Bash. They require `curl`, `tar`, `awk`, and GNU
 coreutils (`sha256sum`, `mkdir`, and `install`) and stop before extraction or
 installation if any download or checksum check fails:
 
@@ -58,7 +58,8 @@ cd "${WORK_DIR}"
 
 curl -fLO "${BASE_URL}/${ARCHIVE}"
 curl -fLO "${BASE_URL}/SHA256SUMS"
-grep -F "  ${ARCHIVE}" SHA256SUMS | sha256sum --check -
+awk -v archive="${ARCHIVE}" '$2 == archive && NF == 2 { print; found=1 } END { exit !found }' SHA256SUMS |
+  sha256sum --check -
 tar -xzf "${ARCHIVE}"
 
 mkdir -p "${HOME}/.local/bin"
@@ -72,7 +73,10 @@ BITBYGIT_INSTALL
 {
 install_dir="${HOME}/.local/bin"
 new_path="${install_dir}"
-IFS=: read -r -a path_entries <<< "${PATH-}:__BITBYGIT_PATH_END__"
+if [[ -z "${PATH+x}" ]]; then
+  PATH="$(command -p getconf PATH)"
+fi
+IFS=: read -r -a path_entries <<< "${PATH}:__BITBYGIT_PATH_END__"
 path_entry_count="${#path_entries[@]}"
 unset "path_entries[$((path_entry_count - 1))]"
 for entry in "${path_entries[@]}"; do
@@ -97,7 +101,7 @@ the command available in new shells.
 ## macOS archive
 
 Run these commands in Bash. They select the Intel or Apple silicon artifact
-automatically and require `curl`, `shasum`, and `tar`, which are included with
+automatically and require `curl`, `awk`, `shasum`, and `tar`, which are included with
 macOS. The shell stops before extraction or installation if any download or
 checksum check fails:
 
@@ -126,7 +130,8 @@ cd "${WORK_DIR}"
 
 curl -fLO "${BASE_URL}/${ARCHIVE}"
 curl -fLO "${BASE_URL}/SHA256SUMS"
-grep -F "  ${ARCHIVE}" SHA256SUMS | shasum -a 256 --check -
+awk -v archive="${ARCHIVE}" '$2 == archive && NF == 2 { print; found=1 } END { exit !found }' SHA256SUMS |
+  shasum -a 256 --check -
 tar -xzf "${ARCHIVE}"
 
 mkdir -p "${HOME}/.local/bin"
@@ -140,7 +145,10 @@ BITBYGIT_INSTALL
 {
 install_dir="${HOME}/.local/bin"
 new_path="${install_dir}"
-IFS=: read -r -a path_entries <<< "${PATH-}:__BITBYGIT_PATH_END__"
+if [[ -z "${PATH+x}" ]]; then
+  PATH="$(command -p getconf PATH)"
+fi
+IFS=: read -r -a path_entries <<< "${PATH}:__BITBYGIT_PATH_END__"
 path_entry_count="${#path_entries[@]}"
 unset "path_entries[$((path_entry_count - 1))]"
 for entry in "${path_entries[@]}"; do
@@ -326,7 +334,10 @@ BITBYGIT_INSTALL
 {
 install_dir="${HOME}/.local/bin"
 new_path="${install_dir}"
-IFS=: read -r -a path_entries <<< "${PATH-}:__BITBYGIT_PATH_END__"
+if [[ -z "${PATH+x}" ]]; then
+  PATH="$(command -p getconf PATH)"
+fi
+IFS=: read -r -a path_entries <<< "${PATH}:__BITBYGIT_PATH_END__"
 path_entry_count="${#path_entries[@]}"
 unset "path_entries[$((path_entry_count - 1))]"
 for entry in "${path_entries[@]}"; do
