@@ -17,9 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive_extension: tar.gz
+            max_glibc: "2.35"
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             archive_extension: tar.gz
@@ -54,6 +55,15 @@ jobs:
 
       - name: Build
         run: cargo build --locked --release -p bitbygit --target ${{ matrix.target }}
+
+      - name: Validate Linux glibc baseline
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/bitbygit"
+          required="$(readelf --version-info "${binary}" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -Vu | tail -n 1)"
+          baseline="GLIBC_${{ matrix.max_glibc }}"
+          [[ "$(printf '%s\n' "${required}" "${baseline}" | sort -V | tail -n 1)" == "${baseline}" ]]
 
       - name: Package Unix binary
         if: runner.os != 'Windows'
