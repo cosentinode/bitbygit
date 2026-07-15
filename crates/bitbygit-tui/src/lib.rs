@@ -47,8 +47,7 @@ const AUDIT_SECRET_MARKERS: &[&str] = &[
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mut terminal = TerminalSession::enter()?;
-    let mut app = App::with_policy(effective_policy_from_environment());
-    app.load_current_dir();
+    let mut app = App::from_startup(startup_policy_from_environment());
 
     loop {
         terminal.draw(|frame| {
@@ -169,6 +168,15 @@ impl App {
             should_quit: false,
             last_viewport: Viewport::default(),
         }
+    }
+
+    fn from_startup(startup: StartupPolicy) -> Self {
+        let mut app = Self::with_policy(startup.policy);
+        app.load_current_dir();
+        if let Some(diagnostic) = startup.diagnostic {
+            app.details = diagnostic;
+        }
+        app
     }
 
     pub fn focus(&self) -> Focus {
@@ -3126,11 +3134,40 @@ fn current_dir() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_error| std::path::PathBuf::from("."))
 }
 
-fn effective_policy_from_environment() -> EffectivePolicy {
-    StorePaths::from_environment()
-        .ok()
-        .and_then(|paths| effective_policy_from_paths(&paths))
-        .unwrap_or_default()
+struct StartupPolicy {
+    policy: EffectivePolicy,
+    diagnostic: Option<String>,
+}
+
+fn startup_policy_from_environment() -> StartupPolicy {
+    match StorePaths::from_environment() {
+        Ok(paths) => startup_policy_from_paths(&paths),
+        Err(error) => StartupPolicy::failed(error.to_string()),
+    }
+}
+
+fn startup_policy_from_paths(paths: &StorePaths) -> StartupPolicy {
+    match LocalStore::open(paths.clone()) {
+        Ok(store) => {
+            let loaded = store.load_config();
+            StartupPolicy {
+                policy: EffectivePolicy::new(&loaded.settings),
+                diagnostic: loaded.diagnostic.map(|diagnostic| diagnostic.to_string()),
+            }
+        }
+        Err(error) => StartupPolicy::failed(error.to_string()),
+    }
+}
+
+impl StartupPolicy {
+    fn failed(error: String) -> Self {
+        Self {
+            policy: EffectivePolicy::safe_fallback(),
+            diagnostic: Some(format!(
+                "configuration could not be loaded: {error}; using the safe fallback configuration"
+            )),
+        }
+    }
 }
 
 fn effective_policy_from_paths(paths: &StorePaths) -> Option<EffectivePolicy> {
@@ -7417,6 +7454,46 @@ mod tests {
             AuditDestination::Paths(unreadable_paths).load_policy(&restrictive_policy),
             restrictive_policy
         );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_policy_fails_closed_and_surfaces_malformed_config() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("invalid-startup-policy")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+
+        let startup = startup_policy_from_paths(&paths);
+
+        assert_eq!(startup.policy, EffectivePolicy::safe_fallback());
+        assert!(
+            startup
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("is invalid"))
+        );
+        let app = App::from_startup(startup);
+        assert!(app.details.contains("safe fallback configuration"));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_policy_fails_closed_and_surfaces_unreadable_config() -> Result<(), Box<dyn Error>> {
+        let paths = isolated_store_paths("unreadable-startup-policy")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::create_dir(&store.paths().config_file)?;
+
+        let startup = startup_policy_from_paths(&paths);
+
+        assert_eq!(startup.policy, EffectivePolicy::safe_fallback());
+        assert!(
+            startup
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("could not be read"))
+        );
+        let app = App::from_startup(startup);
+        assert!(app.details.contains("safe fallback configuration"));
         Ok(())
     }
 

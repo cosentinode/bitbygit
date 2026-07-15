@@ -74,8 +74,11 @@ documented default.
 Unknown keys, unknown operation names, unsupported schema versions, malformed
 branch names or patterns, and values that weaken confirmation defaults make the
 entire file invalid. An invalid or unreadable file produces a diagnostic with
-its path and safe error context, then `bitbygit` applies the complete default
-configuration. A missing file silently uses those defaults.
+its path and safe error context, then `bitbygit` applies a complete fail-closed
+fallback: every operation family is disabled, all confirmation levels are
+blocked, prompt input is disabled, and non-policy settings use their defaults.
+At runtime, a failed reload instead retains the last valid effective policy. A
+missing file silently uses the documented defaults above.
 
 Configuration diagnostics never retain the raw file or rejected values, and
 configuration contents are never written to operation audits. Credentials and

@@ -29,6 +29,10 @@ impl EffectivePolicy {
         }
     }
 
+    pub fn safe_fallback() -> Self {
+        Self::new(&AppConfig::safe_fallback())
+    }
+
     pub fn is_protected_branch(&self, branch: &str) -> bool {
         BUILT_IN_PROTECTED_BRANCHES
             .iter()
@@ -384,5 +388,41 @@ mod tests {
 
         config.prompt.enabled = false;
         assert!(!EffectivePolicy::new(&config).prompt_enabled());
+    }
+
+    #[test]
+    fn safe_fallback_blocks_every_operation_and_prompt() {
+        let policy = EffectivePolicy::safe_fallback();
+        let operations = [
+            OperationKind::RefreshStatus,
+            OperationKind::ViewDiff,
+            OperationKind::Fetch,
+            OperationKind::StagePaths,
+            OperationKind::StageAll,
+            OperationKind::UnstagePaths,
+            OperationKind::UnstageAll,
+            OperationKind::Commit,
+            OperationKind::PushCurrentBranch,
+            OperationKind::PushSetUpstream,
+            OperationKind::PullFastForward,
+            OperationKind::PullRebase,
+            OperationKind::Branches,
+            OperationKind::CheckoutBranch,
+            OperationKind::CreateBranch,
+            OperationKind::MergeFastForward,
+            OperationKind::Rebase,
+            OperationKind::OpenPullRequest,
+        ];
+
+        assert!(!policy.prompt_enabled());
+        for risk_level in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
+            assert_eq!(
+                policy.confirmation_requirement(risk_level),
+                ConfirmationRequirement::Blocked
+            );
+        }
+        for operation in operations {
+            assert!(policy.is_operation_disabled(operation), "{operation:?}");
+        }
     }
 }
