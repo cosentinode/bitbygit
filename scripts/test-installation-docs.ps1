@@ -82,10 +82,11 @@ if ([regex]::Matches($DocsText, [regex]::Escape($ApplicationResolution)).Count -
     Fail "Windows examples do not bypass aliases and functions or verify resolved path identity"
 }
 $RandomTempName = '[System.IO.Path]::GetRandomFileName()'
+$CleanupWarning = '[Console]::Error.WriteLine("Warning: failed to remove temporary directory'
 if ([regex]::Matches($DocsText, [regex]::Escape($RandomTempName)).Count -ne 2 -or
     [regex]::Matches($DocsText, 'finally \{').Count -ne 2 -or
     [regex]::Matches($DocsText, [regex]::Escape('Remove-Item -LiteralPath $WorkDir -Recurse -Force')).Count -ne 2 -or
-    [regex]::Matches($DocsText, [regex]::Escape('Warning: failed to remove temporary directory')).Count -ne 2) {
+    [regex]::Matches($DocsText, [regex]::Escape($CleanupWarning)).Count -ne 2) {
     Fail "Windows examples do not securely stage and clean up temporary work"
 }
 
