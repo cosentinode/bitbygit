@@ -85,6 +85,14 @@ impl EffectivePolicy {
             ));
         }
 
+        if self.is_operation_disabled(operation) {
+            requirement = ConfirmationRequirement::Blocked;
+            reasons.push(format!(
+                "{} is disabled by policy",
+                operation.action_label()
+            ));
+        }
+
         PolicyEvaluation {
             requirement,
             reasons,
@@ -353,6 +361,19 @@ mod tests {
 
             assert_eq!(operation_family(operation), family);
             assert!(policy.is_operation_disabled(operation), "{operation:?}");
+            let evaluation = policy.evaluate_confirmation(RiskLevel::Low, operation, None);
+            assert_eq!(
+                evaluation.requirement,
+                ConfirmationRequirement::Blocked,
+                "{operation:?}"
+            );
+            assert!(
+                evaluation
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("disabled by policy")),
+                "{operation:?}"
+            );
         }
     }
 

@@ -39,6 +39,10 @@ high = "explicit-confirmation"
 enabled = true
 ```
 
+Setting `prompt.enabled` to `false` rejects prompt submissions. It does not
+alter operation policy, and the prompt configuration has no command, shell, or
+hook extension points; enabled prompts still produce only built-in typed plans.
+
 Protected branch entries may be exact branch names or a prefix ending in `/*`,
 such as `stable/*`. They are additive: configuration cannot remove the built-in
 protected branch rules.

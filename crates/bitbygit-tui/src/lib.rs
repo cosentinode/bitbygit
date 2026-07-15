@@ -337,6 +337,13 @@ impl App {
     }
 
     fn refresh_status(&mut self) {
+        if self
+            .policy
+            .is_operation_disabled(OperationKind::RefreshStatus)
+        {
+            self.details = disabled_operation_message(OperationKind::RefreshStatus);
+            return;
+        }
         match Git::new(current_dir()).status() {
             Ok(status) => {
                 self.files = status
@@ -368,6 +375,10 @@ impl App {
     }
 
     fn refresh_diff(&mut self) {
+        if self.policy.is_operation_disabled(OperationKind::ViewDiff) {
+            self.details = disabled_operation_message(OperationKind::ViewDiff);
+            return;
+        }
         let Some(file) = self.files.get(self.selected_file) else {
             self.details = "No changed file selected.".to_owned();
             return;
@@ -396,9 +407,10 @@ impl App {
             return;
         }
         let pathspecs = file.pathspecs.clone();
-        self.submit_prepared_operation(
-            OperationPlanner::current(self.policy.clone()).plan_stage_pathspecs(pathspecs),
-        );
+        match OperationPlanner::current(self.policy.clone()).plan_stage_pathspecs(pathspecs) {
+            Ok(operation) => self.submit_prepared_operation(operation),
+            Err(error) => self.details = error,
+        }
     }
 
     fn unstage_selected_file(&mut self) {
@@ -410,9 +422,10 @@ impl App {
             return;
         }
         let pathspecs = file.pathspecs.clone();
-        self.submit_prepared_operation(
-            OperationPlanner::current(self.policy.clone()).plan_unstage_pathspecs(pathspecs),
-        );
+        match OperationPlanner::current(self.policy.clone()).plan_unstage_pathspecs(pathspecs) {
+            Ok(operation) => self.submit_prepared_operation(operation),
+            Err(error) => self.details = error,
+        }
     }
 
     fn submit_operation_request(&mut self, request: OperationRequest) {
@@ -473,6 +486,10 @@ impl App {
     }
 
     fn submit_prompt(&mut self) {
+        if !self.policy.prompt_enabled() {
+            self.details = "Prompt input is disabled by policy.".to_owned();
+            return;
+        }
         let parsed = match parse_prompt(&self.prompt) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1327,6 +1344,36 @@ fn compare_url_ref(reference: &str) -> String {
     encoded
 }
 
+fn disabled_operation_message(operation: OperationKind) -> String {
+    format!(
+        "Operation blocked: {} is disabled by policy.",
+        operation.action_label()
+    )
+}
+
+fn operation_request_kind(request: &OperationRequest) -> Option<OperationKind> {
+    match request {
+        OperationRequest::RefreshStatus => Some(OperationKind::RefreshStatus),
+        OperationRequest::ViewDiff { .. } => Some(OperationKind::ViewDiff),
+        OperationRequest::Fetch => Some(OperationKind::Fetch),
+        OperationRequest::StagePaths { .. } => Some(OperationKind::StagePaths),
+        OperationRequest::UnstagePaths { .. } => Some(OperationKind::UnstagePaths),
+        OperationRequest::StageAll => Some(OperationKind::StageAll),
+        OperationRequest::UnstageAll => Some(OperationKind::UnstageAll),
+        OperationRequest::Commit { .. } => Some(OperationKind::Commit),
+        OperationRequest::Push => Some(OperationKind::PushCurrentBranch),
+        OperationRequest::Pull { rebase: false } => Some(OperationKind::PullFastForward),
+        OperationRequest::Pull { rebase: true } => Some(OperationKind::PullRebase),
+        OperationRequest::Branches => Some(OperationKind::Branches),
+        OperationRequest::Checkout { .. } => Some(OperationKind::CheckoutBranch),
+        OperationRequest::CreateBranch { .. } => Some(OperationKind::CreateBranch),
+        OperationRequest::Merge { .. } => Some(OperationKind::MergeFastForward),
+        OperationRequest::Rebase { .. } => Some(OperationKind::Rebase),
+        OperationRequest::OpenPullRequest { .. } => Some(OperationKind::OpenPullRequest),
+        OperationRequest::PromptSequence { .. } => None,
+    }
+}
+
 fn apply_policy_to_plan(policy: &EffectivePolicy, plan: &mut OperationPlan, branch: Option<&str>) {
     let evaluation = evaluate_plan_policy(policy, plan, branch);
     apply_policy_evaluation(plan, evaluation);
@@ -1861,6 +1908,9 @@ impl OperationPlanner {
     }
 
     fn plan_request(&self, request: OperationRequest) -> Result<PreparedOperation, String> {
+        if let Some(operation) = operation_request_kind(&request) {
+            self.ensure_operation_enabled(operation)?;
+        }
         if let Some(operation) = self.preflight_blocked_request(&request)? {
             return Ok(operation);
         }
@@ -1953,9 +2003,13 @@ impl OperationPlanner {
             return Err("Prompt sequence requires at least two steps.".to_owned());
         }
         for (index, request) in requests.iter().enumerate() {
-            prompt_sequence_request_preview(request).map_err(|error| {
+            let preview = prompt_sequence_request_preview(request).map_err(|error| {
                 format!("Prompt sequence step {} is blocked: {error}", index + 1)
             })?;
+            self.ensure_operation_enabled(preview.kind)
+                .map_err(|error| {
+                    format!("Prompt sequence step {} is blocked: {error}", index + 1)
+                })?;
         }
         let first_request = requests
             .first()
@@ -1994,18 +2048,28 @@ impl OperationPlanner {
         ))
     }
 
-    fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
-        self.apply_policy(PreparedOperation::new(
+    fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> Result<PreparedOperation, String> {
+        self.ensure_operation_enabled(OperationKind::StagePaths)?;
+        Ok(self.apply_policy(PreparedOperation::new(
             stage_paths_plan(file_path_labels(&paths)),
             ExecutionContext::from_payload(PendingPayload::StagePaths { paths }),
-        ))
+        )))
     }
 
-    fn plan_unstage_pathspecs(&self, paths: Vec<PathBuf>) -> PreparedOperation {
-        self.apply_policy(PreparedOperation::new(
+    fn plan_unstage_pathspecs(&self, paths: Vec<PathBuf>) -> Result<PreparedOperation, String> {
+        self.ensure_operation_enabled(OperationKind::UnstagePaths)?;
+        Ok(self.apply_policy(PreparedOperation::new(
             unstage_paths_plan(file_path_labels(&paths)),
             ExecutionContext::from_payload(PendingPayload::UnstagePaths { paths }),
-        ))
+        )))
+    }
+
+    fn ensure_operation_enabled(&self, operation: OperationKind) -> Result<(), String> {
+        if self.policy.is_operation_disabled(operation) {
+            Err(disabled_operation_message(operation))
+        } else {
+            Ok(())
+        }
     }
 
     fn apply_policy(&self, mut operation: PreparedOperation) -> PreparedOperation {
@@ -3176,6 +3240,13 @@ impl PlanExecutor {
         plan: &OperationPlan,
         context: &ExecutionContext,
     ) -> Result<(), String> {
+        if let Some(step) = plan
+            .steps
+            .iter()
+            .find(|step| self.policy.is_operation_disabled(step.kind))
+        {
+            return Err(disabled_operation_message(step.kind));
+        }
         if plan.confirmation.requirement == ConfirmationRequirement::Blocked {
             return Err("operation is blocked by the policy captured in the preview".to_owned());
         }
@@ -4624,7 +4695,7 @@ fn sanitized_github_error(error: &GhError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitbygit_core::config::{AppConfig, ConfirmationSetting};
+    use bitbygit_core::config::{AppConfig, ConfirmationSetting, OperationFamily};
     use crossterm::event::{KeyModifiers, MouseEvent};
     use ratatui::backend::TestBackend;
 
@@ -4791,6 +4862,33 @@ mod tests {
 
         app.submit_prompt();
 
+        assert!(app.details.contains("Raw Git commands are not supported"));
+        assert_eq!(app.operation_queue.pending(), None);
+    }
+
+    #[test]
+    fn disabled_prompt_cannot_bypass_operation_policy_or_parse_raw_commands() {
+        let mut config = AppConfig::default();
+        config.prompt.enabled = false;
+        config.policy.disabled_operations = vec![OperationFamily::Fetch];
+        let mut app = App::with_policy(EffectivePolicy::new(&config));
+        app.focus = Focus::Prompt;
+        app.prompt = "fetch".to_owned();
+
+        app.submit_prompt();
+
+        assert_eq!(app.details, "Prompt input is disabled by policy.");
+        assert_eq!(app.prompt, "fetch");
+        assert_eq!(app.operation_queue.pending(), None);
+
+        config.prompt.enabled = true;
+        app.policy = EffectivePolicy::new(&config);
+        app.submit_prompt();
+        assert!(app.details.contains("fetch is disabled by policy"));
+        assert_eq!(app.operation_queue.pending(), None);
+
+        app.prompt = "git fetch".to_owned();
+        app.submit_prompt();
         assert!(app.details.contains("Raw Git commands are not supported"));
         assert_eq!(app.operation_queue.pending(), None);
     }
@@ -6505,6 +6603,81 @@ mod tests {
     }
 
     #[test]
+    fn disabled_pull_family_rejects_both_variants_before_fetching() -> Result<(), Box<dyn Error>> {
+        for (name, rebase) in [("fast-forward", false), ("rebase", true)] {
+            let (repo, branch, original_tracking_oid) =
+                stale_pull_tracking_repo(&format!("disabled-pull-{name}"))?;
+            let mut config = AppConfig::default();
+            config.policy.disabled_operations = vec![OperationFamily::Pull];
+            let planner = OperationPlanner {
+                repo_root: repo.clone(),
+                github_executable: None,
+                policy: EffectivePolicy::new(&config),
+                ssh_executable: Some(test_ssh_command()?),
+            };
+
+            let error = match planner.plan_request(OperationRequest::Pull { rebase }) {
+                Ok(_operation) => {
+                    return Err(std::io::Error::other("disabled pull must be rejected").into());
+                }
+                Err(error) => error,
+            };
+
+            assert!(error.contains("pull"), "{error}");
+            assert!(error.contains("disabled by policy"), "{error}");
+            assert_eq!(
+                git_stdout(
+                    &repo,
+                    &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+                )?
+                .trim(),
+                original_tracking_oid
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_later_sequence_step_preflights_before_first_step_planning()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, branch, original_tracking_oid) =
+            stale_pull_tracking_repo("disabled-later-sequence-step")?;
+        let mut config = AppConfig::default();
+        config.policy.disabled_operations = vec![OperationFamily::Branches];
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: None,
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let error = match planner.plan_prompt_sequence(vec![
+            OperationRequest::Pull { rebase: false },
+            OperationRequest::Branches,
+        ]) {
+            Ok(_sequence) => {
+                return Err(std::io::Error::other(
+                    "disabled later step must reject the whole sequence",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains("step 2"), "{error}");
+        assert!(error.contains("disabled by policy"), "{error}");
+        assert_eq!(
+            git_stdout(
+                &repo,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )?
+            .trim(),
+            original_tracking_oid
+        );
+        Ok(())
+    }
+
+    #[test]
     fn allowed_pull_publishes_staged_tracking_ref_only_during_execution()
     -> Result<(), Box<dyn Error>> {
         let (repo, branch, original_tracking_oid) = stale_pull_tracking_repo("allowed-pull")?;
@@ -7053,6 +7226,38 @@ mod tests {
     }
 
     #[test]
+    fn executor_rejects_disabled_steps_without_side_effects() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("disabled-execution")?;
+        std::fs::write(repo.join("file.txt"), "unstaged\n")?;
+        let mut config = AppConfig::default();
+        config.policy.disabled_operations = vec![OperationFamily::Stage];
+        let executor = PlanExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(isolated_store_paths("disabled-execution-audit")?),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: None,
+        };
+
+        let result = executor.execute(
+            &stage_all_plan(),
+            ExecutionContext::from_payload(PendingPayload::StageAll),
+        );
+
+        assert!(!result.succeeded());
+        assert!(
+            result.message().contains("stage all is disabled by policy"),
+            "{}",
+            result.message()
+        );
+        assert!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"])?
+                .trim()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ordinary_queue_rejects_new_protected_reason_without_requirement_change() {
         let target = HeadTarget {
             oid: Some("1234567890abcdef".to_owned()),
@@ -7149,6 +7354,62 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("new sequence preview"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_prompt_step_stops_when_operation_is_disabled_during_sequence()
+    -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("deferred-disabled-operation")?;
+        let remote = isolated_bare_git_repo("deferred-disabled-operation-remote")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("base.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "base.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        std::fs::write(repo.join("next.txt"), "next\n")?;
+        git_stdout(&repo, &["add", "next.txt"])?;
+        add_github_remote(&repo, "origin", &remote)?;
+        let original_head = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let sequence = OperationPlanner::new(&repo)
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Commit {
+                    message: "next".to_owned(),
+                },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("deferred-disabled-operation-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        let ssh = operation_disabling_ssh(
+            "deferred-disabled-operation",
+            &store.paths().config_file,
+            "commit",
+        )?;
+        let executor = PromptSequenceExecutor {
+            repo_root: repo.clone(),
+            audit: AuditDestination::Paths(paths),
+            github_executable: None,
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh),
+        };
+
+        let result =
+            executor.execute_confirmed(sequence.sequence, ConfirmationRequirement::VisiblePlan);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 2."),
+            "{message}"
+        );
+        assert!(
+            message.contains("commit is disabled by policy"),
+            "{message}"
+        );
+        assert_eq!(git_stdout(&repo, &["rev-parse", "HEAD"])?, original_head);
+        assert_eq!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"])?.trim(),
+            "next.txt"
+        );
         Ok(())
     }
 
@@ -8162,6 +8423,31 @@ mod tests {
             &executable,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' 'schema-version = 1' '[policy.confirmation]' '{risk} = \"{setting}\"' > '{}'\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\nexec git-upload-pack \"$target\"\n",
+                config_file.display()
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&executable)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions)?;
+        }
+        Ok(executable)
+    }
+
+    fn operation_disabling_ssh(
+        name: &str,
+        config_file: &std::path::Path,
+        operation: &str,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let root = isolated_temp_root(&format!("{name}-ssh"))?;
+        std::fs::create_dir_all(&root)?;
+        let executable = root.join("ssh");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'schema-version = 1' '[policy]' 'disabled-operations = [\"{operation}\"]' > '{}'\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\nexec git-upload-pack \"$target\"\n",
                 config_file.display()
             ),
         )?;

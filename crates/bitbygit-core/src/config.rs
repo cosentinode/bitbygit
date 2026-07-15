@@ -322,6 +322,7 @@ enabled = false
         assert!(!format!("{error:?}").contains("super-secret-value"));
 
         assert!(AppConfig::parse("[policy]\ndisabled-operations = [\"force-push\"]").is_err());
+        assert!(AppConfig::parse("[prompt]\ncommand = \"git status\"").is_err());
         Ok(())
     }
 
