@@ -44,6 +44,15 @@ TARGET=x86_64-unknown-linux-gnu
 ARCHIVE="bitbygit-${VERSION}-${TARGET}.tar.gz"
 PACKAGE="bitbygit-${VERSION}-${TARGET}"
 BASE_URL="https://github.com/cosentinode/bitbygit/releases/download/v${VERSION}"
+WORK_DIR="$(mktemp -d)"
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf -- "${WORK_DIR}"
+  exit "${status}"
+}
+trap cleanup EXIT
+cd "${WORK_DIR}"
 
 curl -fLO "${BASE_URL}/${ARCHIVE}"
 curl -fLO "${BASE_URL}/SHA256SUMS"
@@ -88,6 +97,15 @@ esac
 ARCHIVE="bitbygit-${VERSION}-${TARGET}.tar.gz"
 PACKAGE="bitbygit-${VERSION}-${TARGET}"
 BASE_URL="https://github.com/cosentinode/bitbygit/releases/download/v${VERSION}"
+WORK_DIR="$(mktemp -d)"
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf -- "${WORK_DIR}"
+  exit "${status}"
+}
+trap cleanup EXIT
+cd "${WORK_DIR}"
 
 curl -fLO "${BASE_URL}/${ARCHIVE}"
 curl -fLO "${BASE_URL}/SHA256SUMS"
@@ -127,19 +145,23 @@ $Target = "x86_64-pc-windows-msvc"
 $Archive = "bitbygit-$Version-$Target.zip"
 $Package = "bitbygit-$Version-$Target"
 $BaseUrl = "https://github.com/cosentinode/bitbygit/releases/download/v$Version"
+$WorkDir = (New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName()))).FullName
 
-Invoke-WebRequest -Uri "$BaseUrl/$Archive" -OutFile $Archive
-Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS" -OutFile SHA256SUMS
-$ExpectedLine = Get-Content SHA256SUMS | Where-Object { $_.EndsWith("  $Archive") }
+try {
+$ArchivePath = Join-Path $WorkDir $Archive
+$ChecksumsPath = Join-Path $WorkDir "SHA256SUMS"
+Invoke-WebRequest -Uri "$BaseUrl/$Archive" -OutFile $ArchivePath
+Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS" -OutFile $ChecksumsPath
+$ExpectedLine = Get-Content $ChecksumsPath | Where-Object { $_.EndsWith("  $Archive") }
 if (-not $ExpectedLine) { throw "No checksum found for $Archive" }
 $Expected = ($ExpectedLine -split '\s+')[0]
-$Actual = (Get-FileHash -Algorithm SHA256 $Archive).Hash
+$Actual = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash
 if ($Actual -ne $Expected) { throw "Checksum verification failed for $Archive" }
-Expand-Archive -Path $Archive -DestinationPath .
+Expand-Archive -Path $ArchivePath -DestinationPath $WorkDir
 
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item "$Package\bitbygit.exe" $InstallDir
+Copy-Item (Join-Path $WorkDir "$Package\bitbygit.exe") $InstallDir
 $InstalledBinary = Join-Path $InstallDir "bitbygit.exe"
 $Output = & $InstalledBinary --version
 if ($LASTEXITCODE -ne 0 -or $Output -ne "bitbygit $Version") {
@@ -170,6 +192,9 @@ if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version on PATH, got $PathOutput"
 }
 bitbygit --version
+} finally {
+    Remove-Item -LiteralPath $WorkDir -Recurse -Force
+}
 }
 ```
 
@@ -209,22 +234,31 @@ On Linux or macOS, run:
 VERSION=0.1.0
 VERSION="${VERSION}" bash -euo pipefail <<'BITBYGIT_INSTALL' &&
 TAG="refs/tags/v${VERSION}"
-mkdir bitbygit
-git -C bitbygit init
-git -C bitbygit fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${TAG}:${TAG}"
-tag_commit="$(git -C bitbygit rev-parse --verify "${TAG}^{commit}")"
-git -C bitbygit checkout --detach "${tag_commit}"
-[[ "$(git -C bitbygit rev-parse --verify HEAD)" == "${tag_commit}" ]]
-cd bitbygit
-cargo build --locked --release -p bitbygit
-built_output="$(target/release/bitbygit --version)"
+WORK_DIR="$(mktemp -d)"
+SOURCE_DIR="${WORK_DIR}/bitbygit"
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf -- "${WORK_DIR}"
+  exit "${status}"
+}
+trap cleanup EXIT
+
+mkdir "${SOURCE_DIR}"
+git -C "${SOURCE_DIR}" init
+git -C "${SOURCE_DIR}" fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${TAG}:${TAG}"
+tag_commit="$(git -C "${SOURCE_DIR}" rev-parse --verify "${TAG}^{commit}")"
+git -C "${SOURCE_DIR}" checkout --detach "${tag_commit}"
+[[ "$(git -C "${SOURCE_DIR}" rev-parse --verify HEAD)" == "${tag_commit}" ]]
+cargo build --manifest-path "${SOURCE_DIR}/Cargo.toml" --locked --release -p bitbygit
+built_output="$("${SOURCE_DIR}/target/release/bitbygit" --version)"
 if [[ "${built_output}" != "bitbygit ${VERSION}" ]]; then
   printf 'Expected bitbygit %s, got %s\n' "${VERSION}" "${built_output}" >&2
   exit 1
 fi
 
 mkdir -p "${HOME}/.local/bin"
-install -m 0755 target/release/bitbygit "${HOME}/.local/bin/bitbygit"
+install -m 0755 "${SOURCE_DIR}/target/release/bitbygit" "${HOME}/.local/bin/bitbygit"
 installed_output="$("${HOME}/.local/bin/bitbygit" --version)"
 if [[ "${installed_output}" != "bitbygit ${VERSION}" ]]; then
   printf 'Expected bitbygit %s, got %s\n' "${VERSION}" "${installed_output}" >&2
@@ -248,7 +282,10 @@ $ErrorActionPreference = "Stop"
 
 $Version = "0.1.0"
 $Tag = "refs/tags/v$Version"
-$SourceDir = Join-Path (Get-Location) "bitbygit"
+$WorkDir = (New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName()))).FullName
+$SourceDir = Join-Path $WorkDir "bitbygit"
+
+try {
 New-Item -ItemType Directory -Path $SourceDir | Out-Null
 git -C $SourceDir init
 if ($LASTEXITCODE -ne 0) { throw "git init failed" }
@@ -301,6 +338,9 @@ if ($LASTEXITCODE -ne 0 -or $PathOutput -ne "bitbygit $Version") {
     throw "Expected bitbygit $Version on PATH, got $PathOutput"
 }
 bitbygit --version
+} finally {
+    Remove-Item -LiteralPath $WorkDir -Recurse -Force
+}
 }
 ```
 

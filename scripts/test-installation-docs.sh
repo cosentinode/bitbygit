@@ -116,7 +116,14 @@ check_unix_success() {
   local target="$2"
   local machine="$3"
   local case_dir="${tmp}/success-${target}"
-  mkdir -p "${case_dir}/home"
+  local archive="bitbygit-${selected_version}-${target}.tar.gz"
+  local package="bitbygit-${selected_version}-${target}"
+  mkdir -p "${case_dir}/home" "${case_dir}/temp" "${case_dir}/protected-package"
+  printf 'protected\n' > "${case_dir}/protected-file"
+  printf 'protected\n' > "${case_dir}/protected-package/marker"
+  ln -s protected-file "${case_dir}/${archive}"
+  ln -s protected-file "${case_dir}/SHA256SUMS"
+  ln -s protected-package "${case_dir}/${package}"
   extract_selected_block "${heading}" bash > "${case_dir}/snippet.bash"
   [[ -s "${case_dir}/snippet.bash" ]] || fail "missing ${heading} Bash block"
 
@@ -126,11 +133,15 @@ check_unix_success() {
     set +u
     set +o pipefail
     export HOME="${case_dir}/home"
+    export TMPDIR="${case_dir}/temp"
     export MOCK_DOWNLOAD_DIR="${tmp}/assets"
     export MOCK_UNAME_MACHINE="${machine}"
     export PATH="${tmp}/mock-bin:${PATH}"
+    starting_dir="${PWD}"
 
     source "${case_dir}/snippet.bash" || fail "${heading} failed a valid ${target} installation"
+    source "${case_dir}/snippet.bash" || fail "${heading} failed when retried"
+    [[ "${PWD}" == "${starting_dir}" ]] || fail "${heading} changed the caller working directory"
     [[ "$-" != *e* && "$-" != *u* ]] || fail "${heading} changed caller shell options"
     if shopt -qo pipefail; then
       fail "${heading} enabled pipefail in the caller shell"
@@ -140,7 +151,15 @@ check_unix_success() {
     [[ "$("${HOME}/.local/bin/bitbygit" --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} installed the wrong version"
     [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "${heading} did not resolve the installed command through PATH"
     [[ "$(bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "${heading} resolved the wrong version through PATH"
+    if compgen -G "${TMPDIR}/*" >/dev/null; then
+      fail "${heading} left temporary installation files behind"
+    fi
   )
+  [[ -L "${case_dir}/${archive}" && "$(readlink "${case_dir}/${archive}")" == protected-file ]] || fail "${heading} replaced the pre-existing archive symlink"
+  [[ -L "${case_dir}/SHA256SUMS" && "$(readlink "${case_dir}/SHA256SUMS")" == protected-file ]] || fail "${heading} replaced the pre-existing checksum symlink"
+  [[ -L "${case_dir}/${package}" && "$(readlink "${case_dir}/${package}")" == protected-package ]] || fail "${heading} replaced the pre-existing package symlink"
+  [[ "$(<"${case_dir}/protected-file")" == protected ]] || fail "${heading} modified a symlink target"
+  [[ "$(<"${case_dir}/protected-package/marker")" == protected ]] || fail "${heading} extracted through a package symlink"
 }
 
 host_os="${INSTALLATION_DOCS_TEST_OS:-$(uname -s)}"
@@ -175,7 +194,7 @@ done
 chmod +x "${tmp}/failure-bin/"*
 
 failure_dir="${tmp}/failure-${failure_target}"
-mkdir -p "${failure_dir}/home"
+mkdir -p "${failure_dir}/home" "${failure_dir}/temp"
 extract_selected_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
 (
   cd "${failure_dir}"
@@ -184,6 +203,7 @@ extract_selected_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
   set +o pipefail
   original_path="${tmp}/failure-bin:${PATH}"
   export HOME="${failure_dir}/home"
+  export TMPDIR="${failure_dir}/temp"
   export MOCK_DOWNLOAD_DIR="${tmp}/failure-assets"
   export MOCK_SIDE_EFFECTS="${failure_dir}/side-effects"
   export MOCK_UNAME_MACHINE="${failure_machine}"
@@ -196,11 +216,14 @@ extract_selected_block "${failure_heading}" bash > "${failure_dir}/snippet.bash"
     fail "failed ${failure_heading} enabled pipefail in the caller shell"
   fi
   [[ "${PATH}" == "${original_path}" ]] || fail "failed ${failure_heading} changed the caller PATH"
+  if compgen -G "${TMPDIR}/*" >/dev/null; then
+    fail "failed ${failure_heading} left temporary installation files behind"
+  fi
 )
 [[ ! -e "${failure_dir}/side-effects" ]] || fail "${failure_heading} extracted or installed after checksum failure"
 
-[[ "${docs_text}" == *'git -C bitbygit fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${TAG}:${TAG}"'* ]] || fail "Bash source build does not fetch the exact selected tag"
-[[ "${docs_text}" == *'git -C bitbygit checkout --detach "${tag_commit}"'* ]] || fail "Bash source build does not detach at the selected tag"
+[[ "${docs_text}" == *'git -C "${SOURCE_DIR}" fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${TAG}:${TAG}"'* ]] || fail "Bash source build does not fetch the exact selected tag"
+[[ "${docs_text}" == *'git -C "${SOURCE_DIR}" checkout --detach "${tag_commit}"'* ]] || fail "Bash source build does not detach at the selected tag"
 [[ "${docs_text}" == *'git -C $SourceDir fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${Tag}:${Tag}"'* ]] || fail "PowerShell source build does not fetch the exact selected tag"
 [[ "${docs_text}" == *'git -C $SourceDir checkout --detach $TagCommit'* ]] || fail "PowerShell source build does not detach at the selected tag"
 [[ "${docs_text}" == *'"${HOME}/.local/bin/bitbygit" --version'* ]] || fail "Unix installation does not validate the installed path"
@@ -228,9 +251,14 @@ git -C "${source_seed}" push --quiet "${source_remote}" \
   "refs/tags/v${selected_version}:refs/tags/v${selected_version}"
 
 source_dir="${tmp}/source-install"
-mkdir -p "${source_dir}/home" "${source_dir}/mock-bin"
+mkdir -p "${source_dir}/home" "${source_dir}/mock-bin" "${source_dir}/temp" "${source_dir}/protected-source"
+printf 'protected\n' > "${source_dir}/protected-source/marker"
+ln -s protected-source "${source_dir}/bitbygit"
 cat > "${source_dir}/mock-bin/cargo" <<'MOCK'
 #!/usr/bin/env sh
+if [ "${MOCK_CARGO_FAILURE:-0}" = 1 ]; then
+  exit 1
+fi
 exit 0
 MOCK
 cp "${tmp}/mock-bin/bitbygit" "${source_dir}/mock-bin/bitbygit"
@@ -241,15 +269,32 @@ printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
 (
   cd "${source_dir}"
   export HOME="${source_dir}/home"
+  export TMPDIR="${source_dir}/temp"
   export PATH="${source_dir}/mock-bin:${PATH}"
-  source "${source_dir}/snippet.bash" || fail "Bash source block failed with colliding branch and tag names"
-  tag_commit="$(git --git-dir="${source_remote}" rev-parse "refs/tags/v${selected_version}^{commit}")"
-  branch_commit="$(git --git-dir="${source_remote}" rev-parse "refs/heads/v${selected_version}")"
-  head_commit="$(git -C bitbygit rev-parse HEAD)"
-  [[ "${head_commit}" == "${tag_commit}" && "${head_commit}" != "${branch_commit}" ]] || fail "Bash source block did not check out the exact tag object"
+  starting_dir="${PWD}"
+  original_path="${PATH}"
+  export MOCK_CARGO_FAILURE=1
+  if source "${source_dir}/snippet.bash"; then
+    fail "Bash source block continued after a failed build"
+  fi
+  [[ "${PWD}" == "${starting_dir}" ]] || fail "failed Bash source block changed the caller working directory"
+  [[ "${PATH}" == "${original_path}" ]] || fail "failed Bash source block changed the caller PATH"
+  if compgen -G "${TMPDIR}/*" >/dev/null; then
+    fail "failed Bash source block left temporary build files behind"
+  fi
+
+  export MOCK_CARGO_FAILURE=0
+  source "${source_dir}/snippet.bash" || fail "Bash source block could not retry a failed build"
+  source "${source_dir}/snippet.bash" || fail "Bash source block failed when retried"
+  [[ "${PWD}" == "${starting_dir}" ]] || fail "Bash source block changed the caller working directory"
   [[ "$(command -v bitbygit)" == "${HOME}/.local/bin/bitbygit" ]] || fail "Bash source block did not resolve the installed command through PATH"
   [[ "$(bitbygit --version)" == "bitbygit ${selected_version}" ]] || fail "Bash source block resolved the wrong version through PATH"
+  if compgen -G "${TMPDIR}/*" >/dev/null; then
+    fail "Bash source block left temporary build files behind"
+  fi
 )
+[[ -L "${source_dir}/bitbygit" && "$(readlink "${source_dir}/bitbygit")" == protected-source ]] || fail "Bash source block replaced a pre-existing source symlink"
+[[ "$(<"${source_dir}/protected-source/marker")" == protected ]] || fail "Bash source block wrote through a pre-existing source symlink"
 
 check_links() {
   local markdown="$1"

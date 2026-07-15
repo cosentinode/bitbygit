@@ -76,6 +76,12 @@ if ([regex]::Matches($DocsText, [regex]::Escape($MachinePathLookup)).Count -ne 2
 if ([regex]::Matches($DocsText, '(?m)^bitbygit --version\r?$').Count -ne 2) {
     Fail "Windows examples do not finish with PATH-resolved version output"
 }
+$RandomTempName = '[System.IO.Path]::GetRandomFileName()'
+if ([regex]::Matches($DocsText, [regex]::Escape($RandomTempName)).Count -ne 2 -or
+    [regex]::Matches($DocsText, 'finally \{').Count -ne 2 -or
+    [regex]::Matches($DocsText, [regex]::Escape('Remove-Item -LiteralPath $WorkDir -Recurse -Force')).Count -ne 2) {
+    Fail "Windows examples do not securely stage and clean up temporary work"
+}
 
 foreach ($Match in [regex]::Matches($DocsText, '(?ms)^```powershell\r?\n(.*?)^```')) {
     $Tokens = $null
@@ -109,6 +115,8 @@ if (-not $SourceBlock.Contains('git -C $SourceDir fetch --depth 1 https://github
 New-Item -ItemType Directory -Path $Temp | Out-Null
 $OriginalLocalAppData = $env:LOCALAPPDATA
 $OriginalProcessPath = $env:Path
+$OriginalTemp = $env:TEMP
+$OriginalTmp = $env:TMP
 
 try {
     cargo build --locked --release -p bitbygit
@@ -141,10 +149,20 @@ try {
     Set-Content -Path (Join-Path $Assets "SHA256SUMS") -Value "$Digest  $Archive"
 
     $SuccessDir = Join-Path $Temp "success"
-    New-Item -ItemType Directory -Path $SuccessDir | Out-Null
+    $SuccessTemp = Join-Path $SuccessDir "temp"
+    $ProtectedPackage = Join-Path $SuccessDir "protected-package"
+    New-Item -ItemType Directory -Path $SuccessDir, $SuccessTemp, $ProtectedPackage | Out-Null
+    $ProtectedFile = Join-Path $SuccessDir "protected-file"
+    Set-Content -Path $ProtectedFile -Value "protected"
+    Set-Content -Path (Join-Path $ProtectedPackage "marker") -Value "protected"
+    New-Item -ItemType SymbolicLink -Path (Join-Path $SuccessDir $Archive) -Target $ProtectedFile | Out-Null
+    New-Item -ItemType SymbolicLink -Path (Join-Path $SuccessDir "SHA256SUMS") -Target $ProtectedFile | Out-Null
+    New-Item -ItemType SymbolicLink -Path (Join-Path $SuccessDir $Package) -Target $ProtectedPackage | Out-Null
     $SuccessScript = Join-Path $SuccessDir "install.ps1"
     Set-Content -Path $SuccessScript -Value $InstallBlock
     $env:LOCALAPPDATA = Join-Path $SuccessDir "local-app-data"
+    $env:TEMP = $SuccessTemp
+    $env:TMP = $SuccessTemp
     $env:Path = $null
     Remove-Item Env:BITBYGIT_TEST_USER_PATH -ErrorAction SilentlyContinue
     $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
@@ -159,9 +177,28 @@ try {
 
     Push-Location $SuccessDir
     try {
-        . $SuccessScript
+        $StartingLocation = (Get-Location).Path
+        foreach ($Attempt in 1..2) {
+            . $SuccessScript
+            if ((Get-Location).Path -ne $StartingLocation) {
+                Fail "archive block changed the caller working directory"
+            }
+            if ((Get-ChildItem -Force $SuccessTemp).Count -ne 0) {
+                Fail "archive block left temporary installation files behind"
+            }
+        }
     } finally {
         Pop-Location
+    }
+
+    if ((Get-Item -Force (Join-Path $SuccessDir $Archive)).LinkType -ne "SymbolicLink" -or
+        (Get-Item -Force (Join-Path $SuccessDir "SHA256SUMS")).LinkType -ne "SymbolicLink" -or
+        (Get-Item -Force (Join-Path $SuccessDir $Package)).LinkType -ne "SymbolicLink") {
+        Fail "archive block replaced a pre-existing working-directory symlink"
+    }
+    if ((Get-Content $ProtectedFile) -ne "protected" -or
+        (Get-Content (Join-Path $ProtectedPackage "marker")) -ne "protected") {
+        Fail "archive block modified a pre-existing working-directory symlink target"
     }
 
     $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
@@ -190,7 +227,11 @@ try {
     Copy-Item $WorkspaceBinary (Join-Path $MachineOldBinaryDir "bitbygit.exe")
     $MachineConflictScript = Join-Path $MachineConflictDir "install.ps1"
     Set-Content -Path $MachineConflictScript -Value $InstallBlock
+    $MachineConflictTemp = Join-Path $MachineConflictDir "temp"
+    New-Item -ItemType Directory -Path $MachineConflictTemp | Out-Null
     $env:LOCALAPPDATA = Join-Path $MachineConflictDir "local-app-data"
+    $env:TEMP = $MachineConflictTemp
+    $env:TMP = $MachineConflictTemp
     $env:Path = "$MachineOldBinaryDir;$OriginalProcessPath"
     $env:BITBYGIT_TEST_MACHINE_PATH = $MachineOldBinaryDir
     Remove-Item Env:BITBYGIT_TEST_USER_PATH -ErrorAction SilentlyContinue
@@ -213,6 +254,7 @@ try {
         Pop-Location
     }
     if (-not $MachineConflictFailed) { Fail "archive block did not reject machine-level PATH shadowing" }
+    if ((Get-ChildItem -Force $MachineConflictTemp).Count -ne 0) { Fail "failed archive block left temporary installation files behind" }
     if ($null -ne $CapturedUserPath) { Fail "machine-level conflict changed persistent user PATH" }
     if ($env:Path -ne $MachineConflictStartingPath) { Fail "machine-level conflict changed process PATH" }
     $ConflictInstalledBinary = Join-Path $env:LOCALAPPDATA "Programs\bitbygit\bitbygit.exe"
@@ -220,15 +262,32 @@ try {
     if ($LASTEXITCODE -ne 0 -or $ConflictOutput -ne "bitbygit $SelectedVersion") {
         Fail "machine-level conflict did not leave the selected binary available by explicit path"
     }
+    $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
+    Push-Location $MachineConflictDir
+    try {
+        $StartingLocation = (Get-Location).Path
+        . $MachineConflictScript
+        if ((Get-Location).Path -ne $StartingLocation) { Fail "retried archive block changed the caller working directory" }
+    } finally {
+        Pop-Location
+    }
+    if ((Get-ChildItem -Force $MachineConflictTemp).Count -ne 0) { Fail "retried archive block left temporary installation files behind" }
+    $ConflictRetryOutput = bitbygit --version
+    if ($LASTEXITCODE -ne 0 -or $ConflictRetryOutput -ne "bitbygit $SelectedVersion") {
+        Fail "archive block could not retry after removing a machine-level conflict"
+    }
 
     $FailureAssets = Join-Path $Temp "failure-assets"
     $FailureDir = Join-Path $Temp "failure"
-    New-Item -ItemType Directory -Path $FailureAssets, $FailureDir | Out-Null
+    $FailureTemp = Join-Path $FailureDir "temp"
+    New-Item -ItemType Directory -Path $FailureAssets, $FailureDir, $FailureTemp | Out-Null
     Copy-Item (Join-Path $Assets $Archive) $FailureAssets
     Set-Content -Path (Join-Path $FailureAssets "SHA256SUMS") -Value "$('0' * 64)  $Archive"
     $FailureScript = Join-Path $FailureDir "install.ps1"
     Set-Content -Path $FailureScript -Value $InstallBlock
     $env:LOCALAPPDATA = Join-Path $FailureDir "local-app-data"
+    $env:TEMP = $FailureTemp
+    $env:TMP = $FailureTemp
     $env:Path = $OriginalProcessPath
     $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
     $env:MOCK_DOWNLOAD_DIR = $FailureAssets
@@ -253,6 +312,7 @@ try {
     }
     if (-not $ChecksumFailed) { Fail "archive block accepted an invalid checksum" }
     if (Test-Path $env:MOCK_SIDE_EFFECT) { Fail "archive block extracted after checksum failure" }
+    if ((Get-ChildItem -Force $FailureTemp).Count -ne 0) { Fail "failed archive block left temporary installation files behind" }
     if ($ErrorActionPreference -ne "Continue") { Fail "failed archive block changed the caller error preference" }
     if ($env:Path -ne $OriginalProcessPath) { Fail "failed archive block changed the process PATH" }
 
@@ -298,10 +358,16 @@ try {
     }
 
     $SourceSuccessDir = Join-Path $Temp "source-success"
-    New-Item -ItemType Directory -Path $SourceSuccessDir | Out-Null
+    $SourceSuccessTemp = Join-Path $SourceSuccessDir "temp"
+    $ProtectedSource = Join-Path $SourceSuccessDir "protected-source"
+    New-Item -ItemType Directory -Path $SourceSuccessDir, $SourceSuccessTemp, $ProtectedSource | Out-Null
+    Set-Content -Path (Join-Path $ProtectedSource "marker") -Value "protected"
+    New-Item -ItemType SymbolicLink -Path (Join-Path $SourceSuccessDir "bitbygit") -Target $ProtectedSource | Out-Null
     $SourceScript = Join-Path $SourceSuccessDir "install-from-source.ps1"
     Set-Content -Path $SourceScript -Value $SourceBlock
     $env:LOCALAPPDATA = Join-Path $SourceSuccessDir "local-app-data"
+    $env:TEMP = $SourceSuccessTemp
+    $env:TMP = $SourceSuccessTemp
     $SourceInstallDir = Join-Path $env:LOCALAPPDATA "Programs\bitbygit"
     $OldBinaryDir = Join-Path $SourceSuccessDir "old-bin"
     New-Item -ItemType Directory -Path $OldBinaryDir | Out-Null
@@ -327,12 +393,23 @@ try {
     Push-Location $SourceSuccessDir
     try {
         $StartingLocation = (Get-Location).Path
-        . $SourceScript
-        if ((Get-Location).Path -ne $StartingLocation) {
-            Fail "source block changed the caller working directory"
+        foreach ($Attempt in 1..2) {
+            $FetchedExactTag = $false
+            $CheckedOutExactTag = $false
+            . $SourceScript
+            if ((Get-Location).Path -ne $StartingLocation) {
+                Fail "source block changed the caller working directory"
+            }
+            if ((Get-ChildItem -Force $SourceSuccessTemp).Count -ne 0) {
+                Fail "source block left temporary build files behind"
+            }
         }
     } finally {
         Pop-Location
+    }
+    if ((Get-Item -Force (Join-Path $SourceSuccessDir "bitbygit")).LinkType -ne "SymbolicLink" -or
+        (Get-Content (Join-Path $ProtectedSource "marker")) -ne "protected") {
+        Fail "source block modified a pre-existing working-directory source symlink"
     }
     $SourceInstalledBinary = Join-Path $SourceInstallDir "bitbygit.exe"
     if ($ErrorActionPreference -ne "Continue") { Fail "source block changed the caller error preference" }
@@ -357,10 +434,13 @@ try {
     }
 
     $SourceFailureDir = Join-Path $Temp "source-failure"
-    New-Item -ItemType Directory -Path $SourceFailureDir | Out-Null
+    $SourceFailureTemp = Join-Path $SourceFailureDir "temp"
+    New-Item -ItemType Directory -Path $SourceFailureDir, $SourceFailureTemp | Out-Null
     $SourceFailureScript = Join-Path $SourceFailureDir "install-from-source.ps1"
     Set-Content -Path $SourceFailureScript -Value $SourceBlock
     $env:LOCALAPPDATA = Join-Path $SourceFailureDir "local-app-data"
+    $env:TEMP = $SourceFailureTemp
+    $env:TMP = $SourceFailureTemp
     $env:Path = $OriginalProcessPath
     $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
     $FetchedExactTag = $false
@@ -383,13 +463,33 @@ try {
         Pop-Location
     }
     if (-not $SourceBuildFailed) { Fail "source block continued after a failed build" }
+    if ((Get-ChildItem -Force $SourceFailureTemp).Count -ne 0) { Fail "failed source block left temporary build files behind" }
     if ($ErrorActionPreference -ne "Continue") { Fail "failed source block changed the caller error preference" }
     if ($env:Path -ne $OriginalProcessPath) { Fail "failed source block changed the process PATH" }
+
+    $env:MOCK_CARGO_FAILURE = "0"
+    $CapturedUserPath = $null
+    Remove-Item Env:BITBYGIT_TEST_USER_PATH -ErrorAction SilentlyContinue
+    Push-Location $SourceFailureDir
+    try {
+        $StartingLocation = (Get-Location).Path
+        . $SourceFailureScript
+        if ((Get-Location).Path -ne $StartingLocation) { Fail "retried source block changed the caller working directory" }
+    } finally {
+        Pop-Location
+    }
+    if ((Get-ChildItem -Force $SourceFailureTemp).Count -ne 0) { Fail "retried source block left temporary build files behind" }
+    $SourceRetryOutput = bitbygit --version
+    if ($LASTEXITCODE -ne 0 -or $SourceRetryOutput -ne "bitbygit $SelectedVersion") {
+        Fail "source block could not retry after a failed build"
+    }
 
     $global:LASTEXITCODE = 0
     Write-Output "installation docs validation passed on Windows"
 } finally {
     $env:LOCALAPPDATA = $OriginalLocalAppData
     $env:Path = $OriginalProcessPath
+    $env:TEMP = $OriginalTemp
+    $env:TMP = $OriginalTmp
     Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
 }
