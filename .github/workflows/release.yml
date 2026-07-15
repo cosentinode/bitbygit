@@ -169,9 +169,13 @@ jobs:
       - name: Verify and publish release assets
         shell: bash
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          set -euo pipefail
+
           archives=(
             "bitbygit-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
             "bitbygit-${VERSION}-x86_64-apple-darwin.tar.gz"
@@ -194,7 +198,24 @@ jobs:
             sha256sum "${archives[@]}" > SHA256SUMS
           )
 
+          tag_target="$(gh api "repos/${GH_REPO}/git/ref/tags/${GITHUB_REF_NAME}" \
+            --jq '.object | [.type, .sha] | @tsv')"
+          read -r target_type target_sha <<< "${tag_target}"
+
+          while [[ "${target_type}" == "tag" ]]; do
+            tag_target="$(gh api "repos/${GH_REPO}/git/tags/${target_sha}" \
+              --jq '.object | [.type, .sha] | @tsv')"
+            read -r target_type target_sha <<< "${tag_target}"
+          done
+
+          if [[ "${target_type}" != "commit" || "${target_sha}" != "${RELEASE_SHA}" ]]; then
+            echo "::error title=Release tag moved::Expected ${GITHUB_REF_NAME} to target ${RELEASE_SHA}, got ${target_type} ${target_sha}"
+            exit 1
+          fi
+
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GH_REPO}" \
+            --target "${RELEASE_SHA}" \
             --verify-tag \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
