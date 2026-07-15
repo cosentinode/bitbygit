@@ -33,11 +33,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Read release metadata
@@ -52,6 +53,18 @@ jobs:
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "package=${package}" >> "${GITHUB_OUTPUT}"
           echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate release tag
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_TAG: v${{ steps.release.outputs.version }}
+        run: |
+          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "::error title=Release tag mismatch::Expected ${EXPECTED_TAG}, got ${RELEASE_TAG}"
+            exit 1
+          fi
 
       - name: Build
         run: cargo build --locked --release -p bitbygit --target ${{ matrix.target }}
@@ -101,7 +114,7 @@ jobs:
           }
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.release.outputs.archive }}
           path: dist/${{ steps.release.outputs.archive }}
