@@ -4,11 +4,12 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::string::FromUtf8Error;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,8 +28,6 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
-use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create};
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, kill_process_group};
 #[cfg(unix)]
@@ -57,8 +56,6 @@ const RECOVERY_UNTRACKED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
 const RECOVERY_IGNORED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
 const RECOVERY_REBASE_TODO_LIMIT: u64 = 1024 * 1024;
 const RECOVERY_LOCK_DIRECTORY: &str = "recovery-locks";
-const RECOVERY_BUILT_IN_MERGE_STRATEGIES: &[&str] =
-    &["octopus", "ort", "ours", "recursive", "resolve", "subtree"];
 const RECOVERY_HOOKS: &[&str] = &[
     "applypatch-msg",
     "commit-msg",
@@ -450,12 +447,16 @@ impl Git {
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
         let recovery_lock = self.acquire_recovery_lock_until(operation, action, deadline)?;
         self.run_recovery_args_until_with(operation, action, deadline, || {
-            before_spawn_check()?;
             let repository_root = self.canonical_repository_root_until(deadline)?;
             recovery_lock.ensure_identity(&repository_root, operation, action)?;
             self.ensure_recovery_state(expected_state, operation, action, deadline)?;
+            before_spawn_check()?;
             let repository_root = self.canonical_repository_root_until(deadline)?;
-            recovery_lock.ensure_identity(&repository_root, operation, action)
+            recovery_lock.ensure_identity(&repository_root, operation, action)?;
+            // A second complete pass catches a mutation that occurred after an
+            // earlier input was consumed by the first pass. Keep this final
+            // pass as the last operation before spawning the recovery command.
+            self.ensure_recovery_state(expected_state, operation, action, deadline)
         })
     }
 
@@ -1429,18 +1430,22 @@ impl Git {
                 });
             }
         }
-        for relative in ["rebase-merge/strategy", "rebase-apply/strategy"] {
+        for relative in [
+            "rebase-merge/strategy",
+            "rebase-apply/strategy",
+            "rebase-merge/strategy_opts",
+            "rebase-apply/strategy_opts",
+        ] {
             let path = self.git_path_until(relative, deadline)?;
-            let Some(strategy) =
+            let Some(value) =
                 read_bounded_optional_file(&path, RECOVERY_REBASE_TODO_LIMIT, deadline)?
             else {
                 continue;
             };
-            let strategy = strategy.trim();
-            if !strategy.is_empty() && !RECOVERY_BUILT_IN_MERGE_STRATEGIES.contains(&strategy) {
+            if !value.trim().is_empty() {
                 return Err(GitError::Blocked {
                     message: format!(
-                        "recovery is blocked because the active rebase requests non-built-in merge strategy {strategy:?}, which may start an uncontained executable; abort and restart with a built-in strategy, or run Git manually"
+                        "recovery is blocked because the active rebase persists an explicit merge strategy or strategy option in {relative}, which may start an uncontained executable; abort and restart without custom strategy settings, or run Git manually"
                     ),
                 });
             }
@@ -2180,22 +2185,10 @@ where
     } else {
         RECOVERY_EXECUTION_CAPTURE_LIMIT.max(output_limit.saturating_add(1))
     };
-    let mut stdout = bounded_capture_file(capture_limit, &args)?;
-    let mut stderr = bounded_capture_file(capture_limit, &args)?;
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
-            GitError::Io {
-                args: args.clone(),
-                source,
-            }
-        })?))
-        .stderr(Stdio::from(stderr.try_clone().map_err(|source| {
-            GitError::Io {
-                args: args.clone(),
-                source,
-            }
-        })?));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if Instant::now() >= deadline {
         return Err(GitError::TimedOut { args });
     }
@@ -2204,12 +2197,41 @@ where
         args: args.clone(),
         source,
     })?;
+    let (stdout, stderr) = take_contained_output(&mut child).map_err(|source| GitError::Io {
+        args: args.clone(),
+        source,
+    })?;
+    let capture_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_exceeded = Arc::clone(&capture_exceeded);
+    let stderr_exceeded = Arc::clone(&capture_exceeded);
+    let stdout_reader = thread::spawn(move || {
+        drain_bounded_output(
+            stdout,
+            output_limit,
+            capture_limit,
+            digest_all_output,
+            stdout_exceeded,
+        )
+    });
+    let stderr_reader = thread::spawn(move || {
+        drain_bounded_output(
+            stderr,
+            output_limit,
+            capture_limit,
+            digest_all_output,
+            stderr_exceeded,
+        )
+    });
 
+    let mut output_limit_hit = false;
     let status = loop {
-        if let Err(error) = ensure_capture_limits(&mut stdout, &mut stderr, capture_limit, &args) {
+        if capture_exceeded.load(Ordering::Acquire) {
+            output_limit_hit = true;
             kill_process_tree(&mut child);
-            let _result = child.wait();
-            return Err(error);
+            break child.wait().map_err(|source| GitError::Io {
+                args: args.clone(),
+                source,
+            })?;
         }
         if let Some(status) = child.try_wait().map_err(|source| GitError::Io {
             args: args.clone(),
@@ -2221,159 +2243,79 @@ where
         if now >= deadline {
             kill_process_tree(&mut child);
             let _result = child.wait();
+            kill_process_tree(&mut child);
+            join_capture_reader(stdout_reader, &args)?;
+            join_capture_reader(stderr_reader, &args)?;
             return Err(GitError::TimedOut { args });
         }
         thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
     };
-    if let Err(error) = ensure_capture_limits(&mut stdout, &mut stderr, capture_limit, &args) {
-        kill_process_tree(&mut child);
-        return Err(error);
-    }
-    // Hooks may leave background children behind. End the command's process group
-    // before reading finite file snapshots; detached children cannot hold these
-    // captures open as they could inherited pipes.
+    // End the contained process tree before joining the drains so descendants
+    // cannot keep inherited pipe writers open.
     kill_process_tree(&mut child);
-    let stdout_len = captured_file_position(&mut stdout, capture_limit, &args)?;
-    let stderr_len = captured_file_position(&mut stderr, capture_limit, &args)?;
+    let stdout = join_capture_reader(stdout_reader, &args)?;
+    let stderr = join_capture_reader(stderr_reader, &args)?;
+    if output_limit_hit || capture_exceeded.load(Ordering::Acquire) {
+        return Err(GitError::Blocked {
+            message: format!(
+                "git {} output exceeded the bounded capture limit",
+                args.join(" ")
+            ),
+        });
+    }
 
     Ok(BoundedCommandOutput {
         status,
-        stdout: read_captured_file(
-            &mut stdout,
-            stdout_len,
-            output_limit,
-            digest_all_output,
-            deadline,
-            &args,
-        )?,
-        stderr: read_captured_file(
-            &mut stderr,
-            stderr_len,
-            output_limit,
-            digest_all_output,
-            deadline,
-            &args,
-        )?,
+        stdout,
+        stderr,
     })
 }
 
-fn read_captured_file(
-    file: &mut fs::File,
-    snapshot_len: u64,
+fn drain_bounded_output(
+    mut reader: impl Read,
     output_limit: usize,
+    capture_limit: usize,
     digest_all_output: bool,
-    deadline: Instant,
-    args: &[String],
-) -> Result<CapturedStream, GitError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| recovery_output_io(args, source))?;
-    let read_limit = if digest_all_output {
-        snapshot_len
-    } else {
-        snapshot_len.min(output_limit.saturating_add(1) as u64)
-    };
+    exceeded: Arc<AtomicBool>,
+) -> io::Result<CapturedStream> {
     let mut hasher = Sha256::new();
-    let mut bytes = Vec::with_capacity(output_limit.min(8192));
-    let mut remaining = read_limit;
+    let mut bytes = Vec::with_capacity(output_limit.min(capture_limit).min(8192));
+    let mut total = 0usize;
     let mut buffer = [0; 8192];
-    while remaining > 0 {
-        if Instant::now() >= deadline {
-            return Err(GitError::TimedOut {
-                args: args.to_vec(),
-            });
-        }
-        let requested = buffer.len().min(remaining as usize);
-        let count = file
-            .read(&mut buffer[..requested])
-            .map_err(|source| recovery_output_io(args, source))?;
+    loop {
+        let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        remaining -= count as u64;
-        hasher.update(&buffer[..count]);
-        let remaining = output_limit.saturating_sub(bytes.len());
-        let retained = remaining.min(count);
+        let within_limit = capture_limit.saturating_sub(total).min(count);
+        if digest_all_output {
+            hasher.update(&buffer[..within_limit]);
+        }
+        let retained = output_limit.saturating_sub(bytes.len()).min(within_limit);
         bytes.extend_from_slice(&buffer[..retained]);
+        total = total.saturating_add(count);
+        if total > capture_limit {
+            exceeded.store(true, Ordering::Release);
+        }
+    }
+    if !digest_all_output {
+        hasher.update(&bytes);
     }
     Ok(CapturedStream {
         bytes,
         digest: hasher.finalize().into(),
-        truncated: snapshot_len > output_limit as u64,
+        truncated: total > output_limit,
     })
 }
 
-fn ensure_capture_limits(
-    stdout: &mut fs::File,
-    stderr: &mut fs::File,
-    capacity: usize,
+fn join_capture_reader(
+    reader: thread::JoinHandle<io::Result<CapturedStream>>,
     args: &[String],
-) -> Result<(), GitError> {
-    let _stdout = captured_file_position(stdout, capacity, args)?;
-    let _stderr = captured_file_position(stderr, capacity, args)?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
-fn bounded_capture_file(capacity: usize, args: &[String]) -> Result<fs::File, GitError> {
-    let descriptor = memfd_create(
-        "bitbygit-recovery-output",
-        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-    )
-    .map_err(|source| recovery_output_io(args, source.into()))?;
-    ftruncate(&descriptor, capacity as u64)
-        .map_err(|source| recovery_output_io(args, source.into()))?;
-    fcntl_add_seals(
-        &descriptor,
-        SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL,
-    )
-    .map_err(|source| recovery_output_io(args, source.into()))?;
-    Ok(fs::File::from(descriptor))
-}
-
-#[cfg(not(any(target_os = "android", target_os = "freebsd", target_os = "linux")))]
-fn bounded_capture_file(_capacity: usize, args: &[String]) -> Result<fs::File, GitError> {
-    tempfile::tempfile().map_err(|source| recovery_output_io(args, source))
-}
-
-#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
-fn captured_file_position(
-    file: &mut fs::File,
-    capacity: usize,
-    args: &[String],
-) -> Result<u64, GitError> {
-    let position = file
-        .stream_position()
-        .map_err(|source| recovery_output_io(args, source))?;
-    if position > capacity as u64 {
-        return Err(GitError::Blocked {
-            message: format!(
-                "git {} output exceeded the bounded capture limit",
-                args.join(" ")
-            ),
-        });
-    }
-    Ok(position)
-}
-
-#[cfg(not(any(target_os = "android", target_os = "freebsd", target_os = "linux")))]
-fn captured_file_position(
-    file: &mut fs::File,
-    capacity: usize,
-    args: &[String],
-) -> Result<u64, GitError> {
-    let length = file
-        .metadata()
-        .map_err(|source| recovery_output_io(args, source))?
-        .len();
-    if length > capacity as u64 {
-        return Err(GitError::Blocked {
-            message: format!(
-                "git {} output exceeded the bounded capture limit",
-                args.join(" ")
-            ),
-        });
-    }
-    Ok(length)
+) -> Result<CapturedStream, GitError> {
+    reader
+        .join()
+        .map_err(|_| recovery_output_io(args, io::Error::other("output drainer panicked")))?
+        .map_err(|source| recovery_output_io(args, source))
 }
 
 fn recovery_output_io(args: &[String], source: io::Error) -> GitError {
@@ -2396,14 +2338,56 @@ fn spawn_contained(mut command: Command) -> io::Result<Child> {
     command.spawn()
 }
 
+#[cfg(unix)]
+fn take_contained_output(child: &mut Child) -> io::Result<(ChildStdout, ChildStderr)> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("contained command has no stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("contained command has no stderr pipe"))?;
+    Ok((stdout, stderr))
+}
+
 #[cfg(windows)]
 fn spawn_contained(mut command: Command) -> io::Result<GroupChild> {
     command.group().kill_on_drop(true).spawn()
 }
 
+#[cfg(windows)]
+fn take_contained_output(child: &mut GroupChild) -> io::Result<(ChildStdout, ChildStderr)> {
+    let child = child.inner();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("contained command has no stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("contained command has no stderr pipe"))?;
+    Ok((stdout, stderr))
+}
+
 #[cfg(not(any(unix, windows)))]
 fn spawn_contained(mut command: Command) -> io::Result<std::process::Child> {
     command.spawn()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn take_contained_output(
+    child: &mut std::process::Child,
+) -> io::Result<(ChildStdout, ChildStderr)> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("contained command has no stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("contained command has no stderr pipe"))?;
+    Ok((stdout, stderr))
 }
 
 #[cfg(unix)]
@@ -2491,15 +2475,24 @@ impl RecoveryLock {
             .map_err(|source| recovery_lock_io(operation, action, source))?;
         let current_guard = fs::symlink_metadata(&self.guard_path)
             .map_err(|source| recovery_lock_io(operation, action, source))?;
+        let same_lock = same_recovery_lock_identity(&self.file, &self.path, &opened, &current)
+            .map_err(|source| recovery_lock_io(operation, action, source))?;
+        let same_guard = same_recovery_lock_identity(
+            &self.guard,
+            &self.guard_path,
+            &opened_guard,
+            &current_guard,
+        )
+        .map_err(|source| recovery_lock_io(operation, action, source))?;
         if current_repository_root != self.repository_root
             || !opened.is_file()
             || !current.is_file()
             || current.file_type().is_symlink()
-            || !same_recovery_file(&opened, &current)
+            || !same_lock
             || !opened_guard.is_file()
             || !current_guard.is_file()
             || current_guard.file_type().is_symlink()
-            || !same_recovery_file(&opened_guard, &current_guard)
+            || !same_guard
             || recovery_repository_key(current_repository_root)
                 != recovery_lock_key_from_path(&self.path).unwrap_or_default()
         {
@@ -2523,6 +2516,28 @@ impl RecoveryLock {
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn same_recovery_lock_identity(
+    opened: &fs::File,
+    path: &Path,
+    _opened_metadata: &fs::Metadata,
+    _path_metadata: &fs::Metadata,
+) -> io::Result<bool> {
+    let opened = same_file::Handle::from_file(opened.try_clone()?)?;
+    let current = same_file::Handle::from_path(path)?;
+    Ok(opened == current)
+}
+
+#[cfg(not(windows))]
+fn same_recovery_lock_identity(
+    _opened: &fs::File,
+    _path: &Path,
+    opened_metadata: &fs::Metadata,
+    path_metadata: &fs::Metadata,
+) -> io::Result<bool> {
+    Ok(same_recovery_file(opened_metadata, path_metadata))
 }
 
 #[cfg(unix)]
@@ -4711,16 +4726,20 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
     #[test]
-    fn recovery_output_file_has_a_hard_growth_limit() -> Result<(), Box<dyn Error>> {
-        use std::io::Write;
+    fn recovery_output_drainer_retains_only_hard_bounded_memory() -> Result<(), Box<dyn Error>> {
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let capture = drain_bounded_output(
+            io::Cursor::new(vec![b'x'; 8192]),
+            1024,
+            4096,
+            true,
+            Arc::clone(&exceeded),
+        )?;
 
-        let args = ["merge".to_owned(), "--continue".to_owned()];
-        let mut capture = bounded_capture_file(4096, &args)?;
-        capture.write_all(&vec![b'x'; 4096])?;
-
-        assert!(capture.write_all(b"x").is_err());
+        assert_eq!(capture.bytes.len(), 1024);
+        assert!(capture.truncated);
+        assert!(exceeded.load(Ordering::Acquire));
         Ok(())
     }
 
@@ -4947,8 +4966,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_recovery_detects_synchronized_change_at_spawn_boundary() -> Result<(), Box<dyn Error>>
-    {
+    fn exact_recovery_rejects_index_change_between_complete_final_fingerprints()
+    -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_merge_conflict()?;
         repo.write("conflict.txt", "resolved\n")?;
         repo.run(["add", "conflict.txt"])?;
@@ -4983,7 +5002,7 @@ mod tests {
                 Ok(())
             },
         ) else {
-            return Err("expected final spawn-boundary check to block recovery".into());
+            return Err("expected final complete fingerprint to block recovery".into());
         };
 
         assert!(error.to_string().contains("state changed after preview"));
@@ -5342,15 +5361,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_rejects_persisted_custom_strategy_before_spawn() -> Result<(), Box<dyn Error>> {
+    fn recovery_rejects_persisted_explicit_strategy_before_spawn() -> Result<(), Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt;
 
         let (repo, _original_head) = prepare_rebase_conflict()?;
         repo.write("conflict.txt", "resolved\n")?;
         repo.run(["add", "conflict.txt"])?;
         let exec_dir = TempRepo::new()?;
-        let marker = repo.path().join("custom-strategy-ran");
-        let strategy = exec_dir.path().join("git-merge-evil");
+        let marker = repo.path().join("explicit-strategy-ran");
+        let strategy = exec_dir.path().join("git-merge-resolve");
         fs::write(
             &strategy,
             format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
@@ -5359,14 +5378,34 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&strategy, permissions)?;
         let git = Git::new(repo.path()).with_test_git_exec_path(exec_dir.path());
-        fs::write(git.git_path("rebase-merge/strategy")?, "evil\n")?;
+        fs::write(git.git_path("rebase-merge/strategy")?, "resolve\n")?;
 
         let Err(error) = git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue) else {
-            return Err("expected a persisted custom strategy to be rejected".into());
+            return Err("expected a persisted explicit strategy to be rejected".into());
         };
 
-        assert!(error.to_string().contains("non-built-in merge strategy"));
-        assert!(!marker.exists(), "custom merge strategy was started");
+        assert!(error.to_string().contains("explicit merge strategy"));
+        assert!(!marker.exists(), "explicit merge strategy was started");
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_persisted_strategy_options_before_spawn() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(repo.path());
+        fs::write(
+            git.git_path("rebase-merge/strategy_opts")?,
+            "--evil-option\n",
+        )?;
+
+        let Err(error) = git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue) else {
+            return Err("expected persisted strategy options to be rejected".into());
+        };
+
+        assert!(error.to_string().contains("strategy option"));
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
         Ok(())
     }
@@ -5426,7 +5465,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn recovery_lock_replacement_cannot_enable_concurrent_recovery() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
@@ -5446,7 +5485,7 @@ mod tests {
         )?;
         let replaced = lock.path.with_extension("replaced");
         fs::rename(&lock.path, &replaced)?;
-        fs::write(&lock.path, "replacement\n")?;
+        fs::File::create(&lock.path)?;
 
         let Err(concurrent_error) =
             git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
