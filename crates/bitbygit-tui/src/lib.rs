@@ -1911,7 +1911,12 @@ impl OperationPlanner {
             prompt_sequence_policy_evaluations(&self.policy, &self.git(), &requests, branch)?;
         apply_policy_evaluation(
             &mut plan,
-            combined_policy_evaluation(sequence_policy_evaluations.clone()),
+            combined_policy_evaluation(
+                policy_evaluations
+                    .iter()
+                    .chain(&sequence_policy_evaluations)
+                    .cloned(),
+            ),
         );
         let remaining_requests = requests.into_iter().skip(1).collect();
         Ok(PreparedPromptSequence::new(
@@ -2733,9 +2738,7 @@ fn queue_panel(app: &App) -> Paragraph<'_> {
         .into_iter()
         .map(Line::from)
         .collect::<Vec<_>>();
-    Paragraph::new(text)
-        .block(panel_block("Queue", app.focus == Focus::Queue))
-        .wrap(Wrap { trim: true })
+    Paragraph::new(text).block(panel_block("Queue", app.focus == Focus::Queue))
 }
 
 fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
@@ -2759,11 +2762,24 @@ fn queue_panel_text(pending: Option<&QueuedOperation>) -> Vec<String> {
     ]
 }
 
-fn policy_reason(plan: &OperationPlan) -> &str {
-    plan.confirmation
+fn policy_reason(plan: &OperationPlan) -> String {
+    let reason = plan
+        .confirmation
         .reason
         .as_deref()
-        .unwrap_or("safe default confirmation policy")
+        .unwrap_or("safe default confirmation policy");
+    let reasons = reason.split("; ").collect::<Vec<_>>();
+    reasons
+        .iter()
+        .filter(|reason| reason.starts_with("protected branch "))
+        .chain(
+            reasons
+                .iter()
+                .filter(|reason| !reason.starts_with("protected branch ")),
+        )
+        .copied()
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn accepted_confirmation_keys(plan: &OperationPlan) -> &'static str {
@@ -2792,10 +2808,11 @@ fn plan_steps_summary(plan: &OperationPlan) -> String {
 }
 
 fn confirmation_copy(plan: &OperationPlan) -> String {
-    if !plan.confirmation.prompt.is_empty() {
-        return plan.confirmation.prompt.clone();
-    }
-    confirmation_prompt(plan, plan.confirmation.requirement)
+    format!(
+        "{} [{}]",
+        confirmation_action(plan),
+        accepted_confirmation_keys(plan)
+    )
 }
 
 fn risk_label(risk: RiskLevel) -> &'static str {
@@ -6216,7 +6233,7 @@ mod tests {
         assert!(queue_text[0].contains("Risk: medium"));
         assert!(queue_text[1].contains("y confirm; n/Esc cancel"));
         assert!(queue_text[2].contains("medium risk policy requires visible-plan"));
-        assert!(queue_text[3].contains("Press y to stage all changes"));
+        assert!(queue_text[3].contains("stage all changes [y confirm; n/Esc cancel]"));
         assert!(queue_text[4].contains("stage all working tree changes"));
 
         app.handle_key(key(KeyCode::Char('n')));
@@ -6352,6 +6369,84 @@ mod tests {
                 .confirmation
                 .prompt
                 .contains("run 2 prompt steps")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn low_explicit_policy_applies_to_low_risk_prompt_sequences() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("sequence-low-explicit-policy")?;
+        let mut config = AppConfig::default();
+        config.policy.confirmation.low = ConfirmationSetting::ExplicitConfirmation;
+
+        let sequence = OperationPlanner::with_policy(&repo, EffectivePolicy::new(&config))
+            .plan_prompt_sequence(vec![OperationRequest::Fetch, OperationRequest::Branches])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::ExplicitConfirmation
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("low risk policy requires explicit"))
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .prompt
+                .contains("uppercase Y to run 2 prompt steps")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_later_low_risk_step_blocks_sequence_before_checkout() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("sequence-later-low-blocked-policy")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        git_stdout(&repo, &["branch", "feature/policy"])?;
+        let original_branch = git_stdout(&repo, &["branch", "--show-current"])?;
+        let mut config = AppConfig::default();
+        config.policy.confirmation.low = ConfirmationSetting::Blocked;
+
+        let sequence = OperationPlanner::with_policy(&repo, EffectivePolicy::new(&config))
+            .plan_prompt_sequence(vec![
+                OperationRequest::Checkout {
+                    branch: "feature/policy".to_owned(),
+                },
+                OperationRequest::Fetch,
+            ])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::Blocked
+        );
+        assert!(
+            sequence
+                .plan
+                .confirmation
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("low risk policy requires blocked"))
+        );
+        let mut app = App::new();
+        app.operation_queue.enqueue(QueuedOperation::new_sequence(
+            sequence.plan,
+            sequence.sequence,
+        ));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(
+            git_stdout(&repo, &["branch", "--show-current"])?,
+            original_branch
         );
         Ok(())
     }
@@ -7042,6 +7137,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Accepted keys: uppercase Y confirm; n/Esc cancel"));
         assert!(rendered.contains("protected branch production"));
+        assert!(rendered.contains("Confirm: run 2 prompt steps"));
         Ok(())
     }
 
