@@ -38,6 +38,10 @@ jobs:
           "${tool_dir}/actionlint"
           bash scripts/test-release-workflow.sh
 
+      - name: Validate installation documentation
+        shell: bash
+        run: bash scripts/test-installation-docs.sh
+
       - name: Format
         run: cargo fmt --all --check
 
