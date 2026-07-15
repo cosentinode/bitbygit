@@ -42,13 +42,19 @@ User policy is defined in `config.toml`; see
 [`docs/configuration.md`](docs/configuration.md) for path resolution, the strict
 schema, and safe fallback behavior.
 
+## Installation
+
+See [`docs/installation.md`](docs/installation.md) for supported release
+archives, checksum verification, PATH setup, and source build instructions.
+Package-manager distribution is not currently available.
+
 ## Development
 
 Prerequisites:
 
 - Rust 1.85 or newer.
 - `git` available on `PATH`.
-- `gh` is optional for future GitHub workflows.
+- `gh` is optional and required only for GitHub-specific workflows.
 
 Run local checks:
 
