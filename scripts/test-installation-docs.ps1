@@ -73,6 +73,12 @@ if ([regex]::Matches($DocsText, [regex]::Escape($MachinePathLookup)).Count -ne 2
     [regex]::Matches($DocsText, [regex]::Escape('User PATH cannot override it in new shells')).Count -ne 2) {
     Fail "Windows examples do not reject machine-level PATH shadowing"
 }
+$PathExtLookup = '$env:PATHEXT -split ";"'
+$ExecutableExtensions = '@(".exe", ".com", ".bat", ".cmd")'
+if ([regex]::Matches($DocsText, [regex]::Escape($PathExtLookup)).Count -ne 2 -or
+    [regex]::Matches($DocsText, [regex]::Escape($ExecutableExtensions)).Count -ne 2) {
+    Fail "Windows examples do not inspect every standard PATHEXT application candidate"
+}
 if ([regex]::Matches($DocsText, '(?m)^& \$ResolvedPath --version\r?$').Count -ne 2) {
     Fail "Windows examples do not finish with PATH-resolved version output"
 }
@@ -124,6 +130,7 @@ $OriginalLocalAppData = $env:LOCALAPPDATA
 $OriginalProcessPath = $env:Path
 $OriginalTemp = $env:TEMP
 $OriginalTmp = $env:TMP
+$OriginalPathExt = $env:PATHEXT
 
 try {
     cargo build --locked --release -p bitbygit
@@ -141,6 +148,7 @@ try {
     Set-Content -Path $FixtureSource -Value $FixtureSourceText
     rustc --crate-name selected_version_fixture $FixtureSource -o $FixtureBinary
     if ($LASTEXITCODE -ne 0) { Fail "selected-version fixture build failed" }
+    $env:PATHEXT = ".CoM;.EXE;.BaT;.CMD"
 
     $Target = "x86_64-pc-windows-msvc"
     $Archive = "bitbygit-$SelectedVersion-$Target.zip"
@@ -267,25 +275,29 @@ try {
     if ($LASTEXITCODE -ne 0 -or $OldMachineOutput -ne "bitbygit $WorkspaceVersion") {
         Fail "older machine-level bitbygit.exe fixture reported the wrong version"
     }
-    $MachineConflictFailed = $false
-    Push-Location $MachineConflictDir
-    try {
+    foreach ($Extension in ".exe", ".com", ".bat", ".cmd") {
+        Remove-Item (Join-Path $MachineOldBinaryDir "bitbygit.*") -Force
+        Copy-Item $WorkspaceBinary (Join-Path $MachineOldBinaryDir "bitbygit$Extension")
+        $MachineConflictFailed = $false
+        Push-Location $MachineConflictDir
         try {
-            . $MachineConflictScript
-        } catch {
-            $MachineConflictFailed = $_.Exception.Message.Contains("User PATH cannot override it in new shells")
+            try {
+                . $MachineConflictScript
+            } catch {
+                $MachineConflictFailed = $_.Exception.Message.Contains("User PATH cannot override it in new shells")
+            }
+        } finally {
+            Pop-Location
         }
-    } finally {
-        Pop-Location
-    }
-    if (-not $MachineConflictFailed) { Fail "archive block did not reject machine-level PATH shadowing" }
-    if ((Get-ChildItem -Force $MachineConflictTemp).Count -ne 0) { Fail "failed archive block left temporary installation files behind" }
-    if ($null -ne $CapturedUserPath) { Fail "machine-level conflict changed persistent user PATH" }
-    if ($env:Path -ne $MachineConflictStartingPath) { Fail "machine-level conflict changed process PATH" }
-    $ConflictInstalledBinary = Join-Path $env:LOCALAPPDATA "Programs\bitbygit\bitbygit.exe"
-    $ConflictOutput = & $ConflictInstalledBinary --version
-    if ($LASTEXITCODE -ne 0 -or $ConflictOutput -ne "bitbygit $SelectedVersion") {
-        Fail "machine-level conflict did not leave the selected binary available by explicit path"
+        if (-not $MachineConflictFailed) { Fail "archive block did not reject machine-level $Extension PATH shadowing" }
+        if ((Get-ChildItem -Force $MachineConflictTemp).Count -ne 0) { Fail "failed archive block left temporary installation files behind" }
+        if ($null -ne $CapturedUserPath) { Fail "machine-level conflict changed persistent user PATH" }
+        if ($env:Path -ne $MachineConflictStartingPath) { Fail "machine-level conflict changed process PATH" }
+        $ConflictInstalledBinary = Join-Path $env:LOCALAPPDATA "Programs\bitbygit\bitbygit.exe"
+        $ConflictOutput = & $ConflictInstalledBinary --version
+        if ($LASTEXITCODE -ne 0 -or $ConflictOutput -ne "bitbygit $SelectedVersion") {
+            Fail "machine-level conflict did not leave the selected binary available by explicit path"
+        }
     }
     $env:BITBYGIT_TEST_MACHINE_PATH = $MachinePathDir
     Push-Location $MachineConflictDir
@@ -564,5 +576,6 @@ try {
     $env:Path = $OriginalProcessPath
     $env:TEMP = $OriginalTemp
     $env:TMP = $OriginalTmp
+    $env:PATHEXT = $OriginalPathExt
     Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
 }

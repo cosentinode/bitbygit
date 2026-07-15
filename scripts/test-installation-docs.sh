@@ -136,7 +136,9 @@ check_unix_success() {
     export TMPDIR="${case_dir}/temp"
     export MOCK_DOWNLOAD_DIR="${tmp}/assets"
     export MOCK_UNAME_MACHINE="${machine}"
-    export PATH="${tmp}/mock-bin:${PATH}"
+    base_path="${PATH}"
+    expected_path="${HOME}/.local/bin::${tmp}/mock-bin::${base_path}:"
+    export PATH=":${tmp}/mock-bin::${HOME}/.local/bin:${base_path}:${HOME}/.local/bin:"
     starting_dir="${PWD}"
 
     bitbygit() {
@@ -161,7 +163,7 @@ check_unix_success() {
     if shopt -qo pipefail; then
       fail "${heading} enabled pipefail in the caller shell"
     fi
-    [[ "${PATH%%:*}" == "${HOME}/.local/bin" ]] || fail "${heading} did not update the caller PATH"
+    [[ "${PATH}" == "${expected_path}" ]] || fail "${heading} did not preserve empty PATH entries while deduplicating the install directory"
     path_entry_count=0
     IFS=: read -r -a path_entries <<< "${PATH}"
     for entry in "${path_entries[@]}"; do
@@ -322,9 +324,11 @@ printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
   cd "${source_dir}"
   export HOME="${source_dir}/home"
   export TMPDIR="${source_dir}/temp"
-  export PATH="${source_dir}/mock-bin:${PATH}"
+  base_path="${PATH}"
+  original_path=":${source_dir}/mock-bin::${HOME}/.local/bin:${base_path}:${HOME}/.local/bin:"
+  expected_path="${HOME}/.local/bin::${source_dir}/mock-bin::${base_path}:"
+  export PATH="${original_path}"
   starting_dir="${PWD}"
-  original_path="${PATH}"
   export MOCK_CARGO_FAILURE=1
   if source "${source_dir}/snippet.bash"; then
     fail "Bash source block continued after a failed build"
@@ -354,6 +358,7 @@ printf '%s' "${source_snippet}" > "${source_dir}/snippet.bash"
   unalias bitbygit
   unset -f shadow_bitbygit
   [[ "${PWD}" == "${starting_dir}" ]] || fail "Bash source block changed the caller working directory"
+  [[ "${PATH}" == "${expected_path}" ]] || fail "Bash source block did not preserve empty PATH entries while deduplicating the install directory"
   path_entry_count=0
   IFS=: read -r -a path_entries <<< "${PATH}"
   for entry in "${path_entries[@]}"; do
