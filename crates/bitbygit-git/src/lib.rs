@@ -1535,7 +1535,7 @@ impl RecoveryTransaction {
         transaction.copy_repository()?;
 
         let live_after_copy = RecoveryGeneration::capture(&transaction.root)?;
-        let copied = RecoveryGeneration::capture(&transaction.candidate)?;
+        let copied = RecoveryGeneration::capture_isolated(&transaction.candidate)?;
         if live_after_copy != transaction.baseline || copied != transaction.baseline {
             return Err(recovery_transaction_blocked(
                 "repository changed while isolated recovery state was prepared",
@@ -1591,7 +1591,7 @@ impl RecoveryTransaction {
 
     fn copy_repository(&mut self) -> Result<(), GitError> {
         let output = Command::new("cp")
-            .args(["-a", "--reflink=auto", "--"])
+            .args(["-a", "--no-preserve=links", "--reflink=auto", "--"])
             .arg(self.root.join("."))
             .arg(&self.candidate)
             .output()
@@ -1742,6 +1742,17 @@ struct RecoveryGeneration {
 
 impl RecoveryGeneration {
     fn capture(root: &Path) -> Result<Self, GitError> {
+        Self::capture_with_hard_linked_git_objects(root, true)
+    }
+
+    fn capture_isolated(root: &Path) -> Result<Self, GitError> {
+        Self::capture_with_hard_linked_git_objects(root, false)
+    }
+
+    fn capture_with_hard_linked_git_objects(
+        root: &Path,
+        allow_hard_linked_git_objects: bool,
+    ) -> Result<Self, GitError> {
         let root_metadata = fs::symlink_metadata(root)
             .map_err(|source| recovery_transaction_io("inspect repository root", source))?;
         if !root_metadata.file_type().is_dir() {
@@ -1749,7 +1760,13 @@ impl RecoveryGeneration {
                 "repository root changed while its generation was captured",
             ));
         }
-        let root_value = recovery_filesystem_metadata(root, Path::new("."), &root_metadata, None)?;
+        let root_value = recovery_filesystem_metadata(
+            root,
+            Path::new("."),
+            &root_metadata,
+            None,
+            allow_hard_linked_git_objects,
+        )?;
         let mut entries = Vec::new();
         let mut pending = vec![PathBuf::new()];
         let mut path_bytes = 0_usize;
@@ -1780,7 +1797,13 @@ impl RecoveryGeneration {
                 let value = if file_type.is_dir() {
                     pending.push(relative.clone());
                     RecoveryGenerationValue::Directory {
-                        metadata: recovery_filesystem_metadata(&path, &relative, &metadata, None)?,
+                        metadata: recovery_filesystem_metadata(
+                            &path,
+                            &relative,
+                            &metadata,
+                            None,
+                            allow_hard_linked_git_objects,
+                        )?,
                     }
                 } else if file_type.is_file() {
                     let (mut file, opened_metadata) =
@@ -1796,6 +1819,7 @@ impl RecoveryGeneration {
                         &relative,
                         &opened_metadata,
                         Some(&file),
+                        allow_hard_linked_git_objects,
                     )?;
                     run_recovery_generation_file_read_hook(&path);
                     let mut hasher = Sha256::new();
@@ -1828,8 +1852,13 @@ impl RecoveryGeneration {
                             "repository generation changed while it was captured",
                         ));
                     }
-                    let current_metadata =
-                        recovery_filesystem_metadata(&path, &relative, &current, Some(&file))?;
+                    let current_metadata = recovery_filesystem_metadata(
+                        &path,
+                        &relative,
+                        &current,
+                        Some(&file),
+                        allow_hard_linked_git_objects,
+                    )?;
                     if current_metadata != file_metadata {
                         return Err(recovery_transaction_blocked(
                             "repository generation changed while it was captured",
@@ -1848,7 +1877,13 @@ impl RecoveryGeneration {
                         )));
                     }
                     RecoveryGenerationValue::Symlink {
-                        metadata: recovery_filesystem_metadata(&path, &relative, &metadata, None)?,
+                        metadata: recovery_filesystem_metadata(
+                            &path,
+                            &relative,
+                            &metadata,
+                            None,
+                            allow_hard_linked_git_objects,
+                        )?,
                         target: fs::read_link(&path).map_err(|source| {
                             recovery_transaction_io("read repository generation symlink", source)
                         })?,
@@ -1868,8 +1903,13 @@ impl RecoveryGeneration {
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let current_root = fs::symlink_metadata(root)
             .map_err(|source| recovery_transaction_io("recheck repository root", source))?;
-        let current_root_value =
-            recovery_filesystem_metadata(root, Path::new("."), &current_root, None)?;
+        let current_root_value = recovery_filesystem_metadata(
+            root,
+            Path::new("."),
+            &current_root,
+            None,
+            allow_hard_linked_git_objects,
+        )?;
         if current_root_value != root_value {
             return Err(recovery_transaction_blocked(
                 "repository root changed while its generation was captured",
@@ -1917,13 +1957,17 @@ fn recovery_filesystem_metadata(
     relative: &Path,
     metadata: &fs::Metadata,
     opened: Option<&fs::File>,
+    allow_hard_linked_git_objects: bool,
 ) -> Result<RecoveryFilesystemMetadata, GitError> {
     ensure_no_recovery_extended_attributes(path, relative)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
-        if metadata.file_type().is_file() && metadata.nlink() != 1 {
+        if metadata.file_type().is_file()
+            && metadata.nlink() != 1
+            && !(allow_hard_linked_git_objects && relative.starts_with(".git/objects"))
+        {
             return Err(recovery_transaction_blocked(format!(
                 "atomic recovery does not support hard-linked file {}",
                 relative.display()
@@ -1938,7 +1982,7 @@ fn recovery_filesystem_metadata(
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, relative, opened);
+        let _ = (path, relative, opened, allow_hard_linked_git_objects);
         Ok(RecoveryFilesystemMetadata {
             mode: recovery_file_mode(metadata),
             owner: (0, 0),
@@ -2090,7 +2134,13 @@ fn create_recovery_candidate(parent: &Path, root: &Path) -> Result<(PathBuf, Vec
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        match fs::create_dir(&candidate) {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
             Ok(()) => {
                 let root_identity =
                     recovery_file_identity(&fs::symlink_metadata(root).map_err(|source| {
@@ -4389,6 +4439,86 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exact_recovery_supports_hard_linked_objects_from_local_clone() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let source = initialized_repo()?;
+        let clone = TempRepo::new()?;
+        let output = Command::new("git")
+            .args(["clone", "--local", "--"])
+            .arg(source.path())
+            .arg(clone.path())
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "local git clone failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        clone.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        clone.run(["config", "user.name", "bitbygit test"])?;
+
+        let oid = clone.git_stdout(["rev-parse", "HEAD"])?;
+        let oid = oid.trim();
+        let object = PathBuf::from(".git/objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        assert!(fs::metadata(clone.path().join(&object))?.nlink() > 1);
+
+        let root = clone.path().canonicalize()?;
+        let baseline = RecoveryGeneration::capture(&root)?;
+        let parent = root.parent().ok_or("local clone has no parent")?;
+        let (candidate, _) = create_recovery_candidate(parent, &root)?;
+        let mut transaction = RecoveryTransaction {
+            root: root.clone(),
+            backup_pointer: recovery_backup_pointer_path(&candidate)?,
+            candidate,
+            baseline,
+            keep_candidate: false,
+        };
+        transaction.copy_repository()?;
+        assert_eq!(
+            RecoveryGeneration::capture_isolated(&transaction.candidate)?,
+            transaction.baseline
+        );
+        assert_eq!(
+            fs::metadata(transaction.candidate.join(&object))?.nlink(),
+            1
+        );
+        drop(transaction);
+
+        clone.write("conflict.txt", "base\n")?;
+        clone.run(["add", "conflict.txt"])?;
+        clone.run(["commit", "-m", "base"])?;
+        clone.run(["switch", "-c", "other"])?;
+        clone.write("conflict.txt", "other\n")?;
+        clone.run(["commit", "-am", "other"])?;
+        clone.run(["switch", "main"])?;
+        clone.write("conflict.txt", "main\n")?;
+        clone.run(["commit", "-am", "main"])?;
+        clone.run_allow_failure(["merge", "other"])?;
+        let git = Git::new(clone.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(fs::metadata(clone.path().join(object))?.nlink(), 1);
+        Ok(())
+    }
+
     #[test]
     fn exact_rebase_promotes_and_reports_subsequent_conflicts() -> Result<(), Box<dyn Error>> {
         let continue_repo = prepare_two_conflict_rebase()?;
@@ -4694,6 +4824,13 @@ mod tests {
             let Some(parent) = root.parent() else {
                 return;
             };
+            let Ok(root_metadata) = fs::symlink_metadata(root) else {
+                return;
+            };
+            let root_identity = recovery_file_identity(&root_metadata);
+            let mut expected_owner = Vec::with_capacity(16);
+            expected_owner.extend_from_slice(&root_identity.0.to_le_bytes());
+            expected_owner.extend_from_slice(&root_identity.1.to_le_bytes());
             let Ok(entries) = fs::read_dir(parent) else {
                 return;
             };
@@ -4702,6 +4839,8 @@ mod tests {
                     .file_name()
                     .as_encoded_bytes()
                     .starts_with(RECOVERY_CANDIDATE_PREFIX.as_bytes())
+                    && fs::read(recovery_candidate_owner_path(&entry.path()))
+                        .is_ok_and(|owner| owner.starts_with(&expected_owner))
                 {
                     let _ = symlink(
                         &hook_victim,
@@ -4745,6 +4884,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&victim)?, "must remain unchanged\n");
         fs::remove_file(owner)?;
         fs::remove_file(victim)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_candidate_is_private_under_shared_parent() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = TempRepo::new()?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755))?;
+        let root = parent.path().join("private-repository");
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        fs::write(root.join("secret.txt"), "private\n")?;
+        fs::set_permissions(root.join("secret.txt"), fs::Permissions::from_mode(0o644))?;
+
+        let (candidate, _) = create_recovery_candidate(&parent.path(), &root)?;
+
+        assert_eq!(
+            fs::metadata(parent.path())?.permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&candidate)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(recovery_candidate_owner_path(&candidate))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         Ok(())
     }
 
