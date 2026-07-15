@@ -475,7 +475,18 @@ impl App {
     }
 
     fn execute_operation(&mut self, plan: OperationPlan, context: ExecutionContext) {
-        let message = execute_typed_plan(&plan, context, self.policy.clone());
+        let executor = PlanExecutor::current(self.policy.clone());
+        self.execute_operation_with(&executor, plan, context);
+    }
+
+    fn execute_operation_with(
+        &mut self,
+        executor: &PlanExecutor,
+        plan: OperationPlan,
+        context: ExecutionContext,
+    ) {
+        let message = executor.execute(&plan, context).message();
+        self.reload_policy(&executor.audit);
         if should_refresh_status_after(&plan) {
             self.refresh_status();
         }
@@ -3257,16 +3268,6 @@ fn operation_message(action: &str, result: Result<(), String>) -> String {
         Ok(()) => format!("{action} succeeded"),
         Err(error) => format!("{action} failed: {error}"),
     }
-}
-
-fn execute_typed_plan(
-    plan: &OperationPlan,
-    context: ExecutionContext,
-    policy: EffectivePolicy,
-) -> String {
-    PlanExecutor::current(policy)
-        .execute(plan, context)
-        .message()
 }
 
 fn should_refresh_status_after(plan: &OperationPlan) -> bool {
@@ -7857,6 +7858,49 @@ mod tests {
             git_stdout(&repo, &["diff", "--cached", "--name-only"])?.trim(),
             "next.txt"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_reloads_policy_before_ordinary_post_operation_refresh_on_success_or_failure()
+    -> Result<(), Box<dyn Error>> {
+        for (name, remote_exists, expected_outcome) in
+            [("success", true, "succeeded"), ("failure", false, "failed")]
+        {
+            let repo = isolated_git_repo(&format!("post-operation-refresh-policy-{name}"))?;
+            let remote = if remote_exists {
+                isolated_bare_git_repo(&format!("post-operation-refresh-policy-{name}-remote"))?
+            } else {
+                repo.join("missing-remote.git")
+            };
+            add_github_remote(&repo, "origin", &remote)?;
+            let paths =
+                isolated_store_paths(&format!("post-operation-refresh-policy-{name}-audit"))?;
+            let store = LocalStore::open(paths.clone())?;
+            let ssh = operation_disabling_ssh(
+                &format!("post-operation-refresh-policy-{name}"),
+                &store.paths().config_file,
+                "refresh-status",
+            )?;
+            let executor = PlanExecutor::with_audit_paths_and_ssh(&repo, paths, ssh);
+            let sentinel = FileRow {
+                path: PathBuf::from("keep.txt"),
+                pathspecs: vec![PathBuf::from("keep.txt")],
+                label: "sentinel".to_owned(),
+                section: FileSection::Unstaged,
+            };
+            let mut app = App::new();
+            app.files = vec![sentinel.clone()];
+
+            app.execute_operation_with(&executor, fetch_plan(), ExecutionContext::default());
+
+            assert!(
+                app.policy
+                    .is_operation_disabled(OperationKind::RefreshStatus)
+            );
+            assert_eq!(app.files, vec![sentinel]);
+            assert!(app.details.contains(expected_outcome), "{}", app.details);
+        }
         Ok(())
     }
 
