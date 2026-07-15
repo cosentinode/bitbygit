@@ -39,6 +39,39 @@ high = "explicit-confirmation"
 enabled = true
 ```
 
+## Examples
+
+Use a repository branch other than the provider default for pull requests opened
+without an explicit target:
+
+```toml
+[pull-requests]
+default-base-branch = "develop"
+```
+
+For `open pr`, the target is selected in this order: an explicit prompt target
+such as `open pr to release`, `default-base-branch`, then the GitHub repository's
+default branch. The selected branch is checked against the upstream GitHub
+repository during planning on both GitHub.com and GitHub Enterprise. If a
+configured branch does not exist, the operation is blocked with guidance to fix
+the setting or provide an explicit target.
+
+Add team-specific protected branches, require stronger confirmation, disable
+selected operation families, and turn off prompt input:
+
+```toml
+[policy]
+additional-protected-branches = ["production", "stable/*"]
+disabled-operations = ["rebase"]
+
+[policy.confirmation]
+medium = "explicit-confirmation"
+high = "blocked"
+
+[prompt]
+enabled = false
+```
+
 Setting `prompt.enabled` to `false` rejects prompt submissions. It does not
 alter operation policy, and the prompt configuration has no command, shell, or
 hook extension points; enabled prompts still produce only built-in typed plans.

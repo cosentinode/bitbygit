@@ -10,6 +10,7 @@ pub struct EffectivePolicy {
     additional_protected_branches: Vec<String>,
     confirmation: ConfirmationConfig,
     disabled_operations: Vec<OperationFamily>,
+    default_pull_request_base: Option<String>,
     prompt_enabled: bool,
 }
 
@@ -25,6 +26,7 @@ impl EffectivePolicy {
             additional_protected_branches: config.policy.additional_protected_branches.clone(),
             confirmation: config.policy.confirmation.clone(),
             disabled_operations: config.policy.disabled_operations.clone(),
+            default_pull_request_base: config.pull_requests.default_base_branch.clone(),
             prompt_enabled: config.prompt.enabled,
         }
     }
@@ -110,6 +112,10 @@ impl EffectivePolicy {
 
     pub const fn prompt_enabled(&self) -> bool {
         self.prompt_enabled
+    }
+
+    pub fn default_pull_request_base(&self) -> Option<&str> {
+        self.default_pull_request_base.as_deref()
     }
 }
 
@@ -388,6 +394,21 @@ mod tests {
 
         config.prompt.enabled = false;
         assert!(!EffectivePolicy::new(&config).prompt_enabled());
+    }
+
+    #[test]
+    fn pull_request_default_is_available_to_runtime_planning() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            EffectivePolicy::new(&config).default_pull_request_base(),
+            None
+        );
+
+        config.pull_requests.default_base_branch = Some("develop".to_owned());
+        assert_eq!(
+            EffectivePolicy::new(&config).default_pull_request_base(),
+            Some("develop")
+        );
     }
 
     #[test]

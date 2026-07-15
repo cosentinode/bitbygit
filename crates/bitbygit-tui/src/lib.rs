@@ -2514,7 +2514,15 @@ impl OperationPlanner {
             &canonical_github_repository,
             &upstream_branch,
         )?;
-        let base = requested_base.unwrap_or(repository.default_branch);
+        let configured_base =
+            requested_base.is_none() && self.policy.default_pull_request_base().is_some();
+        let base = requested_base
+            .or_else(|| {
+                self.policy
+                    .default_pull_request_base()
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or(repository.default_branch);
         if canonical_head_github_repository.eq_ignore_ascii_case(&canonical_github_repository)
             && base == upstream_branch
         {
@@ -2527,10 +2535,16 @@ impl OperationPlanner {
             .branch_exists(&base)
             .map_err(open_pull_request_gh_error)?
         {
-            return Err(format!(
+            let mut error = format!(
                 "Open pull request blocked: base branch {base} was not found in {}.",
                 repository.name_with_owner
-            ));
+            );
+            if configured_base {
+                error.push_str(
+                    " Update pull-requests.default-base-branch or choose an existing branch with `open pr to <branch>`.",
+                );
+            }
+            return Err(error);
         }
         let existing = github
             .existing_pull_requests(&head)
@@ -5589,6 +5603,57 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pull_request_base_precedence_is_explicit_then_configured_then_provider()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-base-precedence")?;
+        let fake_gh = fake_gh("open-pr-base-precedence", false)?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("release".to_owned());
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let configured = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            configured.plan.request,
+            OperationRequest::OpenPullRequest {
+                base: Some("release".to_owned())
+            }
+        );
+        assert!(configured.plan.preview_text().contains("base: release"));
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-base-precedence-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&configured.plan, configured.context);
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert!(
+            std::fs::read_to_string(fake_gh.with_file_name("invocations"))?
+                .contains("--base release")
+        );
+
+        let explicit = planner
+            .plan_request(OperationRequest::OpenPullRequest {
+                base: Some("main".to_owned()),
+            })
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            explicit.plan.request,
+            OperationRequest::OpenPullRequest {
+                base: Some("main".to_owned())
+            }
+        );
+        assert!(explicit.plan.preview_text().contains("base: main"));
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_https_pull_request_uses_authenticated_api_not_repository_credential_helpers()
@@ -5642,10 +5707,12 @@ mod tests {
             ],
         )?;
         let fake_gh = fake_gh("open-pr-enterprise-https", false)?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("release".to_owned());
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
-            policy: EffectivePolicy::default(),
+            policy: EffectivePolicy::new(&config),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -5657,7 +5724,7 @@ mod tests {
             operation
                 .plan
                 .preview_text()
-                .contains("https://git.example.com/octo/repo/compare/main...feature/open-pr")
+                .contains("https://git.example.com/octo/repo/compare/release...feature/open-pr")
         );
         let execution = PlanExecutor::with_audit_paths_and_ssh(
             &repo,
@@ -5676,6 +5743,7 @@ mod tests {
         assert!(invocations.contains("--hostname git.example.com"));
         assert!(invocations.contains("pr create"));
         assert!(invocations.contains("--repo git.example.com/octo/repo"));
+        assert!(invocations.contains("--base release"));
         Ok(())
     }
 
@@ -5961,6 +6029,35 @@ mod tests {
         };
 
         assert!(error.contains("base branch missing was not found"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_configured_pull_request_base_fails_closed_with_guidance()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-missing-configured-base")?;
+        let fake_gh = fake_gh("open-pr-missing-configured-base", false)?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("missing".to_owned());
+        let planner = OperationPlanner {
+            repo_root: repo,
+            github_executable: Some(fake_gh),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let error = match planner.plan_request(OperationRequest::OpenPullRequest { base: None }) {
+            Ok(_) => {
+                return Err(
+                    std::io::Error::other("missing configured base must fail closed").into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains("base branch missing was not found"));
+        assert!(error.contains("pull-requests.default-base-branch"));
+        assert!(error.contains("open pr to <branch>"));
         Ok(())
     }
 
@@ -7550,7 +7647,10 @@ mod tests {
     fn startup_policy_fails_closed_and_surfaces_malformed_config() -> Result<(), Box<dyn Error>> {
         let paths = isolated_store_paths("invalid-startup-policy")?;
         let store = LocalStore::open(paths.clone())?;
-        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+        std::fs::write(
+            &store.paths().config_file,
+            "credential = \"super-secret-value\"\nnot valid toml = [",
+        )?;
 
         let startup = startup_policy_from_paths(&paths);
 
@@ -7562,7 +7662,9 @@ mod tests {
                 .is_some_and(|diagnostic| diagnostic.contains("is invalid"))
         );
         let app = App::from_startup(startup);
-        assert!(details_text(&app).contains("safe fallback configuration"));
+        let details = details_text(&app);
+        assert!(details.contains("safe fallback configuration"));
+        assert!(!details.contains("super-secret-value"));
         Ok(())
     }
 
