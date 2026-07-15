@@ -46,6 +46,7 @@ const MAX_RECOVERY_PATH_BYTES: usize = 256 * 1024;
 const MAX_RECOVERY_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_METADATA_ENTRIES: usize = 4_096;
 const MAX_RECOVERY_SUBPROCESSES: usize = 12;
+const MAX_RECOVERY_COMMAND_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_RECOVERY_GENERATION_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_GENERATION_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_GENERATION_FILE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1670,7 +1671,11 @@ impl RecoveryTransaction {
                 .unwrap_or_else(|| "ssh".to_owned());
             command.env("GIT_SSH_COMMAND", format!("{ssh_executable} {SSH_OPTIONS}"));
         }
-        let output = run_bounded_recovery_command(&mut command, args.clone())?;
+        let output = run_bounded_recovery_command(
+            &mut command,
+            args.clone(),
+            recovery_command_duration(&self.root),
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
@@ -1815,22 +1820,15 @@ impl RecoveryGeneration {
         let mut file_bytes = 0_u64;
         while let Some(relative_dir) = pending.pop() {
             let directory = root.join(&relative_dir);
-            let mut children = fs::read_dir(&directory)
-                .map_err(|source| recovery_transaction_io("read repository generation", source))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|source| recovery_transaction_io("read repository generation", source))?;
-            children.sort_by_key(|entry| entry.file_name());
+            let children = read_recovery_generation_children(
+                &directory,
+                &relative_dir,
+                entries.len(),
+                &mut path_bytes,
+                MAX_RECOVERY_GENERATION_ENTRIES,
+            )?;
             for child in children.into_iter().rev() {
                 let relative = relative_dir.join(child.file_name());
-                path_bytes =
-                    path_bytes.saturating_add(relative.as_os_str().as_encoded_bytes().len());
-                if entries.len() == MAX_RECOVERY_GENERATION_ENTRIES
-                    || path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
-                {
-                    return Err(recovery_transaction_blocked(
-                        "repository generation exceeds atomic recovery entry or path bounds",
-                    ));
-                }
                 let path = child.path();
                 let metadata = fs::symlink_metadata(&path).map_err(|source| {
                     recovery_transaction_io("inspect repository generation entry", source)
@@ -2001,6 +1999,36 @@ impl RecoveryGeneration {
         }
         digest.finalize().into()
     }
+}
+
+fn read_recovery_generation_children(
+    directory: &Path,
+    relative_dir: &Path,
+    captured_entries: usize,
+    path_bytes: &mut usize,
+    entry_limit: usize,
+) -> Result<Vec<fs::DirEntry>, GitError> {
+    let mut children = Vec::new();
+    for child in fs::read_dir(directory)
+        .map_err(|source| recovery_transaction_io("read repository generation", source))?
+    {
+        let child = child
+            .map_err(|source| recovery_transaction_io("read repository generation", source))?;
+        let relative = relative_dir.join(child.file_name());
+        let next_path_bytes =
+            path_bytes.saturating_add(relative.as_os_str().as_encoded_bytes().len());
+        if captured_entries.saturating_add(children.len()) >= entry_limit
+            || next_path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
+        {
+            return Err(recovery_transaction_blocked(
+                "repository generation exceeds atomic recovery entry or path bounds",
+            ));
+        }
+        *path_bytes = next_path_bytes;
+        children.push(child);
+    }
+    children.sort_by_key(|entry| entry.file_name());
+    Ok(children)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2243,26 +2271,13 @@ fn remove_recovery_directory_contents(
 ) -> Result<(), GitError> {
     use rustix::fs::{FileType, Mode, OFlags, openat};
 
-    let names = rustix::fs::Dir::read_from(directory)
-        .map_err(|source| recovery_cleanup_error("read recovery cleanup directory", source))?
-        .filter_map(|entry| match entry {
-            Ok(entry) if entry.file_name().to_bytes() == b"." => None,
-            Ok(entry) if entry.file_name().to_bytes() == b".." => None,
-            Ok(entry) => Some(Ok(entry.file_name().to_owned())),
-            Err(source) => Some(Err(source)),
-        })
-        .collect::<Result<Vec<CString>, _>>()
-        .map_err(|source| recovery_cleanup_error("read recovery cleanup entry", source))?;
+    let names = read_recovery_cleanup_names(
+        directory,
+        entries,
+        path_bytes,
+        MAX_RECOVERY_GENERATION_ENTRIES,
+    )?;
     for name in names {
-        *entries = entries.saturating_add(1);
-        *path_bytes = path_bytes.saturating_add(name.as_bytes().len());
-        if *entries > MAX_RECOVERY_GENERATION_ENTRIES
-            || *path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES
-        {
-            return Err(recovery_transaction_blocked(
-                "recovery cleanup exceeds atomic recovery entry or path bounds",
-            ));
-        }
         let entry_fd = match openat(
             directory,
             name.as_c_str(),
@@ -2325,6 +2340,36 @@ fn remove_recovery_directory_contents(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_recovery_cleanup_names(
+    directory: &impl std::os::fd::AsFd,
+    entries: &mut usize,
+    path_bytes: &mut usize,
+    entry_limit: usize,
+) -> Result<Vec<CString>, GitError> {
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(directory)
+        .map_err(|source| recovery_cleanup_error("read recovery cleanup directory", source))?
+    {
+        let entry = entry
+            .map_err(|source| recovery_cleanup_error("read recovery cleanup entry", source))?;
+        if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = entry.file_name().to_owned();
+        let next_path_bytes = path_bytes.saturating_add(name.as_bytes().len());
+        if *entries >= entry_limit || next_path_bytes > MAX_RECOVERY_GENERATION_PATH_BYTES {
+            return Err(recovery_transaction_blocked(
+                "recovery cleanup exceeds atomic recovery entry or path bounds",
+            ));
+        }
+        *entries += 1;
+        *path_bytes = next_path_bytes;
+        names.push(name);
+    }
+    Ok(names)
 }
 
 #[cfg(target_os = "linux")]
@@ -2986,6 +3031,25 @@ fn run_recovery_sidecar_hook(path: &Path) {
 #[cfg(not(test))]
 fn run_recovery_sidecar_hook(_path: &Path) {}
 
+#[cfg(test)]
+static RECOVERY_COMMAND_DURATIONS: std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn recovery_command_duration(root: &Path) -> std::time::Duration {
+    if let Ok(mut durations) = RECOVERY_COMMAND_DURATIONS.lock()
+        && let Some(index) = durations.iter().position(|(target, _)| target == root)
+    {
+        return durations.swap_remove(index).1;
+    }
+    MAX_RECOVERY_COMMAND_DURATION
+}
+
+#[cfg(not(test))]
+fn recovery_command_duration(_root: &Path) -> std::time::Duration {
+    MAX_RECOVERY_COMMAND_DURATION
+}
+
 #[derive(Default)]
 struct RecoveryCapture {
     output_bytes: usize,
@@ -3039,7 +3103,11 @@ impl RecoveryCapture {
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never")
             .args(&args);
-        let output = run_bounded_recovery_command(&mut command, display_args.clone())?;
+        let output = run_bounded_recovery_command(
+            &mut command,
+            display_args.clone(),
+            MAX_RECOVERY_COMMAND_DURATION,
+        )?;
         let bytes = output.stdout.len().saturating_add(output.stderr.len());
         self.output_bytes = self.output_bytes.saturating_add(bytes);
         if self.output_bytes > MAX_RECOVERY_OUTPUT_BYTES {
@@ -3105,13 +3173,17 @@ impl RecoveryCapture {
 fn run_bounded_recovery_command(
     command: &mut Command,
     args: Vec<String>,
+    duration: std::time::Duration,
 ) -> Result<RawProcessOutput, GitError> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|source| GitError::Io {
         args: args.clone(),
         source,
@@ -3144,8 +3216,19 @@ fn run_bounded_recovery_command(
         std::thread::spawn(move || read_bounded_recovery_output(stdout, stdout_bytes, stdout_stop));
     let stderr_reader =
         std::thread::spawn(move || read_bounded_recovery_output(stderr, stderr_bytes, stderr_stop));
+    let started = std::time::Instant::now();
+    let mut deadline_exceeded = false;
     let status = loop {
         if output_bytes.load(std::sync::atomic::Ordering::Relaxed) > MAX_RECOVERY_OUTPUT_BYTES {
+            #[cfg(target_os = "linux")]
+            let termination = terminate_recovery_process_group(&mut child);
+            #[cfg(not(target_os = "linux"))]
+            let termination = child.kill();
+            let status = child.wait();
+            break termination.and(status);
+        }
+        if started.elapsed() >= duration {
+            deadline_exceeded = true;
             #[cfg(target_os = "linux")]
             let termination = terminate_recovery_process_group(&mut child);
             #[cfg(not(target_os = "linux"))]
@@ -3195,6 +3278,12 @@ fn run_bounded_recovery_command(
     if output_bytes.load(std::sync::atomic::Ordering::Relaxed) > MAX_RECOVERY_OUTPUT_BYTES {
         return Err(recovery_bound_error(format!(
             "Git output bytes exceed {MAX_RECOVERY_OUTPUT_BYTES}"
+        )));
+    }
+    if deadline_exceeded {
+        return Err(recovery_bound_error(format!(
+            "Git command exceeded its {}ms execution deadline",
+            duration.as_millis()
         )));
     }
     Ok(RawProcessOutput {
@@ -5312,6 +5401,78 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn recovery_deadline_terminates_quiet_hook_without_promoting() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let hook = repo.path().join(".git/hooks/commit-msg");
+        let hook_pid = repo.path().with_extension("hanging-hook-pid");
+        let late_side_effect = repo.path().with_extension("hanging-hook-late-effect");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' $$ > {}\nsleep 30\ntouch {}\n",
+                shell_quote(&hook_pid.to_string_lossy()),
+                shell_quote(&late_side_effect.to_string_lossy())
+            ),
+        )?;
+        let mut permissions = fs::metadata(&hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions)?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let root = repo.path().canonicalize()?;
+        RECOVERY_COMMAND_DURATIONS
+            .lock()
+            .map_err(|_| "recovery command duration lock poisoned")?
+            .push((root.clone(), std::time::Duration::from_secs(1)));
+
+        let started = std::time::Instant::now();
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        ) else {
+            return Err("expected quiet recovery hook to exceed the execution deadline".into());
+        };
+
+        assert!(error.to_string().contains("execution deadline"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "recovery waited indefinitely for a quiet hook"
+        );
+        let pid = fs::read_to_string(&hook_pid)?.trim().parse::<i32>()?;
+        let pid = rustix::process::Pid::from_raw(pid).ok_or("invalid hanging hook pid")?;
+        for _ in 0..200 {
+            if rustix::process::test_kill_process(pid).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "quiet recovery hook survived deadline termination"
+        );
+        assert!(!late_side_effect.exists());
+        assert_eq!(git.recovery_state()?, expected);
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(recovery_backup_from_pointer(&root)?, None);
+        fs::remove_file(hook_pid)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn recovery_terminates_quiet_hook_descendants_after_git_exits() -> Result<(), Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6589,6 +6750,53 @@ mod tests {
             return Err("expected wide recovery metadata tree to exceed entry bound".into());
         };
         assert!(error.to_string().contains("metadata entries"));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_generation_collection_rejects_an_over_limit_wide_directory()
+    -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        let wide = repo.path().join("wide");
+        fs::create_dir(&wide)?;
+        for name in ["a", "b", "c"] {
+            fs::write(wide.join(name), [])?;
+        }
+        let mut path_bytes = 0;
+
+        let Err(error) =
+            read_recovery_generation_children(&wide, Path::new("wide"), 0, &mut path_bytes, 2)
+        else {
+            return Err("expected wide generation directory to exceed entry bound".into());
+        };
+
+        assert!(error.to_string().contains("entry or path bounds"));
+        assert!(path_bytes <= "wide/a".len() + "wide/b".len());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_cleanup_collection_rejects_an_over_limit_wide_directory()
+    -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        let wide = repo.path().join("wide");
+        fs::create_dir(&wide)?;
+        for name in ["a", "b", "c"] {
+            fs::write(wide.join(name), [])?;
+        }
+        let directory = fs::File::open(&wide)?;
+        let mut entries = 0;
+        let mut path_bytes = 0;
+
+        let Err(error) = read_recovery_cleanup_names(&directory, &mut entries, &mut path_bytes, 2)
+        else {
+            return Err("expected wide cleanup directory to exceed entry bound".into());
+        };
+
+        assert!(error.to_string().contains("entry or path bounds"));
+        assert_eq!(entries, 2);
+        assert_eq!(path_bytes, 2);
         Ok(())
     }
 
