@@ -931,18 +931,40 @@ impl Git {
             ],
             capture,
         )?;
+        ensure_recovery_path_has_no_symlink_ancestors(
+            git_dir,
+            Path::new("info/attributes"),
+            "repository attributes",
+            false,
+        )?;
+        let attributes = snapshot_recovery_paths(
+            [(
+                PathBuf::from("info/attributes"),
+                git_dir.join("info/attributes"),
+            )],
+            capture,
+        )?;
         let hooks_path = path_from_bytes(strip_byte_line_ending(&capture.required(
             self,
             &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
         )?));
         let hooks_location = match hooks_path.strip_prefix(root) {
-            Ok(relative) => RecoveryHookLocation::Repository(relative.to_owned()),
+            Ok(relative) => {
+                ensure_recovery_path_has_no_symlink_ancestors(
+                    root,
+                    relative,
+                    "repository hook directory",
+                    true,
+                )?;
+                RecoveryHookLocation::Repository(relative.to_owned())
+            }
             Err(_) => RecoveryHookLocation::External(hooks_path.clone()),
         };
         let hooks = snapshot_recovery_paths([(PathBuf::from("hooks"), hooks_path)], capture)?;
         Ok(RecoveryExecutionState {
             config,
             config_files,
+            attributes,
             hooks_location,
             hooks,
         })
@@ -1744,6 +1766,18 @@ impl RecoveryTransaction {
             ));
         }
         run_recovery_execution_hook(&self.root);
+        let mut final_capture = RecoveryCapture::default();
+        let candidate_execution = candidate_git.recovery_execution_state(
+            &candidate_root,
+            &candidate_git_dir,
+            &mut final_capture,
+        )?;
+        let live_state = git.recovery_state()?;
+        if live_state != *expected_state || candidate_execution != expected_state.execution {
+            return Err(recovery_transaction_blocked(
+                "repository state, configuration, attributes, or hooks changed before isolated recovery execution",
+            ));
+        }
         let mut command = Command::new("unshare");
         command
             .args([
@@ -2385,6 +2419,53 @@ fn remove_recovery_directory(path: &Path, expected_identity: (u64, u64)) -> Resu
 }
 
 #[cfg(target_os = "linux")]
+fn remove_recovery_file(path: &Path, expected_identity: (u64, u64)) -> Result<(), GitError> {
+    use rustix::fs::{CWD, FileType, Mode, OFlags, openat};
+
+    let parent = path.parent().ok_or_else(|| {
+        recovery_transaction_blocked("recovery cleanup file has no parent directory")
+    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| recovery_transaction_blocked("recovery cleanup file has no file name"))?;
+    let name = CString::new(name.as_encoded_bytes())
+        .map_err(|_| recovery_transaction_blocked("recovery cleanup file has an invalid name"))?;
+    let parent_fd = openat(
+        CWD,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| recovery_cleanup_error("open recovery file cleanup parent", source))?;
+    let entry = match openat(
+        &parent_fd,
+        name.as_c_str(),
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(entry) => entry,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(source) => {
+            return Err(recovery_cleanup_error("open recovery cleanup file", source));
+        }
+    };
+    let metadata = rustix::fs::fstat(&entry)
+        .map_err(|source| recovery_cleanup_error("inspect recovery cleanup file", source))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || recovery_fd_identity(&entry)? != expected_identity
+    {
+        return Err(recovery_transaction_blocked(
+            "recovery cleanup file identity changed; refusing to remove it",
+        ));
+    }
+    let mount_id = recovery_fd_mount_id(&entry)?;
+    ensure_recovery_cleanup_entry(&parent_fd, name.as_c_str(), expected_identity, mount_id)?;
+    rustix::fs::unlinkat(&parent_fd, name.as_c_str(), rustix::fs::AtFlags::empty())
+        .map_err(|source| recovery_cleanup_error("remove recovery cleanup file", source))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn remove_recovery_directory_contents(
     directory: &impl std::os::fd::AsFd,
     root_mount_id: u64,
@@ -2567,6 +2648,13 @@ fn recovery_cleanup_error(action: &str, source: rustix::io::Errno) -> GitError {
 fn remove_recovery_directory(_path: &Path, _expected_identity: (u64, u64)) -> Result<(), GitError> {
     Err(recovery_transaction_blocked(
         "safe recovery cleanup is not supported on this platform",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_recovery_file(_path: &Path, _expected_identity: (u64, u64)) -> Result<(), GitError> {
+    Err(recovery_transaction_blocked(
+        "safe recovery file cleanup is not supported on this platform",
     ))
 }
 
@@ -2791,6 +2879,8 @@ fn recovery_backup_pointer_path(root: &Path) -> Result<PathBuf, GitError> {
 
 struct RecoveryBackup {
     path: PathBuf,
+    owner_identity: (u64, u64),
+    pointer_identity: (u64, u64),
 }
 
 fn recovery_backup_record_from_pointer(
@@ -2843,12 +2933,14 @@ fn recovery_backup_record_from_pointer(
         .as_ref()
         .is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound);
     let owner = recovery_candidate_owner_path(&backup);
-    let valid_owner = fs::symlink_metadata(&owner)
+    let owner_metadata = fs::symlink_metadata(&owner);
+    let valid_owner = owner_metadata
+        .as_ref()
         .ok()
         .and_then(|metadata| {
             read_recovery_sidecar(
                 &owner,
-                &metadata,
+                metadata,
                 RECOVERY_BACKUP_IDENTITY_BYTES as u64,
                 Some(RECOVERY_BACKUP_IDENTITY_BYTES as u64),
             )
@@ -2862,7 +2954,16 @@ fn recovery_backup_record_from_pointer(
     {
         return Err(invalid_recovery_backup_pointer());
     }
-    Ok(Some(RecoveryBackup { path: backup }))
+    let owner_identity = recovery_file_identity(
+        owner_metadata
+            .as_ref()
+            .map_err(|_| invalid_recovery_backup_pointer())?,
+    );
+    Ok(Some(RecoveryBackup {
+        path: backup,
+        owner_identity,
+        pointer_identity: recovery_file_identity(&pointer_metadata),
+    }))
 }
 
 #[cfg(test)]
@@ -2986,8 +3087,14 @@ fn remove_previous_recovery_backup(root: &Path) -> Result<(), GitError> {
             backup.path.display()
         )));
     }
-    fs::remove_file(recovery_backup_pointer_path(root)?)
-        .map_err(|source| recovery_transaction_io("remove the previous backup pointer", source))?;
+    remove_recovery_file(
+        &recovery_candidate_owner_path(&backup.path),
+        backup.owner_identity,
+    )?;
+    remove_recovery_file(
+        &recovery_backup_pointer_path(root)?,
+        backup.pointer_identity,
+    )?;
     Ok(())
 }
 
@@ -3068,14 +3175,15 @@ fn append_recovery_backup_notice(output: &mut String, backup: &Path) {
 
 #[cfg(target_os = "linux")]
 fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> {
-    let source = create_recovery_probe_directory(parent)?;
-    let target = match create_recovery_probe_directory(parent) {
+    let (source, source_identity) = create_recovery_probe_directory(parent)?;
+    let (target, target_identity) = match create_recovery_probe_directory(parent) {
         Ok(target) => target,
         Err(error) => {
-            let _ = fs::remove_dir(&source);
+            let _ = remove_recovery_directory(&source, source_identity);
             return Err(error);
         }
     };
+    let mut exchanged = false;
     let result = (|| {
         let _mount_id = recovery_mount_id(&source, Path::new("capability probe"))?;
         let output = Command::new("unshare")
@@ -3113,11 +3221,28 @@ fn ensure_recovery_platform_capabilities(parent: &Path) -> Result<(), GitError> 
             recovery_capability_unavailable(format!(
                 "same-filesystem atomic directory exchange is not available: {error}"
             ))
-        })
+        })?;
+        exchanged = true;
+        Ok(())
     })();
-    let _ = fs::remove_dir_all(&source);
-    let _ = fs::remove_dir_all(&target);
-    result
+    run_recovery_probe_cleanup_hook(parent);
+    let source_cleanup = remove_recovery_directory(
+        &source,
+        if exchanged {
+            target_identity
+        } else {
+            source_identity
+        },
+    );
+    let target_cleanup = remove_recovery_directory(
+        &target,
+        if exchanged {
+            source_identity
+        } else {
+            target_identity
+        },
+    );
+    result.and(source_cleanup).and(target_cleanup)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3127,7 +3252,7 @@ fn ensure_recovery_platform_capabilities(_parent: &Path) -> Result<(), GitError>
     ))
 }
 
-fn create_recovery_probe_directory(parent: &Path) -> Result<PathBuf, GitError> {
+fn create_recovery_probe_directory(parent: &Path) -> Result<(PathBuf, (u64, u64)), GitError> {
     for attempt in 0..100_u32 {
         let candidate = parent.join(format!(
             ".bitbygit-recovery-capability-{}-{}-{attempt}",
@@ -3138,7 +3263,10 @@ fn create_recovery_probe_directory(parent: &Path) -> Result<PathBuf, GitError> {
                 .as_nanos()
         ));
         match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                let identity = recovery_path_identity(&candidate)?;
+                return Ok((candidate, identity));
+            }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
                 return Err(recovery_capability_unavailable(format!(
@@ -3203,6 +3331,23 @@ fn run_recovery_capability_hook(root: &Path) -> Result<(), GitError> {
 fn run_recovery_capability_hook(_root: &Path) -> Result<(), GitError> {
     Ok(())
 }
+
+#[cfg(test)]
+static RECOVERY_PROBE_CLEANUP_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_recovery_probe_cleanup_hook(parent: &Path) {
+    if let Ok(mut hooks) = RECOVERY_PROBE_CLEANUP_HOOKS.lock()
+        && let Some(index) = hooks.iter().position(|(target, _)| target == parent)
+    {
+        let (_, hook) = hooks.swap_remove(index);
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_recovery_probe_cleanup_hook(_parent: &Path) {}
 
 #[cfg(test)]
 static RECOVERY_PREPARE_HOOKS: std::sync::Mutex<Vec<(PathBuf, RecoveryCaptureHook)>> =
@@ -4170,6 +4315,104 @@ fn snapshot_recovery_paths(
     Ok(entries)
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_recovery_path_has_no_symlink_ancestors(
+    root: &Path,
+    relative: &Path,
+    description: &str,
+    final_must_be_directory: bool,
+) -> Result<(), GitError> {
+    use rustix::fs::{CWD, FileType, Mode, OFlags, openat};
+
+    let mut directory = openat(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| recovery_cleanup_error("open recovery path root", source))?;
+    let mut checked = PathBuf::new();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(recovery_transaction_blocked(format!(
+                "atomic recovery requires {description} to be beneath the repository"
+            )));
+        };
+        checked.push(name);
+        let name = CString::new(name.as_encoded_bytes()).map_err(|_| {
+            recovery_transaction_blocked(format!(
+                "atomic recovery {description} contains an invalid path component"
+            ))
+        })?;
+        let entry = match openat(
+            &directory,
+            name.as_c_str(),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(entry) => entry,
+            Err(rustix::io::Errno::NOENT) => return Ok(()),
+            Err(source) => {
+                return Err(recovery_cleanup_error(
+                    "inspect recovery path component",
+                    source,
+                ));
+            }
+        };
+        let metadata = rustix::fs::fstat(&entry)
+            .map_err(|source| recovery_cleanup_error("inspect recovery path component", source))?;
+        let file_type = FileType::from_raw_mode(metadata.st_mode);
+        let is_final = components.peek().is_none();
+        if file_type != FileType::Directory
+            && (!is_final || final_must_be_directory || file_type != FileType::RegularFile)
+        {
+            return Err(recovery_transaction_blocked(format!(
+                "atomic recovery rejects {description} with symlinked or non-directory component {}",
+                checked.display()
+            )));
+        }
+        if file_type == FileType::Directory {
+            directory = entry;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_recovery_path_has_no_symlink_ancestors(
+    root: &Path,
+    relative: &Path,
+    description: &str,
+    final_must_be_directory: bool,
+) -> Result<(), GitError> {
+    let mut path = root.to_owned();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(recovery_transaction_blocked(format!(
+                "atomic recovery requires {description} to be beneath the repository"
+            )));
+        };
+        path.push(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_dir()
+                    || (components.peek().is_none()
+                        && !final_must_be_directory
+                        && metadata.file_type().is_file()) => {}
+            Ok(_) => {
+                return Err(recovery_transaction_blocked(format!(
+                    "atomic recovery rejects {description} with a symlinked or non-directory component"
+                )));
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(recovery_transaction_io("inspect recovery path", source)),
+        }
+    }
+    Ok(())
+}
+
 fn recovery_metadata_io_error(path: &Path, source: std::io::Error) -> GitError {
     GitError::Io {
         args: vec![
@@ -4394,6 +4637,7 @@ pub struct RecoveryState {
 struct RecoveryExecutionState {
     config: Vec<u8>,
     config_files: Vec<RecoveryMetadataEntry>,
+    attributes: Vec<RecoveryMetadataEntry>,
     hooks_location: RecoveryHookLocation,
     hooks: Vec<RecoveryMetadataEntry>,
 }
@@ -6367,9 +6611,53 @@ mod tests {
         git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
 
         assert!(archived.is_dir());
+        assert!(!recovery_candidate_owner_path(&first_backup).exists());
         assert!(recovery_backup_from_pointer(&repo.path().canonicalize()?)?.is_some());
         fs::remove_dir_all(&archived)?;
-        let _ = fs::remove_file(recovery_candidate_owner_path(&first_backup));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_retained_backup_cleanup_removes_owner_sidecars() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+        )? {
+            return Ok(());
+        }
+        let mut previous_owner: Option<PathBuf> = None;
+        let mut archives = Vec::new();
+
+        for cycle in 0..3 {
+            let expected = git.recovery_state()?;
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+            if let Some(owner) = previous_owner.take() {
+                assert!(!owner.exists());
+            }
+            let root = repo.path().canonicalize()?;
+            let backup = recovery_backup_from_pointer(&root)?.ok_or("missing retained backup")?;
+            let owner = recovery_candidate_owner_path(&backup);
+            assert!(owner.is_file());
+            let archive = repo
+                .path()
+                .with_extension(format!("approved-backup-{cycle}"));
+            fs::rename(&backup, &archive)?;
+            archives.push(archive);
+            previous_owner = Some(owner);
+            if cycle < 2 {
+                repo.run_allow_failure(["merge", "other"])?;
+                assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+            }
+        }
+
+        for archive in archives {
+            fs::remove_dir_all(archive)?;
+        }
         Ok(())
     }
 
@@ -6453,6 +6741,62 @@ mod tests {
         assert!(error.to_string().contains("backup pointer is invalid"));
         assert!(backup.is_dir());
         assert_eq!(recovery_backup_from_pointer(&root)?, Some(backup));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probe_cleanup_rejects_synchronized_path_replacement() -> Result<(), Box<dyn Error>>
+    {
+        use std::sync::{Arc, Mutex};
+
+        let parent = TempRepo::new()?;
+        let replaced = Arc::new(Mutex::new(None));
+        let hook_replaced = Arc::clone(&replaced);
+        let hook_parent = parent.path();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let Ok(entries) = fs::read_dir(&hook_parent) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if !entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".bitbygit-recovery-capability-")
+                {
+                    continue;
+                }
+                let probe = entry.path();
+                let displaced = probe.with_extension("displaced");
+                if fs::rename(&probe, &displaced).is_ok() && fs::create_dir(&probe).is_ok() {
+                    let _ = fs::write(probe.join("replacement-sentinel"), "preserve\n");
+                    if let Ok(mut paths) = hook_replaced.lock() {
+                        *paths = Some((probe, displaced));
+                    }
+                }
+                return;
+            }
+        });
+        RECOVERY_PROBE_CLEANUP_HOOKS
+            .lock()
+            .map_err(|_| "recovery probe cleanup hook lock poisoned")?
+            .push((parent.path(), hook));
+
+        let Err(_error) = ensure_recovery_platform_capabilities(&parent.path()) else {
+            return Err("expected substituted capability probe cleanup to fail closed".into());
+        };
+
+        let (probe, displaced) = replaced
+            .lock()
+            .map_err(|_| "replaced probe lock poisoned")?
+            .take()
+            .ok_or("capability probe hook did not replace a probe")?;
+        assert_eq!(
+            fs::read_to_string(probe.join("replacement-sentinel"))?,
+            "preserve\n"
+        );
+        fs::remove_dir_all(probe)?;
+        fs::remove_dir_all(displaced)?;
         Ok(())
     }
 
@@ -7217,6 +7561,7 @@ mod tests {
                 execution: RecoveryExecutionState {
                     config: Vec::new(),
                     config_files: Vec::new(),
+                    attributes: Vec::new(),
                     hooks_location: RecoveryHookLocation::Repository(PathBuf::new()),
                     hooks: Vec::new(),
                 },
@@ -7325,6 +7670,185 @@ mod tests {
         assert!(!marker.exists());
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         fs::remove_dir_all(hooks)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_repository_hook_path_with_symlinked_parent() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let external = repo.path().with_extension("external-hooks-parent");
+        fs::create_dir(&external)?;
+        symlink(&external, repo.path().join("hooks"))?;
+        repo.run(["config", "core.hooksPath", "hooks/subdir"])?;
+
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        let Err(error) =
+            git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)
+        else {
+            return Err("expected a symlinked hook parent to block recovery".into());
+        };
+
+        assert!(
+            error.to_string().contains("symlinked or non-directory")
+                || error
+                    .to_string()
+                    .contains("repository-local hook directory")
+        );
+        assert_eq!(
+            Git::new(repo.path()).status()?.operation,
+            Some(RepositoryOperation::Merge)
+        );
+        fs::remove_dir_all(external)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_recovery_rejects_hook_parent_replaced_after_final_snapshot()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        fs::create_dir_all(repo.path().join("hooks/subdir"))?;
+        repo.run(["config", "core.hooksPath", "hooks/subdir"])?;
+        let external = repo.path().with_extension("late-external-hooks");
+        let marker = repo.path().with_extension("late-external-hook-ran");
+        fs::create_dir(&external)?;
+        let external_hook = external.join("reference-transaction");
+        fs::write(
+            &external_hook,
+            format!(
+                "#!/bin/sh\ntouch {}\n",
+                shell_quote(&marker.to_string_lossy())
+            ),
+        )?;
+        let mut permissions = fs::metadata(&external_hook)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&external_hook, permissions)?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        if !recovery_capabilities_or_verify_fail_closed(
+            &git,
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        )? {
+            fs::remove_dir_all(external)?;
+            return Ok(());
+        }
+        let root = repo.path().canonicalize()?;
+        let parent = root
+            .parent()
+            .ok_or("test repository has no parent")?
+            .to_owned();
+        let root_identity = recovery_path_identity(&root)?;
+        let replacement = external.clone();
+        let hook: RecoveryCaptureHook = Box::new(move || {
+            let Ok(entries) = fs::read_dir(parent) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                let owner = recovery_candidate_owner_path(&candidate);
+                let mut expected_owner = Vec::with_capacity(16);
+                expected_owner.extend_from_slice(&root_identity.0.to_le_bytes());
+                expected_owner.extend_from_slice(&root_identity.1.to_le_bytes());
+                if !fs::read(owner).is_ok_and(|bytes| bytes.starts_with(&expected_owner)) {
+                    continue;
+                }
+                let hooks = candidate.join("hooks");
+                if fs::rename(&hooks, candidate.join("original-hooks")).is_ok() {
+                    let _ = symlink(&replacement, hooks);
+                }
+                return;
+            }
+        });
+        RECOVERY_EXECUTION_HOOKS
+            .lock()
+            .map_err(|_| "recovery execution hook lock poisoned")?
+            .push((root, hook));
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Merge,
+            RecoveryAction::Continue,
+            &expected,
+        ) else {
+            return Err("expected the late symlinked hook parent to block recovery".into());
+        };
+
+        assert!(
+            error.to_string().contains("symlinked or non-directory")
+                || error
+                    .to_string()
+                    .contains("changed before isolated recovery execution"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        fs::remove_dir_all(external)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_recovery_rejects_repository_attributes_changed_after_preview()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        let marker = repo.path().with_extension("late-filter-ran");
+        repo.run_args(&[
+            "config",
+            "filter.marker.smudge",
+            &format!("touch {}; cat", shell_quote(&marker.to_string_lossy())),
+        ])?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        fs::write(
+            git.git_path("info/attributes")?,
+            "conflict.txt filter=marker\n",
+        )?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected changed repository attributes to invalidate the preview".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert!(!marker.exists());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_filter_command_changed_after_preview() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_rebase_conflict()?;
+        fs::write(
+            Git::new(repo.path()).git_path("info/attributes")?,
+            "conflict.txt filter=marker\n",
+        )?;
+        repo.run(["config", "filter.marker.smudge", "cat"])?;
+        let git = Git::new(repo.path());
+        let expected = git.recovery_state()?;
+        repo.run(["config", "filter.marker.smudge", "false"])?;
+
+        let Err(error) = git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        ) else {
+            return Err("expected a changed filter command to invalidate the preview".into());
+        };
+
+        assert!(error.to_string().contains("state changed after preview"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
         Ok(())
     }
 

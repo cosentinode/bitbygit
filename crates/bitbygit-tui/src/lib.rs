@@ -2253,16 +2253,28 @@ fn validate_conflict_mode(git: &Git, requests: &[OperationRequest]) -> Result<()
     }) {
         return Ok(());
     }
-    let operation = git
+    let status = git
         .status()
-        .map_err(|error| format!("Unable to validate conflict-mode policy: {error}"))?
-        .operation;
+        .map_err(|error| format!("Unable to validate conflict-mode policy: {error}"))?;
+    let operation = status.operation;
 
     for request in requests {
         if let OperationRequest::Recover(recovery) = request
             && operation != Some(recovery_git_operation(*recovery))
         {
             return Err(recovery_state_error(*recovery, operation));
+        }
+        if let OperationRequest::Recover(recovery) = request
+            && matches!(
+                recovery,
+                RecoveryRequest::MergeContinue | RecoveryRequest::RebaseContinue
+            )
+            && !status.conflicted_files().is_empty()
+        {
+            return Err(format!(
+                "{} continue blocked: resolve and stage all conflicts first.",
+                capitalize(recovery.operation_label())
+            ));
         }
         if let Some(active) = operation
             && !conflict_mode_allows(request)
@@ -5048,6 +5060,14 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let repo = merge_conflict_repo("recovery-planner")?;
         let planner = OperationPlanner::new(repo);
+
+        let Err(error) = planner.plan_prompt_sequence(vec![
+            OperationRequest::Fetch,
+            OperationRequest::Recover(RecoveryRequest::MergeContinue),
+        ]) else {
+            return Err("fetch then blocked merge continue should fail sequence preflight".into());
+        };
+        assert!(error.contains("resolve and stage all conflicts"));
 
         let operation = planner
             .plan_request(OperationRequest::Recover(RecoveryRequest::MergeAbort))
