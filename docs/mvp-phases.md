@@ -255,7 +255,8 @@ Status:
   [#65](https://github.com/cosentinode/bitbygit/issues/65),
   [#67](https://github.com/cosentinode/bitbygit/issues/67), and
   [#69](https://github.com/cosentinode/bitbygit/issues/69); umbrella
-  [#15](https://github.com/cosentinode/bitbygit/issues/15) remains open
+  [#15](https://github.com/cosentinode/bitbygit/issues/15) is closed and Phase
+  13 is complete
 
 Must have:
 

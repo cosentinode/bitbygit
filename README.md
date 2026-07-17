@@ -37,9 +37,10 @@ typed merge/rebase recovery commands are merged, while recovery policy and TUI
 actions remain open in [#55](https://github.com/cosentinode/bitbygit/issues/55)
 and [#56](https://github.com/cosentinode/bitbygit/issues/56).
 
-Phase 13 configuration and policy slices and Phase 14 release automation and
-installation documentation are implemented. Their umbrella issues remain open,
-and no release has been published; cutting and validating the first release is
+Phase 13 configuration and policy controls are complete. Phase 14 release
+automation and installation documentation are implemented, but its umbrella
+issue [#16](https://github.com/cosentinode/bitbygit/issues/16) remains open and
+no release has been published; cutting and validating the first release is
 tracked in [#81](https://github.com/cosentinode/bitbygit/issues/81). Phase 15
 documentation work is also in progress. See
 [`docs/mvp-phases.md`](docs/mvp-phases.md) for the issue-linked roadmap.

@@ -42,11 +42,11 @@ Completed Phase 10 parser support includes deterministic, typed plans for:
 The parser also accepts `pull rebase` as an alias when the meaning is
 unambiguous.
 
-`open pr`, `open pull request`, and `commit and push and open pr` are Phase 11
-GitHub integration work, not completed Phase 10 behavior. They depend on
-[#13](https://github.com/cosentinode/bitbygit/issues/13). When implemented,
-those prompts must produce plans that preview provider, remote, head branch,
-base branch, title, and target URL before calling a GitHub operation.
+Completed Phase 11 GitHub integration in
+[#13](https://github.com/cosentinode/bitbygit/issues/13) adds `open pr`,
+`open pull request`, and guarded sequences ending in `push and open pr`. These
+prompts produce plans that preview provider, remote, head branch, base branch,
+title, and target URL before calling a GitHub operation.
 
 ## Quoted Strings
 
@@ -80,9 +80,9 @@ Multi-step prompts produce ordered plans. For example,
 1. commit staged changes with message `sync docs`
 2. push the current branch
 
-If step 1 fails, step 2 must not run. Provider-backed sequences such as
-`commit and push and open pr` must wait for the Phase 11 GitHub integration in
-[#13](https://github.com/cosentinode/bitbygit/issues/13).
+If step 1 fails, step 2 must not run. Phase 11 provider-backed sequences such as
+`commit -m "message" and push and open pr` also stop before PR creation when an
+earlier step fails.
 
 ## Agent Compatibility
 
