@@ -449,17 +449,25 @@ impl Git {
         self.run_recovery_args_until_with(operation, action, deadline, || {
             let repository_root = self.canonical_repository_root_until(deadline)?;
             recovery_lock.ensure_identity(&repository_root, operation, action)?;
-            self.ensure_recovery_state(expected_state, operation, action, deadline)?;
-            before_spawn_check()?;
+            let current_state = match self.recovery_state_fenced_until(deadline, before_spawn_check)
+            {
+                Ok(state) => state,
+                Err(GitError::Blocked { message })
+                    if message.contains("changed while it was fingerprinted") =>
+                {
+                    return Err(recovery_state_changed(operation, action));
+                }
+                Err(error) => return Err(error),
+            };
+            if current_state != *expected_state {
+                return Err(recovery_state_changed(operation, action));
+            }
             let repository_root = self.canonical_repository_root_until(deadline)?;
-            recovery_lock.ensure_identity(&repository_root, operation, action)?;
-            // A second complete pass catches a mutation that occurred after an
-            // earlier input was consumed by the first pass. Keep this final
-            // pass as the last operation before spawning the recovery command.
-            self.ensure_recovery_state(expected_state, operation, action, deadline)
+            recovery_lock.ensure_identity(&repository_root, operation, action)
         })
     }
 
+    #[cfg(test)]
     fn ensure_recovery_state(
         &self,
         expected_state: &RecoveryState,
@@ -470,13 +478,7 @@ impl Git {
         if self.recovery_state_until(deadline)? == *expected_state {
             return Ok(());
         }
-        Err(GitError::Blocked {
-            message: format!(
-                "{} {} is blocked because repository state changed after preview",
-                operation.label(),
-                action.label()
-            ),
-        })
+        Err(recovery_state_changed(operation, action))
     }
 
     fn validate_recovery_until(
@@ -1280,6 +1282,31 @@ impl Git {
     }
 
     fn recovery_state_until(&self, deadline: Instant) -> Result<RecoveryState, GitError> {
+        self.recovery_state_until_with(deadline, None, &mut None::<fn() -> Result<(), GitError>>)
+    }
+
+    fn recovery_state_fenced_until<F>(
+        &self,
+        deadline: Instant,
+        after_index: F,
+    ) -> Result<RecoveryState, GitError>
+    where
+        F: FnOnce() -> Result<(), GitError>,
+    {
+        let mut fence = RecoveryInputFence::default();
+        let mut after_index = Some(after_index);
+        self.recovery_state_until_with(deadline, Some(&mut fence), &mut after_index)
+    }
+
+    fn recovery_state_until_with<F>(
+        &self,
+        deadline: Instant,
+        mut fence: Option<&mut RecoveryInputFence>,
+        after_index: &mut Option<F>,
+    ) -> Result<RecoveryState, GitError>
+    where
+        F: FnOnce() -> Result<(), GitError>,
+    {
         let mut hasher = Sha256::new();
         for args in [
             vec![
@@ -1324,29 +1351,49 @@ impl Git {
                 return Err(output.git_error(args));
             }
             hash_field(&mut hasher, &output.stdout.digest);
+            if let Some(fence) = fence.as_deref_mut() {
+                fence.probes.push(RecoveryProbe {
+                    args,
+                    digest: output.stdout.digest,
+                });
+            }
         }
 
         let mut entries = 0;
         for relative in RECOVERY_CONTROL_PATHS {
             let path = self.git_path_until(relative, deadline)?;
-            hash_recovery_path(
+            hash_recovery_path_fenced(
                 &mut hasher,
                 relative.as_bytes(),
                 &path,
                 deadline,
                 &mut entries,
+                fence.as_deref_mut(),
             )?;
+            if *relative == "index"
+                && let Some(after_index) = after_index.take()
+            {
+                after_index()?;
+            }
         }
         let hooks = self.recovery_hooks_path_until(deadline)?;
-        hash_recovery_path(&mut hasher, b"hooks", &hooks, deadline, &mut entries)?;
+        hash_recovery_path_fenced(
+            &mut hasher,
+            b"hooks",
+            &hooks,
+            deadline,
+            &mut entries,
+            fence.as_deref_mut(),
+        )?;
         for variable in ["GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"] {
             if let Some(path) = self.git_var_path_until(variable, deadline)? {
-                hash_recovery_path(
+                hash_recovery_path_fenced(
                     &mut hasher,
                     variable.as_bytes(),
                     &path,
                     deadline,
                     &mut entries,
+                    fence.as_deref_mut(),
                 )?;
             }
         }
@@ -1362,6 +1409,7 @@ impl Git {
                 follow_symlinks: false,
                 byte_budget: &mut untracked_bytes_remaining,
                 byte_budget_error: "recovery planning is blocked because untracked worktree data exceeds the 64 MiB fingerprint limit",
+                fence: fence.as_deref_mut(),
             };
             hash_recovery_path_inner(&mut hasher, &label, &path, 0, &mut context, &mut |_, _| {
                 Ok(())
@@ -1378,6 +1426,7 @@ impl Git {
                 follow_symlinks: false,
                 byte_budget: &mut ignored_bytes_remaining,
                 byte_budget_error: "recovery planning is blocked because ignored worktree data exceeds the 64 MiB fingerprint limit",
+                fence: fence.as_deref_mut(),
             };
             hash_recovery_path_inner(&mut hasher, &label, &path, 0, &mut context, &mut |_, _| {
                 Ok(())
@@ -1386,13 +1435,18 @@ impl Git {
         for relative in self.worktree_attributes_until(deadline)? {
             let mut label = b"worktree-attributes/".to_vec();
             label.extend_from_slice(relative.as_os_str().as_encoded_bytes());
-            hash_recovery_path(
+            hash_recovery_path_fenced(
                 &mut hasher,
                 &label,
                 &root.join(relative),
                 deadline,
                 &mut entries,
+                fence.as_deref_mut(),
             )?;
+        }
+
+        if let Some(fence) = fence {
+            fence.validate(self, deadline)?;
         }
 
         Ok(RecoveryState {
@@ -1776,6 +1830,14 @@ impl Git {
     ) -> Result<RecoveryLock, GitError> {
         let repository_root = self.canonical_repository_root_until(deadline)?;
         let path = self.recovery_lock_path(operation, action, &repository_root)?;
+        let directory_path = path
+            .parent()
+            .ok_or_else(|| GitError::Blocked {
+                message: "recovery is blocked because the BitByGit recovery lock directory is unavailable"
+                    .to_owned(),
+            })?
+            .to_owned();
+        let directory = open_recovery_lock_directory(&directory_path, operation, action)?;
         let guard_path = path.with_extension("guard");
         let guard = open_recovery_lock_file(&guard_path, operation, action)?;
         guard
@@ -1789,6 +1851,8 @@ impl Git {
             file,
             guard_path,
             guard,
+            directory_path,
+            directory,
             repository_root,
         };
         lock.ensure_identity(&lock.repository_root, operation, action)?;
@@ -2453,6 +2517,8 @@ struct RecoveryLock {
     file: fs::File,
     guard_path: PathBuf,
     guard: fs::File,
+    directory_path: PathBuf,
+    directory: RecoveryFile,
     repository_root: PathBuf,
 }
 
@@ -2475,6 +2541,8 @@ impl RecoveryLock {
             .map_err(|source| recovery_lock_io(operation, action, source))?;
         let current_guard = fs::symlink_metadata(&self.guard_path)
             .map_err(|source| recovery_lock_io(operation, action, source))?;
+        let current_directory =
+            open_recovery_lock_directory(&self.directory_path, operation, action)?;
         let same_lock = same_recovery_lock_identity(&self.file, &self.path, &opened, &current)
             .map_err(|source| recovery_lock_io(operation, action, source))?;
         let same_guard = same_recovery_lock_identity(
@@ -2484,7 +2552,14 @@ impl RecoveryLock {
             &current_guard,
         )
         .map_err(|source| recovery_lock_io(operation, action, source))?;
+        let same_directory = self
+            .directory
+            .same_path_identity(&current_directory)
+            .map_err(|source| recovery_lock_io(operation, action, source))?;
         if current_repository_root != self.repository_root
+            || !self.directory.metadata.is_dir()
+            || !current_directory.metadata.is_dir()
+            || !same_directory
             || !opened.is_file()
             || !current.is_file()
             || current.file_type().is_symlink()
@@ -2515,6 +2590,26 @@ impl RecoveryLock {
             });
         }
         Ok(())
+    }
+}
+
+fn open_recovery_lock_directory(
+    path: &Path,
+    operation: RepositoryOperation,
+    action: RecoveryAction,
+) -> Result<RecoveryFile, GitError> {
+    match open_recovery_file(path) {
+        Ok(opened) if opened.metadata.is_dir() => Ok(opened),
+        Ok(_) | Err(RecoveryOpenError::Missing | RecoveryOpenError::Symlink) => {
+            Err(GitError::Blocked {
+                message: format!(
+                    "{} {} is blocked because the BitByGit recovery lock identity changed",
+                    operation.label(),
+                    action.label()
+                ),
+            })
+        }
+        Err(RecoveryOpenError::Io(source)) => Err(recovery_lock_io(operation, action, source)),
     }
 }
 
@@ -2656,7 +2751,8 @@ fn read_bounded_optional_file(
             ),
         });
     }
-    let Some(mut file) = opened.file else {
+    let mut opened = opened;
+    let Some(file) = opened.file.as_mut() else {
         return Err(recovery_state_io(
             path,
             io::Error::other("regular recovery input has no open descriptor"),
@@ -2697,21 +2793,24 @@ fn read_bounded_optional_file(
     let final_metadata = file
         .metadata()
         .map_err(|source| recovery_state_io(path, source))?;
-    let path_metadata = match open_recovery_file(path) {
-        Ok(reopened) => reopened.metadata,
+    let reopened = match open_recovery_file(path) {
+        Ok(reopened) => reopened,
         Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
         Err(RecoveryOpenError::Missing | RecoveryOpenError::Symlink) => {
             return Err(recovery_path_changed(path));
         }
     };
     if !same_recovery_file(&opened.metadata, &final_metadata)
-        || !same_recovery_file(&opened.metadata, &path_metadata)
+        || !opened
+            .same_path_identity(&reopened)
+            .map_err(|source| recovery_state_io(path, source))?
     {
         return Err(recovery_path_changed(path));
     }
     Ok(Some(String::from_utf8_lossy(&contents).into_owned()))
 }
 
+#[cfg(all(test, unix))]
 fn hash_recovery_path(
     hasher: &mut Sha256,
     label: &[u8],
@@ -2719,15 +2818,50 @@ fn hash_recovery_path(
     deadline: Instant,
     entries: &mut usize,
 ) -> Result<(), GitError> {
-    hash_recovery_path_with(hasher, label, path, deadline, entries, &mut |_, _| Ok(()))
+    hash_recovery_path_fenced(hasher, label, path, deadline, entries, None)
 }
 
+fn hash_recovery_path_fenced(
+    hasher: &mut Sha256,
+    label: &[u8],
+    path: &Path,
+    deadline: Instant,
+    entries: &mut usize,
+    fence: Option<&mut RecoveryInputFence>,
+) -> Result<(), GitError> {
+    hash_recovery_path_with_fence(
+        hasher,
+        label,
+        path,
+        deadline,
+        entries,
+        fence,
+        &mut |_, _| Ok(()),
+    )
+}
+
+#[cfg(test)]
 fn hash_recovery_path_with<F>(
     hasher: &mut Sha256,
     label: &[u8],
     path: &Path,
     deadline: Instant,
     entries: &mut usize,
+    after_contents: &mut F,
+) -> Result<(), GitError>
+where
+    F: FnMut(&Path, RecoveryPathKind) -> Result<(), GitError>,
+{
+    hash_recovery_path_with_fence(hasher, label, path, deadline, entries, None, after_contents)
+}
+
+fn hash_recovery_path_with_fence<F>(
+    hasher: &mut Sha256,
+    label: &[u8],
+    path: &Path,
+    deadline: Instant,
+    entries: &mut usize,
+    fence: Option<&mut RecoveryInputFence>,
     after_contents: &mut F,
 ) -> Result<(), GitError>
 where
@@ -2740,8 +2874,103 @@ where
         follow_symlinks: true,
         byte_budget: &mut byte_budget,
         byte_budget_error: "recovery planning is blocked because recovery input data exceeds its fingerprint limit",
+        fence,
     };
     hash_recovery_path_inner(hasher, label, path, 0, &mut context, after_contents)
+}
+
+#[derive(Default)]
+struct RecoveryInputFence {
+    inputs: Vec<RecoveryInput>,
+    probes: Vec<RecoveryProbe>,
+}
+
+struct RecoveryProbe {
+    args: Vec<String>,
+    digest: [u8; 32],
+}
+
+enum RecoveryInput {
+    Missing(PathBuf),
+    Symlink {
+        path: PathBuf,
+        target: PathBuf,
+        metadata: fs::Metadata,
+    },
+    Opened {
+        path: PathBuf,
+        opened: RecoveryFile,
+    },
+}
+
+impl RecoveryInputFence {
+    fn validate(&self, git: &Git, deadline: Instant) -> Result<(), GitError> {
+        for probe in &self.probes {
+            let output = git.run_bounded_git(probe.args.clone(), deadline, true)?;
+            if !output.status.success() {
+                return Err(output.git_error(probe.args.clone()));
+            }
+            if output.stdout.digest != probe.digest {
+                return Err(GitError::Blocked {
+                    message: format!(
+                        "recovery planning is blocked because Git {} output changed while it was fingerprinted",
+                        probe.args.join(" ")
+                    ),
+                });
+            }
+        }
+        for input in &self.inputs {
+            if Instant::now() >= deadline {
+                return Err(GitError::TimedOut {
+                    args: vec!["recovery-state".to_owned()],
+                });
+            }
+            match input {
+                RecoveryInput::Missing(path) => match fs::symlink_metadata(path) {
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(recovery_path_changed(path)),
+                    Err(source) => return Err(recovery_state_io(path, source)),
+                },
+                RecoveryInput::Symlink {
+                    path,
+                    target,
+                    metadata,
+                } => {
+                    let current_target =
+                        fs::read_link(path).map_err(|source| recovery_state_io(path, source))?;
+                    let current_metadata = recovery_symlink_metadata(path)?;
+                    if current_target != *target || !same_recovery_file(metadata, &current_metadata)
+                    {
+                        return Err(recovery_path_changed(path));
+                    }
+                }
+                RecoveryInput::Opened { path, opened } => {
+                    let final_metadata = opened
+                        .file
+                        .as_ref()
+                        .map_or_else(|| fs::symlink_metadata(path), fs::File::metadata)
+                        .map_err(|source| recovery_state_io(path, source))?;
+                    let current = match open_recovery_file(path) {
+                        Ok(current) => current,
+                        Err(RecoveryOpenError::Io(source)) => {
+                            return Err(recovery_state_io(path, source));
+                        }
+                        Err(RecoveryOpenError::Missing | RecoveryOpenError::Symlink) => {
+                            return Err(recovery_path_changed(path));
+                        }
+                    };
+                    if !same_recovery_file(&opened.metadata, &final_metadata)
+                        || !opened
+                            .same_path_identity(&current)
+                            .map_err(|source| recovery_state_io(path, source))?
+                    {
+                        return Err(recovery_path_changed(path));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 struct RecoveryHashContext<'a> {
@@ -2750,6 +2979,7 @@ struct RecoveryHashContext<'a> {
     follow_symlinks: bool,
     byte_budget: &'a mut Option<u64>,
     byte_budget_error: &'static str,
+    fence: Option<&'a mut RecoveryInputFence>,
 }
 
 fn hash_recovery_path_inner<F>(
@@ -2769,6 +2999,9 @@ where
         Ok(opened) => opened,
         Err(RecoveryOpenError::Missing) => {
             hash_field(hasher, b"missing");
+            if let Some(fence) = context.fence.as_deref_mut() {
+                fence.inputs.push(RecoveryInput::Missing(path.to_owned()));
+            }
             return Ok(());
         }
         Err(RecoveryOpenError::Symlink) => {
@@ -2814,12 +3047,19 @@ where
             if final_target != target || !same_recovery_file(&metadata, &final_metadata) {
                 return Err(recovery_path_changed(path));
             }
+            if let Some(fence) = context.fence.as_deref_mut() {
+                fence.inputs.push(RecoveryInput::Symlink {
+                    path: path.to_owned(),
+                    target,
+                    metadata,
+                });
+            }
             return Ok(());
         }
         Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
     };
-    let mut file = opened.file;
-    let metadata = opened.metadata;
+    let mut opened = opened;
+    let metadata = opened.metadata.clone();
     *context.entries += 1;
     hash_field(hasher, &metadata.len().to_le_bytes());
     #[cfg(unix)]
@@ -2829,7 +3069,7 @@ where
 
     if metadata.is_file() {
         hash_field(hasher, b"file");
-        let Some(file) = file.as_mut() else {
+        let Some(file) = opened.file.as_mut() else {
             return Err(recovery_state_io(
                 path,
                 io::Error::other("regular recovery input has no open descriptor"),
@@ -2861,8 +3101,9 @@ where
         let final_metadata = file
             .metadata()
             .map_err(|source| recovery_state_io(path, source))?;
-        let path_metadata = match open_recovery_file(path) {
-            Ok(reopened) => reopened.metadata,
+        after_contents(path, RecoveryPathKind::File)?;
+        let reopened = match open_recovery_file(path) {
+            Ok(reopened) => reopened,
             Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
             Err(RecoveryOpenError::Missing | RecoveryOpenError::Symlink) => {
                 return Err(GitError::Blocked {
@@ -2874,7 +3115,9 @@ where
             }
         };
         if !same_recovery_file(&metadata, &final_metadata)
-            || !same_recovery_file(&metadata, &path_metadata)
+            || !opened
+                .same_path_identity(&reopened)
+                .map_err(|source| recovery_state_io(path, source))?
         {
             return Err(GitError::Blocked {
                 message: format!(
@@ -2885,8 +3128,12 @@ where
         }
     } else if metadata.is_dir() {
         hash_field(hasher, b"directory");
-        let mut children =
-            recovery_directory_children(file.as_ref(), path, context.deadline, context.entries)?;
+        let mut children = recovery_directory_children(
+            opened.file.as_ref(),
+            path,
+            context.deadline,
+            context.entries,
+        )?;
         children.sort();
         for child in children {
             ensure_recovery_fingerprint_capacity(context.deadline, context.entries)?;
@@ -2903,14 +3150,14 @@ where
             )?;
         }
         after_contents(path, RecoveryPathKind::Directory)?;
-        let final_metadata = match file.as_ref() {
+        let final_metadata = match opened.file.as_ref() {
             Some(file) => file
                 .metadata()
                 .map_err(|source| recovery_state_io(path, source))?,
             None => fs::symlink_metadata(path).map_err(|source| recovery_state_io(path, source))?,
         };
-        let path_metadata = match open_recovery_file(path) {
-            Ok(reopened) => reopened.metadata,
+        let reopened = match open_recovery_file(path) {
+            Ok(reopened) => reopened,
             Err(RecoveryOpenError::Io(source)) => return Err(recovery_state_io(path, source)),
             Err(RecoveryOpenError::Missing | RecoveryOpenError::Symlink) => {
                 return Err(recovery_path_changed(path));
@@ -2918,7 +3165,9 @@ where
         };
         if !final_metadata.is_dir()
             || !same_recovery_file(&metadata, &final_metadata)
-            || !same_recovery_file(&metadata, &path_metadata)
+            || !opened
+                .same_path_identity(&reopened)
+                .map_err(|source| recovery_state_io(path, source))?
         {
             return Err(recovery_path_changed(path));
         }
@@ -2930,11 +3179,18 @@ where
             ),
         });
     }
+    if let Some(fence) = context.fence.as_deref_mut() {
+        fence.inputs.push(RecoveryInput::Opened {
+            path: path.to_owned(),
+            opened,
+        });
+    }
     Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryPathKind {
+    File,
     Symlink,
     Directory,
 }
@@ -2956,9 +3212,39 @@ fn recovery_path_changed(path: &Path) -> GitError {
     }
 }
 
+fn recovery_state_changed(operation: RepositoryOperation, action: RecoveryAction) -> GitError {
+    GitError::Blocked {
+        message: format!(
+            "{} {} is blocked because repository state changed after preview",
+            operation.label(),
+            action.label()
+        ),
+    }
+}
+
 struct RecoveryFile {
     file: Option<fs::File>,
     metadata: fs::Metadata,
+    #[cfg(windows)]
+    identity: same_file::Handle,
+}
+
+impl RecoveryFile {
+    #[cfg(windows)]
+    fn same_path_identity(&self, current: &Self) -> io::Result<bool> {
+        Ok(self.identity == current.identity)
+    }
+
+    #[cfg(unix)]
+    fn same_path_identity(&self, current: &Self) -> io::Result<bool> {
+        Ok(self.metadata.dev() == current.metadata.dev()
+            && self.metadata.ino() == current.metadata.ino())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn same_path_identity(&self, current: &Self) -> io::Result<bool> {
+        Ok(same_recovery_file(&self.metadata, &current.metadata))
+    }
 }
 
 enum RecoveryOpenError {
@@ -3064,7 +3350,24 @@ fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
     } else {
         None
     };
-    Ok(RecoveryFile { file, metadata })
+    #[cfg(windows)]
+    let identity = match file.as_ref() {
+        Some(file) => {
+            same_file::Handle::from_file(file.try_clone().map_err(RecoveryOpenError::Io)?)
+                .map_err(RecoveryOpenError::Io)?
+        }
+        None => same_file::Handle::from_path(path).map_err(RecoveryOpenError::Io)?,
+    };
+    let metadata = match file.as_ref() {
+        Some(file) => file.metadata().map_err(RecoveryOpenError::Io)?,
+        None => metadata,
+    };
+    Ok(RecoveryFile {
+        file,
+        metadata,
+        #[cfg(windows)]
+        identity,
+    })
 }
 
 #[cfg(unix)]
@@ -4966,7 +5269,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_recovery_rejects_index_change_between_complete_final_fingerprints()
+    fn exact_recovery_rejects_index_change_after_it_is_read_in_final_fingerprint()
     -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_merge_conflict()?;
         repo.write("conflict.txt", "resolved\n")?;
@@ -5002,7 +5305,7 @@ mod tests {
                 Ok(())
             },
         ) else {
-            return Err("expected final complete fingerprint to block recovery".into());
+            return Err("expected final fingerprint fence to block recovery".into());
         };
 
         assert!(error.to_string().contains("state changed after preview"));
@@ -5010,6 +5313,57 @@ mod tests {
         assert_eq!(
             repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
             original_head
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_platform_rejects_same_metadata_file_replacement() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        let input = repo.path().join("index");
+        let retained = repo.path().join("index-retained");
+        fs::write(&input, b"original")?;
+        let original_metadata = fs::metadata(&input)?;
+        let modified = original_metadata.modified()?;
+        let mut hasher = Sha256::new();
+        let mut entries = 0;
+        let mut replaced = false;
+
+        let Err(error) = hash_recovery_path_with(
+            &mut hasher,
+            b"index",
+            &input,
+            Instant::now() + Duration::from_secs(2),
+            &mut entries,
+            &mut |path, kind| {
+                if path == input && kind == RecoveryPathKind::File {
+                    fs::rename(&input, &retained)
+                        .map_err(|source| recovery_state_io(path, source))?;
+                    fs::write(&input, b"replaced")
+                        .map_err(|source| recovery_state_io(path, source))?;
+                    fs::File::open(&input)
+                        .and_then(|file| {
+                            file.set_times(fs::FileTimes::new().set_modified(modified))
+                        })
+                        .map_err(|source| recovery_state_io(path, source))?;
+                    replaced = true;
+                }
+                Ok(())
+            },
+        ) else {
+            return Err("expected same-metadata replacement to be rejected".into());
+        };
+
+        assert!(replaced);
+        assert!(same_recovery_file(
+            &original_metadata,
+            &fs::metadata(&input)?
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("changed while it was fingerprinted")
         );
         Ok(())
     }
@@ -5509,6 +5863,51 @@ mod tests {
         assert!(error.to_string().contains("lock identity changed"));
         drop(lock);
         fs::remove_file(replaced)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recovery_platform_lock_directory_replacement_is_rejected_after_final_validation()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_merge_conflict()?;
+        let storage = TempRepo::new()?;
+        let git = Git::new(repo.path()).with_recovery_data_dir(storage.path());
+        let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+        let lock_directory = storage.path().join(RECOVERY_LOCK_DIRECTORY);
+        let replaced_directory = storage.path().join("recovery-locks-replaced");
+        let concurrent = std::cell::RefCell::new(None);
+
+        let Err(error) = git.recover_exact_with(
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+            || {
+                fs::rename(&lock_directory, &replaced_directory)
+                    .map_err(|source| recovery_state_io(&lock_directory, source))?;
+                fs::create_dir(&lock_directory)
+                    .map_err(|source| recovery_state_io(&lock_directory, source))?;
+                let lock = git.acquire_recovery_lock_until(
+                    RepositoryOperation::Merge,
+                    RecoveryAction::Abort,
+                    Instant::now() + Duration::from_secs(2),
+                )?;
+                *concurrent.borrow_mut() = Some(lock);
+                Ok(())
+            },
+        ) else {
+            return Err("expected replaced lock directory to block recovery".into());
+        };
+
+        assert!(concurrent.borrow().is_some());
+        assert!(error.to_string().contains("lock identity changed"));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        drop(concurrent.into_inner());
+        fs::remove_dir_all(replaced_directory)?;
         Ok(())
     }
 
