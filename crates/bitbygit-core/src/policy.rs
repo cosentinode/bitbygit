@@ -77,16 +77,17 @@ impl EffectivePolicy {
             confirmation_label(requirement)
         )];
 
-        if let Some(branch) = branch
-            && self.is_protected_branch(branch)
-            && let Some(minimum) = protected_branch_requirement(operation)
-        {
-            requirement = requirement.max(minimum);
-            reasons.push(format!(
-                "protected branch {branch}: {} requires at least {} confirmation",
-                operation.action_label(),
-                confirmation_label(minimum)
-            ));
+        if let Some(branch) = branch {
+            if self.is_protected_branch(branch) {
+                if let Some(minimum) = protected_branch_requirement(operation) {
+                    requirement = requirement.max(minimum);
+                    reasons.push(format!(
+                        "protected branch {branch}: {} requires at least {} confirmation",
+                        operation.action_label(),
+                        confirmation_label(minimum)
+                    ));
+                }
+            }
         }
 
         if self.is_operation_disabled(operation) {

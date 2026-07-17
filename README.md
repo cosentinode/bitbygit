@@ -42,22 +42,36 @@ User policy is defined in `config.toml`; see
 [`docs/configuration.md`](docs/configuration.md) for path resolution, the strict
 schema, and safe fallback behavior.
 
+## Installation
+
+See [`docs/installation.md`](docs/installation.md) for supported release
+archives, checksum verification, PATH setup, and source build instructions.
+Package-manager distribution is not currently available.
+
 ## Development
 
 Prerequisites:
 
 - Rust 1.85 or newer.
 - Git 2.42 or newer available on `PATH` (required for guarded conflict recovery).
-- `gh` is optional for future GitHub workflows.
+- `gh` is optional and required only for GitHub-specific workflows.
 
 Run local checks:
 
 ```sh
+bash scripts/test-release-workflow.sh
+bash scripts/test-installation-docs.sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --workspace
 ```
+
+The Bash installation validator runs on Linux and macOS without PowerShell.
+Windows contributors can run the platform-specific installation validation with
+`pwsh -NoProfile -File scripts/test-installation-docs.ps1`; CI runs that command
+on a Windows runner. The validator uses temporary process-scoped PATH state and
+never changes the persistent user PATH.
 
 Or run:
 

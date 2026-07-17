@@ -54,13 +54,13 @@ impl AppConfig {
         }
 
         self.policy.validate()?;
-        if let Some(branch) = &self.pull_requests.default_base_branch
-            && !valid_branch_name(branch)
-        {
-            return Err(invalid_value(
-                "pull-requests.default-base-branch",
-                "must be a valid local branch name",
-            ));
+        if let Some(branch) = &self.pull_requests.default_base_branch {
+            if !valid_branch_name(branch) {
+                return Err(invalid_value(
+                    "pull-requests.default-base-branch",
+                    "must be a valid local branch name",
+                ));
+            }
         }
         Ok(())
     }
