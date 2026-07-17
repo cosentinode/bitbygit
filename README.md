@@ -59,6 +59,7 @@ Prerequisites:
 Run local checks:
 
 ```sh
+bash scripts/test-ci-workflow.sh
 bash scripts/test-release-workflow.sh
 bash scripts/test-installation-docs.sh
 cargo fmt --all --check

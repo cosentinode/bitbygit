@@ -52,7 +52,7 @@ const COMMIT_HOOKS: &[&str] = &[
     "post-commit",
 ];
 const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(10);
-const RECOVERY_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
+const RECOVERY_START_TIMEOUT: Duration = Duration::from_secs(60);
 const RECOVERY_OUTPUT_LIMIT: usize = 256 * 1024;
 const RECOVERY_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 const RECOVERY_DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
@@ -120,7 +120,7 @@ pub struct Git {
     cwd: PathBuf,
     ssh_executable: Option<PathBuf>,
     recovery_plan_timeout: Duration,
-    recovery_execution_timeout: Duration,
+    recovery_start_timeout: Duration,
     recovery_output_limit: usize,
     isolated_test_config: bool,
     #[cfg(test)]
@@ -137,7 +137,7 @@ impl Git {
             cwd: cwd.into(),
             ssh_executable: None,
             recovery_plan_timeout: RECOVERY_PLAN_TIMEOUT,
-            recovery_execution_timeout: RECOVERY_EXECUTION_TIMEOUT,
+            recovery_start_timeout: RECOVERY_START_TIMEOUT,
             recovery_output_limit: RECOVERY_OUTPUT_LIMIT,
             isolated_test_config: cfg!(test),
             #[cfg(test)]
@@ -157,7 +157,7 @@ impl Git {
             cwd: cwd.into(),
             ssh_executable: Some(ssh_executable.into()),
             recovery_plan_timeout: RECOVERY_PLAN_TIMEOUT,
-            recovery_execution_timeout: RECOVERY_EXECUTION_TIMEOUT,
+            recovery_start_timeout: RECOVERY_START_TIMEOUT,
             recovery_output_limit: RECOVERY_OUTPUT_LIMIT,
             isolated_test_config: cfg!(test),
             #[cfg(test)]
@@ -173,14 +173,14 @@ impl Git {
     fn with_recovery_limits(
         cwd: impl Into<PathBuf>,
         plan_timeout: Duration,
-        execution_timeout: Duration,
+        start_timeout: Duration,
         output_limit: usize,
     ) -> Self {
         Self {
             cwd: cwd.into(),
             ssh_executable: None,
             recovery_plan_timeout: plan_timeout,
-            recovery_execution_timeout: execution_timeout,
+            recovery_start_timeout: start_timeout,
             recovery_output_limit: output_limit,
             isolated_test_config: true,
             test_global_config: None,
@@ -384,7 +384,7 @@ impl Git {
         action: RecoveryAction,
     ) -> Result<GitOutput, GitError> {
         ensure_recovery_execution_supported(operation, action)?;
-        let deadline = Instant::now() + self.recovery_execution_timeout;
+        let deadline = Instant::now() + self.recovery_start_timeout;
         self.ensure_recovery_git_version_until(deadline)?;
         self.validate_recovery_until(operation, action, deadline)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
@@ -454,7 +454,7 @@ impl Git {
         F: FnOnce() -> Result<(), GitError>,
     {
         ensure_recovery_execution_supported(operation, action)?;
-        let deadline = Instant::now() + self.recovery_execution_timeout;
+        let deadline = Instant::now() + self.recovery_start_timeout;
         self.ensure_recovery_git_version_until(deadline)?;
         self.validate_recovery_action(operation, action)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
@@ -2996,32 +2996,50 @@ where
     });
 
     let mut output_limit_hit = false;
-    let status = loop {
-        if policy == BoundedCommandPolicy::Diagnostic && capture_exceeded.load(Ordering::Acquire) {
-            output_limit_hit = true;
-            kill_process_tree(&mut child);
-            break child.wait().map_err(|source| GitError::Io {
+    let status = if policy == BoundedCommandPolicy::RecoveryExecution {
+        // The deadline protects the checks before spawn. Killing Git after a
+        // mutating recovery starts can leave a partial worktree or stale lock.
+        match child.wait() {
+            Ok(status) => status,
+            Err(source) => {
+                kill_process_tree(&mut child);
+                let _result = child.wait();
+                kill_process_tree(&mut child);
+                let _result = join_capture_reader(stdout_reader, &args);
+                let _result = join_capture_reader(stderr_reader, &args);
+                return Err(GitError::Io { args, source });
+            }
+        }
+    } else {
+        loop {
+            if policy == BoundedCommandPolicy::Diagnostic
+                && capture_exceeded.load(Ordering::Acquire)
+            {
+                output_limit_hit = true;
+                kill_process_tree(&mut child);
+                break child.wait().map_err(|source| GitError::Io {
+                    args: args.clone(),
+                    source,
+                })?;
+            }
+            if let Some(status) = child.try_wait().map_err(|source| GitError::Io {
                 args: args.clone(),
                 source,
-            })?;
+            })? {
+                break status;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                kill_process_tree(&mut child);
+                let _result = child.wait();
+                kill_process_tree(&mut child);
+                join_capture_reader(stdout_reader, &args)?;
+                join_capture_reader(stderr_reader, &args)?;
+                return Err(GitError::TimedOut { args });
+            }
+            let delay = Duration::from_millis(5).min(deadline.saturating_duration_since(now));
+            thread::sleep(delay);
         }
-        if let Some(status) = child.try_wait().map_err(|source| GitError::Io {
-            args: args.clone(),
-            source,
-        })? {
-            break status;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            kill_process_tree(&mut child);
-            let _result = child.wait();
-            kill_process_tree(&mut child);
-            join_capture_reader(stdout_reader, &args)?;
-            join_capture_reader(stderr_reader, &args)?;
-            return Err(GitError::TimedOut { args });
-        }
-        let delay = Duration::from_millis(5).min(deadline.saturating_duration_since(now));
-        thread::sleep(delay);
     };
     // End the contained process tree before joining the drains so descendants
     // cannot keep inherited pipe writers open.
@@ -5975,28 +5993,75 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn recovery_execution_times_out_after_spawn() -> Result<(), Box<dyn Error>> {
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            "sleep 0.1; i=0; while [ $i -lt 5000 ]; do printf x; i=$((i + 1)); done",
-        ]);
-        configure_process_group(&mut command);
+    fn recovery_platform_end_to_end_deadline_does_not_interrupt_merge_abort()
+    -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "other"])?;
+        repo.write("conflict.txt", "other\n")?;
+        for index in 0..2_000 {
+            repo.write(&format!("generated-{index:04}.txt"), "other\n")?;
+        }
+        repo.run(["add", "."])?;
+        repo.run(["commit", "-m", "other"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.run(["commit", "-am", "main"])?;
+        let original_head = repo.git_stdout(["rev-parse", "HEAD"])?.trim().to_owned();
+        repo.run_allow_failure(["merge", "other"])?;
+        let git = Git::new(repo.path());
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
 
-        let Err(error) = run_bounded_command(
+        let mut command = Command::new("git");
+        command
+            .current_dir(repo.path())
+            .args([
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "merge",
+                "--abort",
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0");
+        configure_process_group(&mut command);
+        let start_timeout = Duration::from_millis(10);
+        let started = Instant::now();
+
+        let output = run_bounded_command(
             command,
-            vec!["mutating-recovery-test".to_owned()],
-            Instant::now() + Duration::from_millis(20),
-            32,
+            vec!["merge".to_owned(), "--abort".to_owned()],
+            started + start_timeout,
+            4096,
             BoundedCommandPolicy::RecoveryExecution,
             || Ok(()),
-        ) else {
-            return Err("expected mutating recovery to time out".into());
-        };
+        )?;
 
-        assert!(matches!(error, GitError::TimedOut { .. }));
+        assert!(output.status.success());
+        assert!(started.elapsed() >= start_timeout);
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("conflict.txt"))?,
+            "main\n"
+        );
+        for index in 0..2_000 {
+            assert!(
+                !repo
+                    .path()
+                    .join(format!("generated-{index:04}.txt"))
+                    .exists()
+            );
+        }
+        assert!(!git.git_path("index.lock")?.exists());
+        assert!(repo.git_stdout(["status", "--porcelain"])?.is_empty());
         Ok(())
     }
 
@@ -6037,31 +6102,6 @@ mod tests {
                     .is_err_and(|error| error.to_string().contains("bounded capture limit")),
             "unexpected result: {result:?}"
         );
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn recovery_platform_execution_times_out_after_spawn() -> Result<(), Box<dyn Error>> {
-        let mut command = Command::new("powershell");
-        command.args([
-            "-NoProfile",
-            "-Command",
-            "[Console]::Out.Write('x' * 5000000); Start-Sleep -Milliseconds 200",
-        ]);
-
-        let Err(error) = run_bounded_command(
-            command,
-            vec!["mutating-recovery-test".to_owned()],
-            Instant::now() + Duration::from_millis(100),
-            32,
-            BoundedCommandPolicy::RecoveryExecution,
-            || Ok(()),
-        ) else {
-            return Err("expected mutating recovery to time out".into());
-        };
-
-        assert!(matches!(error, GitError::TimedOut { .. }));
         Ok(())
     }
 
@@ -6901,28 +6941,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_execution_timeout_kills_descendants() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_execution_cleans_descendants_after_parent_exit()
+    -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         let marker = repo.path().join("descendant-ran");
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("(sleep 1; touch \"$1\") & wait")
+            .arg("(sleep 1; touch \"$1\") &")
             .arg("sh")
             .arg(&marker);
         configure_process_group(&mut command);
 
-        let Err(error) = run_bounded_command(
+        let output = run_bounded_command(
             command,
-            vec!["descendant-timeout-test".to_owned()],
-            Instant::now() + Duration::from_millis(100),
+            vec!["descendant-cleanup-test".to_owned()],
+            Instant::now() + Duration::from_secs(5),
             4096,
             BoundedCommandPolicy::RecoveryExecution,
             || Ok(()),
-        ) else {
-            return Err("expected descendant command to time out".into());
-        };
-        assert!(matches!(error, GitError::TimedOut { .. }));
+        )?;
+        assert!(output.status.success());
         thread::sleep(Duration::from_millis(1100));
         assert!(!marker.exists());
         Ok(())
@@ -6930,27 +6969,26 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn recovery_execution_timeout_kills_windows_job_descendants() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_execution_cleans_windows_job_descendants_after_parent_exit()
+    -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         let marker = repo.path().join("windows-descendant-ran");
         let script = format!(
-            "$child = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 1; Set-Content -Path ''{}'' -Value ran' -PassThru; Wait-Process -Id $child.Id",
+            "Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 1; Set-Content -Path ''{}'' -Value ran' | Out-Null",
             marker.display()
         );
         let mut command = Command::new("powershell");
         command.args(["-NoProfile", "-Command", &script]);
 
-        let Err(error) = run_bounded_command(
+        let output = run_bounded_command(
             command,
-            vec!["windows-job-timeout-test".to_owned()],
-            Instant::now() + Duration::from_millis(100),
+            vec!["windows-job-cleanup-test".to_owned()],
+            Instant::now() + Duration::from_secs(5),
             4096,
             BoundedCommandPolicy::RecoveryExecution,
             || Ok(()),
-        ) else {
-            return Err("expected Windows descendant command to time out".into());
-        };
-        assert!(matches!(error, GitError::TimedOut { .. }));
+        )?;
+        assert!(output.status.success());
         thread::sleep(Duration::from_millis(1200));
         assert!(!marker.exists());
         Ok(())
@@ -7311,14 +7349,48 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn recovery_platform_capability_is_available() -> Result<(), Box<dyn Error>> {
+    fn recovery_platform_end_to_end_exact_merge_and_rebase() -> Result<(), Box<dyn Error>> {
         ensure_recovery_execution_supported(RepositoryOperation::Merge, RecoveryAction::Abort)?;
-        let (repo, _original_head) = prepare_merge_conflict()?;
+        let (repo, original_head) = prepare_merge_conflict()?;
         let storage = TempRepo::new()?;
         let git = Git::new(repo.path()).with_recovery_data_dir(storage.path());
         let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
         git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
         assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        assert!(!git.git_path("index.lock")?.exists());
+        drop(git.acquire_recovery_lock_until(
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            Instant::now() + Duration::from_secs(2),
+        )?);
+
+        let (repo, original_head) = prepare_rebase_conflict()?;
+        let git = Git::new(repo.path()).with_recovery_data_dir(storage.path());
+        let expected = git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Abort)?;
+        git.recover_exact(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            &expected,
+        )?;
+        assert_eq!(git.status()?.operation, None);
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("conflict.txt"))?,
+            "topic\n"
+        );
+        assert!(!git.git_path("index.lock")?.exists());
+        drop(git.acquire_recovery_lock_until(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Abort,
+            Instant::now() + Duration::from_secs(2),
+        )?);
         Ok(())
     }
 
