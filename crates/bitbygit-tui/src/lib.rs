@@ -2768,19 +2768,19 @@ fn validate_conflict_mode(git: &Git, requests: &[OperationRequest]) -> Result<()
     };
 
     for request in requests {
-        if let OperationRequest::Recover(recovery) = request
-            && operation != Some(recovery_git_operation(*recovery))
-        {
-            return Err(recovery_state_error(*recovery, operation));
+        if let OperationRequest::Recover(recovery) = request {
+            if operation != Some(recovery_git_operation(*recovery)) {
+                return Err(recovery_state_error(*recovery, operation));
+            }
         }
-        if let Some(active) = operation
-            && !conflict_mode_allows(request)
-        {
-            return Err(format!(
-                "{} blocked: an active {} must be resolved first.",
-                request_action_label(request),
-                operation_label(active).to_ascii_lowercase()
-            ));
+        if let Some(active) = operation {
+            if !conflict_mode_allows(request) {
+                return Err(format!(
+                    "{} blocked: an active {} must be resolved first.",
+                    request_action_label(request),
+                    operation_label(active).to_ascii_lowercase()
+                ));
+            }
         }
     }
     Ok(())

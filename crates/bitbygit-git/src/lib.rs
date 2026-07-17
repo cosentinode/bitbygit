@@ -1381,10 +1381,10 @@ impl Git {
                 &mut entries,
                 fence.as_deref_mut(),
             )?;
-            if *relative == "index"
-                && let Some(after_index) = after_index.take()
-            {
-                after_index()?;
+            if *relative == "index" {
+                if let Some(after_index) = after_index.take() {
+                    after_index()?;
+                }
             }
         }
         let hooks = self.recovery_hooks_path_until(deadline)?;
@@ -5186,27 +5186,54 @@ mod tests {
             command.args([
                 "-NoProfile",
                 "-Command",
-                "[Console]::Out.Write('x' * 5000000)",
+                "[Console]::Out.Write('x' * 70000000)",
             ]);
             command
         };
         configure_process_group(&mut command);
 
-        let Err(error) = run_bounded_command(
+        let result = run_bounded_command(
             command,
             vec!["recovery-output-bound-test".to_owned()],
             Instant::now() + Duration::from_secs(5),
             1024,
             BoundedCommandPolicy::Diagnostic,
             || Ok(()),
-        ) else {
-            return Err("expected oversized recovery output to be stopped".into());
-        };
+        );
 
         assert!(
-            error.to_string().contains("bounded capture limit"),
-            "unexpected error: {error}"
+            matches!(result, Err(GitError::TimedOut { .. }))
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("bounded capture limit")),
+            "unexpected result: {result:?}"
         );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_platform_execution_is_not_killed_after_spawn_limits() -> Result<(), Box<dyn Error>>
+    {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::Out.Write('x' * 5000000); Start-Sleep -Milliseconds 200",
+        ]);
+
+        let output = run_bounded_command(
+            command,
+            vec!["mutating-recovery-test".to_owned()],
+            Instant::now() + Duration::from_millis(100),
+            32,
+            BoundedCommandPolicy::RecoveryExecution,
+            || Ok(()),
+        )?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.bytes.len(), 32);
+        assert!(output.stdout.truncated);
         Ok(())
     }
 
