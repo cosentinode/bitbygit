@@ -19,3 +19,4 @@ rustix = { version = "0.38", features = ["fs", "process"] }
 [target.'cfg(windows)'.dependencies]
 command-group = "5.0"
 same-file = "1.0"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

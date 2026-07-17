@@ -18,8 +18,14 @@ use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
 use command_group::{CommandGroup, GroupChild};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::process::Child;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -2665,11 +2671,11 @@ fn open_recovery_lock_file(
             ),
         });
     }
-    fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(windows)]
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    options
         .open(path)
         .map_err(|source| recovery_lock_io(operation, action, source))
 }
@@ -3333,7 +3339,35 @@ fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(RecoveryOpenError::Missing);
+        }
+        Err(source) => return Err(RecoveryOpenError::Io(source)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(RecoveryOpenError::Symlink);
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(RecoveryOpenError::Io)?;
+    let metadata = file.metadata().map_err(RecoveryOpenError::Io)?;
+    let identity = same_file::Handle::from_file(file.try_clone().map_err(RecoveryOpenError::Io)?)
+        .map_err(RecoveryOpenError::Io)?;
+    Ok(RecoveryFile {
+        file: Some(file),
+        metadata,
+        identity,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -3350,24 +3384,7 @@ fn open_recovery_file(path: &Path) -> Result<RecoveryFile, RecoveryOpenError> {
     } else {
         None
     };
-    #[cfg(windows)]
-    let identity = match file.as_ref() {
-        Some(file) => {
-            same_file::Handle::from_file(file.try_clone().map_err(RecoveryOpenError::Io)?)
-                .map_err(RecoveryOpenError::Io)?
-        }
-        None => same_file::Handle::from_path(path).map_err(RecoveryOpenError::Io)?,
-    };
-    let metadata = match file.as_ref() {
-        Some(file) => file.metadata().map_err(RecoveryOpenError::Io)?,
-        None => metadata,
-    };
-    Ok(RecoveryFile {
-        file,
-        metadata,
-        #[cfg(windows)]
-        identity,
-    })
+    Ok(RecoveryFile { file, metadata })
 }
 
 #[cfg(unix)]
