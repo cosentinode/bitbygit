@@ -12,7 +12,7 @@ before anything runs.
 
 ## Product Model
 
-The core model should stay small and explicit:
+The core model is small and explicit:
 
 - Repository: a registered working tree path plus derived Git identity such as
   root, current branch, upstream, remotes, and provider hints.
@@ -73,15 +73,17 @@ The executor may run processes, but only from validated operation plans.
 9. Record an audit entry with sanitized metadata.
 10. Refresh repository state.
 
-## Initial Workspace
+## Workspace
 
 - `crates/bitbygit`: CLI binary entry point.
-- `crates/bitbygit-core`: shared domain model and constants.
+- `crates/bitbygit-core`: operation model, prompt parser, configuration, policy,
+  and shared constants.
+- `crates/bitbygit-gh`: typed `gh` CLI boundary for repository and pull request
+  operations.
 - `crates/bitbygit-git`: typed system Git command boundary.
 - `crates/bitbygit-store`: local registry, app state, and audit storage.
-
-Future phases should add crates only when the boundary is useful in practice.
-Likely future crates include `bitbygit-tui` and `bitbygit-gh`.
+- `crates/bitbygit-tui`: responsive terminal UI, operation planner, pending
+  queue, confirmation flow, and typed executor.
 
 The initial store is a single-writer file-backed store. The TUI should route
 mutations through one runtime owner; multi-process locking is a later concern
@@ -99,11 +101,29 @@ Prompt text and other user input must never be interpolated into shell commands.
 
 ## GitHub Boundary
 
-The MVP should use the `gh` CLI for GitHub-specific workflows such as pull
-request creation. `bitbygit` should not store GitHub tokens.
+The MVP uses the `gh` CLI for GitHub-specific workflows such as pull request
+creation on GitHub.com and GitHub Enterprise. `bitbygit` does not store GitHub
+tokens.
 
-GitHub behavior should stay behind an interface that can later support direct
-GitHub API calls or other providers without changing the planner contract.
+GitHub behavior stays behind a typed boundary so direct GitHub API calls or
+other providers can be added later without changing the planner contract.
+
+## Configuration and Policy Boundary
+
+`bitbygit-core` parses strict typed TOML configuration and derives an effective
+policy. Invalid startup configuration fails closed, and runtime reload failures
+retain the last valid policy. Protected branches, confirmation levels, disabled
+operations, prompt availability, and the default pull request base are applied
+to typed plans rather than raw commands.
+
+## Automation Boundary
+
+`.github/workflows/ci.yml` checks the workspace and supported source-build
+targets. `.github/workflows/release.yml` validates version tags, builds and
+smoke-tests supported platform archives, creates checksums, and publishes an
+immutable GitHub release. The automation is implemented, but the first real
+tagged release remains open in
+[#81](https://github.com/cosentinode/bitbygit/issues/81).
 
 ## Guardrail Boundary
 

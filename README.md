@@ -29,12 +29,20 @@ keeping risky operations visible, typed, previewed, and confirmed.
 
 ## Current Status
 
-The repository has merged through Phase 10 deterministic prompt parser work as
-part of [#12](https://github.com/cosentinode/bitbygit/issues/12), including
-golden parser tests, manual planner parity, and safe non-provider multi-step
-prompts. Pull request creation from `open pr` remains Phase 11 work in
-[#13](https://github.com/cosentinode/bitbygit/issues/13). See
-[`docs/mvp-phases.md`](docs/mvp-phases.md) for the implementation roadmap.
+Phases 0 through 11 are merged. The workspace includes the TUI and `gh` CLI
+boundaries, deterministic prompt parsing, a shared planner/executor path with
+queue preview and audit history, and guarded single- and multi-step pull request
+workflows. Phase 12 is in progress: repository operation-state detection and
+typed merge/rebase recovery commands are merged, while recovery policy and TUI
+actions remain open in [#55](https://github.com/cosentinode/bitbygit/issues/55)
+and [#56](https://github.com/cosentinode/bitbygit/issues/56).
+
+Phase 13 configuration and policy slices and Phase 14 release automation and
+installation documentation are implemented. Their umbrella issues remain open,
+and no release has been published; cutting and validating the first release is
+tracked in [#81](https://github.com/cosentinode/bitbygit/issues/81). Phase 15
+documentation work is also in progress. See
+[`docs/mvp-phases.md`](docs/mvp-phases.md) for the issue-linked roadmap.
 
 ## Configuration
 

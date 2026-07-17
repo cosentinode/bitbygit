@@ -2,26 +2,46 @@
 
 ```txt
 bitbygit/
-  Cargo.toml
-  README.md
-  CONTRIBUTING.md
+  .github/
+    workflows/
+      ci.yml
+      release.yml
+
+  .gitignore
   CHANGELOG.md
+  CONTRIBUTING.md
+  Cargo.lock
+  Cargo.toml
   LICENSE
+  README.md
 
   crates/
     bitbygit/
+      Cargo.toml
       src/main.rs
 
     bitbygit-core/
+      Cargo.toml
+      src/
+        config.rs
+        lib.rs
+        policy.rs
+        prompt_parser.rs
+
+    bitbygit-gh/
+      Cargo.toml
       src/lib.rs
 
     bitbygit-git/
+      Cargo.toml
       src/lib.rs
 
     bitbygit-store/
+      Cargo.toml
       src/lib.rs
 
     bitbygit-tui/
+      Cargo.toml
       src/lib.rs
 
   docs/
@@ -31,16 +51,16 @@ bitbygit/
     command-planner.md
     configuration.md
     guardrails.md
+    installation.md
     mvp-phases.md
     repo-layout.md
     tui-smoke-test.md
 
   scripts/
     setup-dev.sh
-
-  .github/
-    workflows/
-      ci.yml
+    test-installation-docs.ps1
+    test-installation-docs.sh
+    test-release-workflow.sh
 ```
 
 ## Notes
