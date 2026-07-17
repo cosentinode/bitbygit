@@ -677,8 +677,37 @@ impl PreparedPromptSequence {
 struct QueuedPromptSequence {
     first: PreparedOperation,
     remaining_requests: Vec<OperationRequest>,
+    deferred_pull_request_targets: Vec<Option<DeferredPullRequestTarget>>,
     policy_evaluations: Vec<PolicyEvaluation>,
     sequence_policy_evaluations: Vec<PolicyEvaluation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredPullRequestTarget {
+    repository: GitHubRepository,
+    head_repository: GitHubRepository,
+    head: String,
+    base: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SequenceBranch {
+    name: String,
+    upstream: SequenceUpstream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SequenceUpstream {
+    Existing,
+    Missing,
+    Bound { remote: String, branch: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypedPushTarget {
+    remote: String,
+    branch: String,
+    sets_upstream: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -708,12 +737,14 @@ impl QueuedPromptSequence {
     fn new(
         first: PreparedOperation,
         remaining_requests: Vec<OperationRequest>,
+        deferred_pull_request_targets: Vec<Option<DeferredPullRequestTarget>>,
         policy_evaluations: Vec<PolicyEvaluation>,
         sequence_policy_evaluations: Vec<PolicyEvaluation>,
     ) -> Self {
         Self {
             first,
             remaining_requests,
+            deferred_pull_request_targets,
             policy_evaluations,
             sequence_policy_evaluations,
         }
@@ -1658,13 +1689,23 @@ fn checkout_resulting_branch(target: &BranchTarget) -> Result<String, String> {
 fn prompt_sequence_plan(
     requests: &[OperationRequest],
     first: &PreparedOperation,
+    deferred_pull_request_targets: &[Option<DeferredPullRequestTarget>],
 ) -> Result<OperationPlan, String> {
     let Some(first_step) = first.plan.first_step() else {
         return Err("Prompt sequence blocked: first step produced no visible plan.".to_owned());
     };
     let mut steps = vec![prompt_sequence_first_step(1, first_step)];
-    for (index, request) in requests.iter().enumerate().skip(1) {
-        steps.push(prompt_sequence_deferred_step(index + 1, request)?);
+    for ((index, request), pull_request_target) in requests
+        .iter()
+        .enumerate()
+        .skip(1)
+        .zip(deferred_pull_request_targets)
+    {
+        steps.push(prompt_sequence_deferred_step(
+            index + 1,
+            request,
+            pull_request_target.as_ref(),
+        )?);
     }
     let confirmation_prompt = prompt_sequence_confirmation_prompt(&steps, requests.len());
     Ok(OperationPlan::new(
@@ -1692,8 +1733,28 @@ fn prompt_sequence_first_step(index: usize, step: &OperationStep) -> OperationSt
 fn prompt_sequence_deferred_step(
     index: usize,
     request: &OperationRequest,
+    pull_request_target: Option<&DeferredPullRequestTarget>,
 ) -> Result<OperationStep, String> {
-    let preview = prompt_sequence_request_preview(request)?;
+    let mut preview = prompt_sequence_request_preview(request)?;
+    if let Some(target) = pull_request_target {
+        preview.details.retain(|detail| {
+            !detail.starts_with("base: ") && !detail.starts_with("re-plan branch, remote, base")
+        });
+        preview
+            .details
+            .push(format!("repository: {}", target.repository.0));
+        preview.details.push(format!("head: {}", target.head));
+        preview.details.push(format!("base: {}", target.base));
+        preview.details.push(format!(
+            "target: https://{}/compare/{}...{}?expand=1",
+            target.repository.0,
+            compare_url_ref(&target.base),
+            compare_url_ref(&target.head)
+        ));
+        preview.details.push(
+            "revalidate the bound provider, repository, head, and base before execution".to_owned(),
+        );
+    }
     let mut step = OperationStep::new(
         preview.kind,
         sequence_step_risk(preview.risk_level),
@@ -1837,6 +1898,32 @@ fn prompt_sequence_request_preview(
             Err("unsupported request in prompt sequence".to_owned())
         }
     }
+}
+
+fn prompt_sequence_request_is_side_effecting(request: &OperationRequest) -> bool {
+    matches!(
+        request,
+        OperationRequest::Fetch
+            | OperationRequest::Commit { .. }
+            | OperationRequest::Push
+            | OperationRequest::Pull { .. }
+            | OperationRequest::Checkout { .. }
+            | OperationRequest::CreateBranch { .. }
+            | OperationRequest::Merge { .. }
+            | OperationRequest::Rebase { .. }
+            | OperationRequest::OpenPullRequest { .. }
+    )
+}
+
+fn deferred_pull_request_base_changed(
+    previous: &EffectivePolicy,
+    current: &EffectivePolicy,
+    requests: &[OperationRequest],
+) -> bool {
+    previous.default_pull_request_base() != current.default_pull_request_base()
+        && requests
+            .iter()
+            .any(|request| matches!(request, OperationRequest::OpenPullRequest { base: None }))
 }
 
 fn repo_list(app: &App) -> List<'_> {
@@ -2086,21 +2173,26 @@ impl OperationPlanner {
                     .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
             });
         let (policy_evaluations, sequence_policy_evaluations) =
-            prompt_sequence_policy_evaluations(&self.policy, &git, &requests, branch)?;
-        let first_request = requests
-            .first()
-            .cloned()
-            .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
+            prompt_sequence_policy_evaluations(&self.policy, &git, &requests, branch.clone())?;
         let blocked = policy_evaluations
             .iter()
             .chain(&sequence_policy_evaluations)
             .any(|evaluation| evaluation.requirement == ConfirmationRequirement::Blocked);
+        let deferred_pull_request_targets = if blocked {
+            vec![None; requests.len().saturating_sub(1)]
+        } else {
+            self.deferred_pull_request_targets(&requests, branch.clone())?
+        };
+        let first_request = requests
+            .first()
+            .cloned()
+            .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
         let first = if blocked {
             prompt_sequence_preflight_operation(first_request)?
         } else {
             self.plan_request(first_request)?
         };
-        let mut plan = prompt_sequence_plan(&requests, &first)?;
+        let mut plan = prompt_sequence_plan(&requests, &first, &deferred_pull_request_targets)?;
         apply_policy_evaluation(
             &mut plan,
             combined_policy_evaluation(
@@ -2116,10 +2208,198 @@ impl OperationPlanner {
             QueuedPromptSequence::new(
                 first,
                 remaining_requests,
+                deferred_pull_request_targets,
                 policy_evaluations,
                 sequence_policy_evaluations,
             ),
         ))
+    }
+
+    fn deferred_pull_request_targets(
+        &self,
+        requests: &[OperationRequest],
+        initial_branch: Option<String>,
+    ) -> Result<Vec<Option<DeferredPullRequestTarget>>, String> {
+        let git = self.git();
+        let mut branch = initial_branch.map(|name| SequenceBranch {
+            name,
+            upstream: SequenceUpstream::Existing,
+        });
+        let mut targets = Vec::with_capacity(requests.len().saturating_sub(1));
+
+        for (index, request) in requests.iter().enumerate() {
+            if index > 0 {
+                let target = match request {
+                    OperationRequest::OpenPullRequest { base } => {
+                        let branch = branch.as_ref().ok_or_else(|| {
+                            "Open pull request blocked: unable to resolve the deferred branch."
+                                .to_owned()
+                        })?;
+                        Some(self.deferred_pull_request_target(&git, branch, base.as_deref())?)
+                    }
+                    _ => None,
+                };
+                targets.push(target);
+            }
+
+            if !requests[index + 1..]
+                .iter()
+                .any(|request| matches!(request, OperationRequest::OpenPullRequest { .. }))
+            {
+                continue;
+            }
+            match request {
+                OperationRequest::Checkout { branch: target }
+                    if branch.as_ref().map(|branch| &branch.name) != Some(target) =>
+                {
+                    let target = git
+                        .branch_target(target)
+                        .map_err(|error| format!("Unable to resolve sequence checkout: {error}"))?
+                        .ok_or_else(|| {
+                            format!(
+                                "Prompt sequence blocked: checkout target {target} cannot be validated during preflight; create a new sequence preview."
+                            )
+                        })?;
+                    git.ensure_remote_checkout_target_available(&target)
+                        .map_err(|error| {
+                            format!(
+                                "Prompt sequence blocked: checkout target cannot be validated during preflight: {error}; create a new sequence preview."
+                            )
+                        })?;
+                    let name = checkout_resulting_branch(&target)?;
+                    let upstream = if target.kind == BranchKind::Remote {
+                        let (remote, branch) = target.name.split_once('/').ok_or_else(|| {
+                            format!(
+                                "Prompt sequence blocked: remote checkout target {} cannot be bound during preflight; create a new sequence preview.",
+                                target.name
+                            )
+                        })?;
+                        SequenceUpstream::Bound {
+                            remote: remote.to_owned(),
+                            branch: branch.to_owned(),
+                        }
+                    } else {
+                        SequenceUpstream::Existing
+                    };
+                    branch = Some(SequenceBranch { name, upstream });
+                }
+                OperationRequest::CreateBranch { branch: target, .. } => {
+                    branch = Some(SequenceBranch {
+                        name: target.clone(),
+                        upstream: SequenceUpstream::Missing,
+                    });
+                }
+                OperationRequest::Push => {
+                    let branch = branch.as_mut().ok_or_else(|| {
+                        "Prompt sequence blocked: push branch cannot be resolved during preflight; create a new sequence preview."
+                            .to_owned()
+                    })?;
+                    let target = self.typed_push_target(&git, &branch.name, &branch.upstream)?;
+                    if target.sets_upstream {
+                        branch.upstream = SequenceUpstream::Bound {
+                            remote: target.remote,
+                            branch: target.branch,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(targets)
+    }
+
+    fn deferred_pull_request_target(
+        &self,
+        git: &Git,
+        branch: &SequenceBranch,
+        requested_base: Option<&str>,
+    ) -> Result<DeferredPullRequestTarget, String> {
+        let push_target = self.typed_push_target(git, &branch.name, &branch.upstream)?;
+        if push_target.sets_upstream {
+            return Err(
+                "Open pull request blocked: the deferred branch will not have an upstream; add `push` before `open pr` and create a new sequence preview."
+                    .to_owned(),
+            );
+        }
+        let TypedPushTarget {
+            remote,
+            branch: upstream_branch,
+            ..
+        } = push_target;
+        let remote_urls = git
+            .remote_push_urls(&remote)
+            .map_err(|error| format!("Unable to prepare pull request remote: {error}"))?;
+        let push_url = single_pull_request_push_url(&remote, &remote_urls)?;
+        let head_repository = github_repository_from_push_url(push_url)
+            .map_err(|reason| format!("Open pull request blocked: remote {remote} {reason}"))?;
+        let github_repository = github_base_repository(git, &remote, &head_repository)?;
+        if !head_repository
+            .hostname()
+            .eq_ignore_ascii_case(github_repository.hostname())
+        {
+            return Err(
+                "Open pull request blocked: source and upstream remotes use different GitHub hosts."
+                    .to_owned(),
+            );
+        }
+        let github = self.github(&github_repository);
+        let repository = github.repository().map_err(open_pull_request_gh_error)?;
+        let canonical_github_repository =
+            GitHubRepository::new(github_repository.hostname(), &repository.name_with_owner);
+        let canonical_head_repository = if head_repository.eq_ignore_ascii_case(&github_repository)
+        {
+            canonical_github_repository.clone()
+        } else {
+            let head = self
+                .github(&head_repository)
+                .repository()
+                .map_err(open_pull_request_gh_error)?;
+            GitHubRepository::new(head_repository.hostname(), &head.name_with_owner)
+        };
+        let head = pull_request_head(
+            &canonical_head_repository,
+            &canonical_github_repository,
+            &upstream_branch,
+        )?;
+        let configured_base =
+            requested_base.is_none() && self.policy.default_pull_request_base().is_some();
+        let base = requested_base
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.policy
+                    .default_pull_request_base()
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| repository.default_branch.clone());
+        validate_pull_request_base_head(
+            &canonical_head_repository,
+            &canonical_github_repository,
+            &base,
+            &upstream_branch,
+        )?;
+        if !github
+            .branch_exists(&base)
+            .map_err(open_pull_request_gh_error)?
+        {
+            let mut error = format!(
+                "Open pull request blocked: base branch {base} was not found in {}.",
+                repository.name_with_owner
+            );
+            if configured_base {
+                error.push_str(
+                    " Update pull-requests.default-base-branch or choose an existing branch with `open pr to <branch>`.",
+                );
+            }
+            return Err(error);
+        }
+
+        Ok(DeferredPullRequestTarget {
+            repository: canonical_github_repository,
+            head_repository: canonical_head_repository,
+            head,
+            base,
+        })
     }
 
     fn plan_stage_pathspecs(&self, paths: Vec<PathBuf>) -> Result<PreparedOperation, String> {
@@ -2193,62 +2473,61 @@ impl OperationPlanner {
             .map_err(|error| format!("Unable to snapshot push target: {error}"))?;
         let ahead = status.branch.ahead;
 
-        match status.branch.upstream {
+        let upstream = status.branch.upstream;
+        let sequence_upstream = match upstream.as_deref() {
             Some(upstream) => {
-                let (remote, upstream_branch) = git
+                let (remote, branch) = git
                     .upstream_push_target(&branch)
                     .map_err(|error| format!("Unable to prepare push target: {error}"))?
                     .ok_or_else(|| {
                         format!("Push blocked: unable to resolve upstream {upstream}.")
                     })?;
-                let expected_upstream = format!("{remote}/{upstream_branch}");
+                let expected_upstream = format!("{remote}/{branch}");
                 if expected_upstream != upstream {
                     return Err(format!(
                         "Push blocked: upstream config does not match {upstream}."
                     ));
                 }
-                let remote_urls = git
-                    .remote_push_urls(&remote)
-                    .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
-                let push_url = single_push_url(&remote, &remote_urls)?;
-                let expected_remote_oid = git
-                    .remote_url_head_oid(push_url, &upstream_branch)
-                    .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
-                Ok(PreparedOperation::new(
-                    push_plan(&branch, &upstream, ahead),
-                    ExecutionContext::from_payload(PendingPayload::Push {
-                        local_branch: branch,
-                        target: head_target,
-                        remote,
-                        upstream_branch,
-                        upstream,
-                        expected_remote_oid,
-                        remote_urls,
-                    }),
-                ))
+                SequenceUpstream::Bound { remote, branch }
             }
-            None => {
-                let Some(remote) = self.default_remote_name() else {
-                    return Err("Push blocked: no remotes are configured.".to_owned());
-                };
-                let remote_urls = git
-                    .remote_push_urls(&remote)
-                    .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
-                let push_url = single_push_url(&remote, &remote_urls)?;
-                let expected_remote_oid = git
-                    .remote_url_head_oid(push_url, &branch)
-                    .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
-                Ok(PreparedOperation::new(
-                    push_set_upstream_plan(&branch, &remote),
-                    ExecutionContext::from_payload(PendingPayload::PushSetUpstream {
-                        remote,
-                        branch,
-                        target: head_target,
-                        expected_remote_oid,
-                        remote_urls,
-                    }),
-                ))
-            }
+            None => SequenceUpstream::Missing,
+        };
+        let push_target = self.typed_push_target(&git, &branch, &sequence_upstream)?;
+        let remote_urls = git
+            .remote_push_urls(&push_target.remote)
+            .map_err(|error| format!("Unable to snapshot push remote URLs: {error}"))?;
+        let push_url = single_push_url(&push_target.remote, &remote_urls)?;
+        let expected_remote_oid = git
+            .remote_url_head_oid(push_url, &push_target.branch)
+            .map_err(|error| format!("Unable to snapshot push remote: {error}"))?;
+        if push_target.sets_upstream {
+            Ok(PreparedOperation::new(
+                push_set_upstream_plan(&branch, &push_target.remote),
+                ExecutionContext::from_payload(PendingPayload::PushSetUpstream {
+                    remote: push_target.remote,
+                    branch,
+                    target: head_target,
+                    expected_remote_oid,
+                    remote_urls,
+                }),
+            ))
+        } else {
+            let upstream = upstream.ok_or_else(|| {
+                "Push blocked: tracked push destination has no upstream.".to_owned()
+            })?;
+            let destination = format!("{}/{}", push_target.remote, push_target.branch);
+            Ok(PreparedOperation::new(
+                push_plan(&branch, &destination, ahead),
+                ExecutionContext::from_payload(PendingPayload::Push {
+                    local_branch: branch,
+                    target: head_target,
+                    remote: push_target.remote,
+                    upstream_branch: push_target.branch,
+                    upstream,
+                    expected_remote_oid,
+                    remote_urls,
+                }),
+            ))
         }
     }
 
@@ -2457,13 +2736,28 @@ impl OperationPlanner {
         let Some(upstream) = status.branch.upstream.clone() else {
             return Err("Open pull request blocked: current branch has no upstream. Push it with `push` first.".to_owned());
         };
-        let (remote, upstream_branch) = git
-            .push_target(&branch)
+        let (tracking_remote, tracking_branch) = git
+            .upstream_push_target(&branch)
             .map_err(|error| format!("Unable to prepare pull request target: {error}"))?
             .ok_or_else(|| {
-                "Open pull request blocked: unable to resolve the current branch push target."
+                "Open pull request blocked: unable to resolve the current branch upstream."
                     .to_owned()
             })?;
+        if format!("{tracking_remote}/{tracking_branch}") != upstream {
+            return Err(format!(
+                "Open pull request blocked: upstream config does not match {upstream}."
+            ));
+        }
+        let push_target = self.typed_push_target(
+            &git,
+            &branch,
+            &SequenceUpstream::Bound {
+                remote: tracking_remote,
+                branch: tracking_branch,
+            },
+        )?;
+        let remote = push_target.remote;
+        let upstream_branch = push_target.branch;
         let remote_urls = git
             .remote_push_urls(&remote)
             .map_err(|error| format!("Unable to prepare pull request remote: {error}"))?;
@@ -2514,23 +2808,35 @@ impl OperationPlanner {
             &canonical_github_repository,
             &upstream_branch,
         )?;
-        let base = requested_base.unwrap_or(repository.default_branch);
-        if canonical_head_github_repository.eq_ignore_ascii_case(&canonical_github_repository)
-            && base == upstream_branch
-        {
-            return Err(
-                "Open pull request blocked: base branch must differ from the pull request head."
-                    .to_owned(),
-            );
-        }
+        let configured_base =
+            requested_base.is_none() && self.policy.default_pull_request_base().is_some();
+        let base = requested_base
+            .or_else(|| {
+                self.policy
+                    .default_pull_request_base()
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or(repository.default_branch);
+        validate_pull_request_base_head(
+            &canonical_head_github_repository,
+            &canonical_github_repository,
+            &base,
+            &upstream_branch,
+        )?;
         if !github
             .branch_exists(&base)
             .map_err(open_pull_request_gh_error)?
         {
-            return Err(format!(
+            let mut error = format!(
                 "Open pull request blocked: base branch {base} was not found in {}.",
                 repository.name_with_owner
-            ));
+            );
+            if configured_base {
+                error.push_str(
+                    " Update pull-requests.default-base-branch or choose an existing branch with `open pr to <branch>`.",
+                );
+            }
+            return Err(error);
         }
         let existing = github
             .existing_pull_requests(&head)
@@ -2585,13 +2891,37 @@ impl OperationPlanner {
         branch_name(&status.branch).map_err(|error| error.replace("Operation", action))
     }
 
-    fn default_remote_name(&self) -> Option<String> {
-        let remotes = self.git().remotes().ok()?;
-        remotes
-            .iter()
-            .find(|remote| remote.name == "origin")
-            .or_else(|| remotes.first())
-            .map(|remote| remote.name.clone())
+    fn typed_push_target(
+        &self,
+        git: &Git,
+        branch: &str,
+        upstream: &SequenceUpstream,
+    ) -> Result<TypedPushTarget, String> {
+        let upstream = match upstream {
+            SequenceUpstream::Existing => git
+                .upstream_push_target(branch)
+                .map_err(|error| format!("Unable to prepare push target: {error}"))?,
+            SequenceUpstream::Missing => None,
+            SequenceUpstream::Bound { remote, branch } => Some((remote.clone(), branch.clone())),
+        };
+        let default_remote = default_remote_name(git);
+        let (remote, target_branch) = git
+            .typed_push_target(
+                branch,
+                upstream
+                    .as_ref()
+                    .map(|(remote, branch)| (remote.as_str(), branch.as_str())),
+                default_remote.as_deref(),
+            )
+            .map_err(|error| format!("Unable to prepare push target: {error}"))?
+            .ok_or_else(|| {
+                "Push blocked: no configured push destination could be resolved.".to_owned()
+            })?;
+        Ok(TypedPushTarget {
+            remote,
+            branch: target_branch,
+            sets_upstream: upstream.is_none(),
+        })
     }
 
     fn git(&self) -> Git {
@@ -2618,6 +2948,15 @@ impl OperationPlanner {
             ),
         }
     }
+}
+
+fn default_remote_name(git: &Git) -> Option<String> {
+    let remotes = git.remotes().ok()?;
+    remotes
+        .iter()
+        .find(|remote| remote.name == "origin")
+        .or_else(|| remotes.first())
+        .map(|remote| remote.name.clone())
 }
 
 fn prompt_sequence_preflight_operation(
@@ -2811,6 +3150,21 @@ fn pull_request_head(
     Ok(format!("{owner}:{branch}"))
 }
 
+fn validate_pull_request_base_head(
+    head_repository: &GitHubRepository,
+    base_repository: &GitHubRepository,
+    base: &str,
+    head_branch: &str,
+) -> Result<(), String> {
+    if head_repository.eq_ignore_ascii_case(base_repository) && base == head_branch {
+        return Err(
+            "Open pull request blocked: base branch must differ from the pull request head."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn matching_pull_request<'a>(
     pull_requests: &'a [bitbygit_gh::PullRequest],
     base: &str,
@@ -2837,6 +3191,7 @@ fn validate_push_plan(
     expected_upstream: Option<&str>,
     target: &HeadTarget,
     remote: &str,
+    remote_branch: &str,
     remote_urls: &[String],
 ) -> Result<(), String> {
     if git
@@ -2855,6 +3210,40 @@ fn validate_push_plan(
     }
     if status.branch.upstream.as_deref() != expected_upstream {
         return Err("Push blocked: upstream changed since the plan was shown.".to_owned());
+    }
+    let upstream = match expected_upstream {
+        Some(expected_upstream) => {
+            let upstream = git
+                .upstream_push_target(branch)
+                .map_err(|error| format!("Unable to revalidate push target: {error}"))?
+                .ok_or_else(|| {
+                    "Push blocked: upstream config is no longer available.".to_owned()
+                })?;
+            if format!("{}/{}", upstream.0, upstream.1) != expected_upstream {
+                return Err(
+                    "Push blocked: upstream config changed since the plan was shown.".to_owned(),
+                );
+            }
+            Some(upstream)
+        }
+        None => None,
+    };
+    let default_remote = default_remote_name(git);
+    let current_target = git
+        .typed_push_target(
+            branch,
+            upstream
+                .as_ref()
+                .map(|(remote, branch)| (remote.as_str(), branch.as_str())),
+            default_remote.as_deref(),
+        )
+        .map_err(|error| format!("Unable to revalidate push target: {error}"))?;
+    if current_target
+        .as_ref()
+        .map(|(remote, branch)| (remote.as_str(), branch.as_str()))
+        != Some((remote, remote_branch))
+    {
+        return Err("Push blocked: push destination changed since the plan was shown.".to_owned());
     }
     let current_remote_urls = git
         .remote_push_urls(remote)
@@ -2928,7 +3317,27 @@ fn validate_open_pull_request_plan(
             "Open pull request blocked: upstream changed since the plan was shown.".to_owned(),
         ));
     }
-    let current_target = git.push_target(branch).map_err(StepExecutionError::Git)?;
+    let tracking_target = git
+        .upstream_push_target(branch)
+        .map_err(StepExecutionError::Git)?
+        .ok_or_else(|| {
+            StepExecutionError::Blocked(
+                "Open pull request blocked: upstream config is no longer available.".to_owned(),
+            )
+        })?;
+    if format!("{}/{}", tracking_target.0, tracking_target.1) != expected_upstream {
+        return Err(StepExecutionError::Blocked(
+            "Open pull request blocked: upstream config changed since the plan was shown."
+                .to_owned(),
+        ));
+    }
+    let current_target = git
+        .typed_push_target(
+            branch,
+            Some((tracking_target.0.as_str(), tracking_target.1.as_str())),
+            None,
+        )
+        .map_err(StepExecutionError::Git)?;
     if current_target
         .as_ref()
         .map(|(name, branch)| (name.as_str(), branch.as_str()))
@@ -3306,6 +3715,29 @@ fn policy_branch(context: &ExecutionContext) -> Option<&str> {
     }
 }
 
+fn prepared_pull_request_target(
+    operation: &PreparedOperation,
+) -> Option<DeferredPullRequestTarget> {
+    let PendingPayload::OpenPullRequest {
+        base,
+        repository,
+        github_repository,
+        head_github_repository,
+        head_repository,
+        head,
+        ..
+    } = operation.context.payload.as_ref()?
+    else {
+        return None;
+    };
+    Some(DeferredPullRequestTarget {
+        repository: GitHubRepository::new(github_repository.hostname(), repository),
+        head_repository: GitHubRepository::new(head_github_repository.hostname(), head_repository),
+        head: head.clone(),
+        base: base.clone(),
+    })
+}
+
 fn head_target_branch(target: &HeadTarget) -> Option<&str> {
     target.reference.as_deref()?.strip_prefix("refs/heads/")
 }
@@ -3569,6 +4001,7 @@ impl PlanExecutor {
             Some(upstream),
             target,
             remote,
+            upstream_branch,
             remote_urls,
         )
         .map_err(StepExecutionError::Blocked)?;
@@ -3596,7 +4029,7 @@ impl PlanExecutor {
         else {
             return Err(mismatched_context(OperationKind::PushSetUpstream));
         };
-        validate_push_plan(git, branch, None, target, remote, remote_urls)
+        validate_push_plan(git, branch, None, target, remote, branch, remote_urls)
             .map_err(StepExecutionError::Blocked)?;
         let source_oid = target.oid.as_deref().ok_or_else(|| {
             StepExecutionError::Git(GitError::Blocked {
@@ -4042,6 +4475,7 @@ impl PromptSequenceExecutor {
         let QueuedPromptSequence {
             first,
             remaining_requests,
+            deferred_pull_request_targets,
             policy_evaluations,
             sequence_policy_evaluations,
         } = sequence;
@@ -4059,6 +4493,21 @@ impl PromptSequenceExecutor {
                     .ok()
                     .and_then(|status| branch_name(&status.branch).ok())
             });
+        let planner = self.planner(current_policy.clone());
+        let current_pull_request_targets =
+            planner.deferred_pull_request_targets(&requests, branch.clone());
+        current_policy = self.load_policy(&current_policy);
+        if deferred_pull_request_base_changed(&planner.policy, &current_policy, &requests)
+            || current_pull_request_targets.as_ref() != Ok(&deferred_pull_request_targets)
+        {
+            step_results.push(PromptSequenceStepResult::planning_failed(
+                1,
+                first.plan.title.clone(),
+                "pull request target changed since the sequence preview; create a new sequence preview and confirmation"
+                    .to_owned(),
+            ));
+            return PromptSequenceExecutionResult::new(total_steps, step_results, current_policy);
+        }
         let (current_policies, current_sequence_policies) =
             match prompt_sequence_policy_evaluations(&current_policy, &git, &requests, branch) {
                 Ok(evaluations) => evaluations,
@@ -4144,17 +4593,71 @@ impl PromptSequenceExecutor {
 
         for (index, request) in remaining_requests.into_iter().enumerate() {
             let step_number = index + 2;
-            current_policy = self.load_policy(&current_policy);
-            let planner = OperationPlanner {
-                repo_root: self.repo_root.clone(),
-                github_executable: self.github_executable.clone(),
-                policy: current_policy.clone(),
-                #[cfg(test)]
-                ssh_executable: self.ssh_executable.clone(),
+            let Some(previewed_pull_request_target) =
+                deferred_pull_request_targets.get(index).cloned()
+            else {
+                step_results.push(PromptSequenceStepResult::planning_failed(
+                    step_number,
+                    prompt_sequence_request_title(&request),
+                    "sequence preview is missing pull request target context".to_owned(),
+                ));
+                return PromptSequenceExecutionResult::new(
+                    total_steps,
+                    step_results,
+                    current_policy,
+                );
             };
+            current_policy = self.load_policy(&current_policy);
+            let planner = self.planner(current_policy.clone());
+            let downstream_pull_request_targets = &deferred_pull_request_targets[index + 1..];
+            if prompt_sequence_request_is_side_effecting(&request)
+                && downstream_pull_request_targets.iter().any(Option::is_some)
+            {
+                let branch = git
+                    .status()
+                    .ok()
+                    .and_then(|status| branch_name(&status.branch).ok())
+                    .or_else(|| {
+                        git.head_target()
+                            .ok()
+                            .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
+                    });
+                let remaining_requests = &requests[index + 1..];
+                let current_targets =
+                    planner.deferred_pull_request_targets(remaining_requests, branch);
+                current_policy = self.load_policy(&current_policy);
+                if deferred_pull_request_base_changed(
+                    &planner.policy,
+                    &current_policy,
+                    remaining_requests,
+                ) || !current_targets
+                    .as_ref()
+                    .is_ok_and(|targets| targets == downstream_pull_request_targets)
+                {
+                    step_results.push(PromptSequenceStepResult::planning_failed(
+                        step_number,
+                        prompt_sequence_request_title(&request),
+                        "pull request target changed since the sequence preview; create a new sequence preview and confirmation"
+                            .to_owned(),
+                    ));
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
+                }
+            }
+            let planner = self.planner(current_policy.clone());
             let operation = match planner.plan_request(request.clone()) {
                 Ok(operation) => operation,
                 Err(error) => {
+                    let error = if previewed_pull_request_target.is_some() {
+                        format!(
+                            "pull request target must be re-previewed and confirmed before execution: {error}"
+                        )
+                    } else {
+                        error
+                    };
                     step_results.push(PromptSequenceStepResult::planning_failed(
                         step_number,
                         prompt_sequence_request_title(&request),
@@ -4167,6 +4670,60 @@ impl PromptSequenceExecutor {
                     );
                 }
             };
+            if prompt_sequence_request_is_side_effecting(&request)
+                && downstream_pull_request_targets.iter().any(Option::is_some)
+            {
+                let branch = git
+                    .status()
+                    .ok()
+                    .and_then(|status| branch_name(&status.branch).ok())
+                    .or_else(|| {
+                        git.head_target()
+                            .ok()
+                            .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
+                    });
+                let remaining_requests = &requests[index + 1..];
+                let current_targets =
+                    planner.deferred_pull_request_targets(remaining_requests, branch);
+                current_policy = self.load_policy(&current_policy);
+                if deferred_pull_request_base_changed(
+                    &planner.policy,
+                    &current_policy,
+                    remaining_requests,
+                ) || !current_targets
+                    .as_ref()
+                    .is_ok_and(|targets| targets == downstream_pull_request_targets)
+                {
+                    step_results.push(PromptSequenceStepResult::planning_failed(
+                        step_number,
+                        operation.plan.title.clone(),
+                        "pull request target changed since the sequence preview; create a new sequence preview and confirmation"
+                            .to_owned(),
+                    ));
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
+                }
+            } else {
+                current_policy = self.load_policy(&current_policy);
+            }
+            if let Some(previewed_target) = previewed_pull_request_target {
+                if prepared_pull_request_target(&operation).as_ref() != Some(&previewed_target) {
+                    step_results.push(PromptSequenceStepResult::planning_failed(
+                        step_number,
+                        operation.plan.title.clone(),
+                        "pull request target changed since the sequence preview; create a new sequence preview and confirmation"
+                            .to_owned(),
+                    ));
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
+                }
+            }
             let (Some(previewed_policy), Some(previewed_sequence_policy)) = (
                 previewed_policies.next(),
                 previewed_sequence_policies.next(),
@@ -4182,7 +4739,6 @@ impl PromptSequenceExecutor {
                     current_policy,
                 );
             };
-            current_policy = self.load_policy(&current_policy);
             let branch = policy_branch(&operation.context);
             let current_evaluation = evaluate_plan_policy(&current_policy, &operation.plan, branch);
             let current_sequence_evaluation =
@@ -4233,6 +4789,16 @@ impl PromptSequenceExecutor {
 
     fn load_policy(&self, fallback: &EffectivePolicy) -> EffectivePolicy {
         self.audit.load_policy(fallback)
+    }
+
+    fn planner(&self, policy: EffectivePolicy) -> OperationPlanner {
+        OperationPlanner {
+            repo_root: self.repo_root.clone(),
+            github_executable: self.github_executable.clone(),
+            policy,
+            #[cfg(test)]
+            ssh_executable: self.ssh_executable.clone(),
+        }
     }
 
     fn execute_prepared_step(
@@ -5203,23 +5769,27 @@ mod tests {
     #[test]
     fn prompt_sequence_stops_before_push_and_pr_when_commit_execution_fails()
     -> Result<(), Box<dyn Error>> {
-        let repo = isolated_git_repo("prompt-sequence-commit-fails")?;
-        configure_git_identity(&repo)?;
+        let repo = pushed_branch_repo("prompt-sequence-commit-fails")?;
+        let fake_gh = fake_gh("prompt-sequence-commit-fails", false)?;
         std::fs::write(repo.join("file.txt"), "hello\n")?;
         git_stdout(&repo, &["add", "file.txt"])?;
-        let sequence = OperationPlanner::new(&repo)
-            .plan_prompt_sequence(vec![
-                OperationRequest::Commit {
-                    message: "ship staged".to_owned(),
-                },
-                OperationRequest::Push,
-                OperationRequest::OpenPullRequest { base: None },
-            ])
-            .map_err(std::io::Error::other)?;
+        let sequence = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(test_ssh_command()?),
+        }
+        .plan_prompt_sequence(vec![
+            OperationRequest::Commit {
+                message: "ship staged".to_owned(),
+            },
+            OperationRequest::Push,
+            OperationRequest::OpenPullRequest { base: None },
+        ])
+        .map_err(std::io::Error::other)?;
         std::fs::write(repo.join("file.txt"), "changed after preview\n")?;
         git_stdout(&repo, &["add", "file.txt"])?;
         let paths = isolated_store_paths("prompt-sequence-commit-fails-audit")?;
-        let fake_gh = fake_gh("prompt-sequence-commit-fails", false)?;
 
         let result = PromptSequenceExecutor::with_audit_paths_and_tools(
             &repo,
@@ -5234,7 +5804,9 @@ mod tests {
                 .message()
                 .contains("Prompt sequence stopped after step 1 of 3.")
         );
-        assert!(!fake_gh.with_file_name("invocations").exists());
+        assert!(
+            !std::fs::read_to_string(fake_gh.with_file_name("invocations"))?.contains("pr:create")
+        );
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         let operations = entries
             .iter()
@@ -5275,7 +5847,9 @@ mod tests {
                 .message()
                 .contains("Prompt sequence stopped after step 1 of 2.")
         );
-        assert!(!fake_gh.with_file_name("invocations").exists());
+        assert!(
+            !std::fs::read_to_string(fake_gh.with_file_name("invocations"))?.contains("pr:create")
+        );
         let entries = LocalStore::open(paths)?.list_audit_entries()?;
         let operations = entries
             .iter()
@@ -5361,7 +5935,8 @@ mod tests {
         assert!(preview.contains("1. commit 1 staged file(s)"));
         assert!(preview.contains("2. push current branch"));
         assert!(preview.contains("3. open or surface pull request"));
-        assert!(preview.contains("base: repository default (resolved after push)"));
+        assert!(preview.contains("repository: github.com/octo/repo"));
+        assert!(preview.contains("base: main"));
         assert!(preview.contains("planned after step 2 succeeds"));
         let paths = isolated_store_paths("prompt-sequence-open-pr-audit")?;
         let result =
@@ -5400,7 +5975,758 @@ mod tests {
     }
 
     #[test]
-    fn missing_gh_after_push_stops_pr_with_setup_guidance() -> Result<(), Box<dyn Error>> {
+    fn remote_checkout_push_pr_revalidates_target_before_any_step() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-remote-checkout-pr")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-remote-checkout-pr-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let original_branch = git_stdout(&repo, &["branch", "--show-current"])?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        add_github_remote(&repo, "fork", &fork)?;
+        git_stdout(&repo, &["update-ref", "refs/remotes/fork/topic", "HEAD"])?;
+        let fake_gh = fake_gh("prompt-sequence-remote-checkout-pr", false)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Checkout {
+                    branch: "fork/topic".to_owned(),
+                },
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(preview.contains("repository: github.com/upstream/repo"));
+        assert!(preview.contains("head: octo:topic"));
+        assert!(preview.contains(
+            "target: https://github.com/upstream/repo/compare/main...octo%3Atopic?expand=1"
+        ));
+        git_stdout(&repo, &["config", "remote.pushDefault", "origin"])?;
+        let paths = isolated_store_paths("prompt-sequence-remote-checkout-pr-audit")?;
+
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 1 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        assert_eq!(
+            git_stdout(&repo, &["branch", "--show-current"])?,
+            original_branch
+        );
+        assert!(LocalStore::open(paths)?.list_audit_entries()?.is_empty());
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&fork)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/topic"])
+                .status()?
+                .success(),
+            "push must not run before the changed pull request target is rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_revalidates_downstream_pr_target_after_fetch() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = isolated_git_repo("prompt-sequence-fetch-changes-push-target")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-fetch-origin")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-fetch-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &origin)?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "ssh://git@github.com/fork/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "config",
+                "remote.fork.testbare",
+                &fork.display().to_string(),
+            ],
+        )?;
+        let fake_gh = fake_gh("prompt-sequence-fetch-changes-push-target", false)?;
+        let ssh_root = isolated_temp_root("prompt-sequence-fetch-changes-push-target-ssh")?;
+        std::fs::create_dir_all(&ssh_root)?;
+        let ssh = ssh_root.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\ngit config remote.pushDefault fork\ncase \"$*\" in\n*fork/repo.git*) target='{}' ;;\n*) target='{}' ;;\nesac\ncase \"$*\" in\n*git-receive-pack*) exec git-receive-pack \"$target\" ;;\n*) exec git-upload-pack \"$target\" ;;\nesac\n",
+                fork.display(),
+                origin.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&ssh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        let preview = sequence.plan.preview_text();
+        assert!(
+            preview.contains("repository: github.com/octo/repo"),
+            "{preview}"
+        );
+        let paths = isolated_store_paths("prompt-sequence-fetch-changes-push-target-audit")?;
+
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert!(entries.iter().all(|entry| entry.operation != "push"));
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&fork)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()?
+                .success(),
+            "push must not create a ref at the changed destination"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_revalidates_downstream_pr_target_after_replanning() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = isolated_git_repo("prompt-sequence-replan-changes-push-target")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-replan-origin")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-replan-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &origin)?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "ssh://git@github.com/fork/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "config",
+                "remote.fork.testbare",
+                &fork.display().to_string(),
+            ],
+        )?;
+
+        let delegated_gh = fake_gh("prompt-sequence-replan-changes-push-target", false)?;
+        let gh_root = isolated_temp_root("prompt-sequence-replan-changes-push-target-gh")?;
+        std::fs::create_dir_all(&gh_root)?;
+        let fake_gh = gh_root.join("gh");
+        let repo_view_count = gh_root.join("repo-view-count");
+        std::fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\nif [ \"$1:$2\" = repo:view ]; then\n  count=0\n  [ ! -f '{}' ] || count=$(cat '{}')\n  count=$((count + 1))\n  printf '%s\\n' \"$count\" > '{}'\n  if [ \"$count\" -eq 5 ]; then git config remote.pushDefault fork; fi\nfi\nexec '{}' \"$@\"\n",
+                repo_view_count.display(),
+                repo_view_count.display(),
+                repo_view_count.display(),
+                delegated_gh.display(),
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&fake_gh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, permissions)?;
+
+        let ssh_root = isolated_temp_root("prompt-sequence-replan-changes-push-target-ssh")?;
+        std::fs::create_dir_all(&ssh_root)?;
+        let ssh = ssh_root.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*fork/repo.git*) target='{}' ;;\n*) target='{}' ;;\nesac\ncase \"$*\" in\n*git-receive-pack*) exec git-receive-pack \"$target\" ;;\n*) exec git-upload-pack \"$target\" ;;\nesac\n",
+                fork.display(),
+                origin.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&ssh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions)?;
+
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("prompt-sequence-replan-changes-push-target-audit")?;
+
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert!(entries.iter().all(|entry| entry.operation != "push"));
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&fork)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()?
+                .success(),
+            "push must not create a ref at the replanned destination"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_revalidates_downstream_pr_base_after_config_reload() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = isolated_git_repo("prompt-sequence-reload-changes-pr-base")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-reload-pr-base-origin")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &origin)?;
+
+        let paths = isolated_store_paths("prompt-sequence-reload-changes-pr-base-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[pull-requests]\ndefault-base-branch = \"release\"\n",
+        )?;
+        let policy = EffectivePolicy::new(&store.load_config().settings);
+        let delegated_gh = fake_gh("prompt-sequence-reload-changes-pr-base", false)?;
+        let gh_root = isolated_temp_root("prompt-sequence-reload-changes-pr-base-gh")?;
+        std::fs::create_dir_all(&gh_root)?;
+        let fake_gh = gh_root.join("gh");
+        let repo_view_count = gh_root.join("repo-view-count");
+        std::fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\nif [ \"$1:$2\" = repo:view ]; then\n  count=0\n  [ ! -f '{}' ] || count=$(cat '{}')\n  count=$((count + 1))\n  printf '%s\\n' \"$count\" > '{}'\n  if [ \"$count\" -eq 5 ]; then printf '%s\\n' 'schema-version = 1' '[pull-requests]' 'default-base-branch = \"main\"' > '{}'; fi\nfi\nexec '{}' \"$@\"\n",
+                repo_view_count.display(),
+                repo_view_count.display(),
+                repo_view_count.display(),
+                store.paths().config_file.display(),
+                delegated_gh.display(),
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&fake_gh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, permissions)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: policy.clone(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        assert!(sequence.plan.preview_text().contains("base: release"));
+
+        let result = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(paths.clone()),
+            github_executable: Some(fake_gh),
+            policy,
+            ssh_executable: Some(ssh),
+        }
+        .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert!(entries.iter().all(|entry| entry.operation != "push"));
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&origin)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()?
+                .success(),
+            "push must not create a ref after the configured base changes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_checkout_push_pr_uses_configured_push_destination() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-remote-checkout-push-target")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-remote-checkout-origin")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        git_stdout(
+            &repo,
+            &["remote", "add", "fork", "ssh://git@github.com/bob/repo.git"],
+        )?;
+        git_stdout(&repo, &["update-ref", "refs/remotes/fork/topic", "HEAD"])?;
+        add_github_remote(&repo, "origin", &origin)?;
+        git_stdout(&repo, &["config", "remote.pushDefault", "origin"])?;
+        let fake_gh = fake_gh("prompt-sequence-remote-checkout-push-target", false)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Checkout {
+                    branch: "fork/topic".to_owned(),
+                },
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(
+            preview.contains("repository: github.com/octo/repo"),
+            "{preview}"
+        );
+        assert!(preview.contains("head: topic"), "{preview}");
+        let paths = isolated_store_paths("prompt-sequence-remote-checkout-push-target-audit")?;
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths, &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        assert!(
+            result.message().contains("completed 3 step(s)"),
+            "{}",
+            result.message()
+        );
+        let local_head = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let pushed = git_stdout(&origin, &["rev-parse", "refs/heads/topic"])?;
+        assert_eq!(pushed.trim(), local_head.trim());
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(invocations.contains("--head topic"), "{invocations}");
+        Ok(())
+    }
+
+    #[test]
+    fn create_branch_push_pr_uses_branch_push_remote() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-create-branch-push-target")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-create-branch-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "ssh://git@github.com/upstream/repo.git",
+            ],
+        )?;
+        add_github_remote(&repo, "fork", &fork)?;
+        git_stdout(&repo, &["config", "branch.feature/new.pushRemote", "fork"])?;
+        let fake_gh = fake_gh("prompt-sequence-create-branch-push-target", false)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::CreateBranch {
+                    branch: "feature/new".to_owned(),
+                    base: None,
+                },
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(
+            preview.contains("repository: github.com/upstream/repo"),
+            "{preview}"
+        );
+        assert!(preview.contains("head: octo:feature/new"), "{preview}");
+        let paths = isolated_store_paths("prompt-sequence-create-branch-push-target-audit")?;
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths, &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        assert!(
+            result.message().contains("completed 3 step(s)"),
+            "{}",
+            result.message()
+        );
+        let local_head = git_stdout(&repo, &["rev-parse", "HEAD"])?;
+        let pushed = git_stdout(&fork, &["rev-parse", "refs/heads/feature/new"])?;
+        assert_eq!(pushed.trim(), local_head.trim());
+        let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
+        assert!(
+            invocations.contains("--head octo:feature/new"),
+            "{invocations}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_matching_base_and_head_fails_before_any_step() -> Result<(), Box<dyn Error>> {
+        let repo = isolated_git_repo("prompt-sequence-matching-base-head")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-matching-base-head-origin")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let original_branch = git_stdout(&repo, &["branch", "--show-current"])?;
+        git_stdout(&repo, &["update-ref", "refs/remotes/origin/topic", "HEAD"])?;
+        add_github_remote(&repo, "origin", &origin)?;
+        let fake_gh = fake_gh("prompt-sequence-matching-base-head", false)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let error = match planner.plan_prompt_sequence(vec![
+            OperationRequest::Checkout {
+                branch: "origin/topic".to_owned(),
+            },
+            OperationRequest::Push,
+            OperationRequest::OpenPullRequest {
+                base: Some("topic".to_owned()),
+            },
+        ]) {
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "matching base and head must fail during sequence preflight",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains("base branch must differ"), "{error}");
+        assert_eq!(
+            git_stdout(&repo, &["branch", "--show-current"])?,
+            original_branch
+        );
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&origin)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/topic"])
+                .status()?
+                .success()
+        );
+        let paths = isolated_store_paths("prompt-sequence-matching-base-head-audit")?;
+        assert!(LocalStore::open(paths)?.list_audit_entries()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_configured_pull_request_base_is_previewed_and_executed()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("prompt-sequence-configured-pr-base")?;
+        let fake_gh = fake_gh("prompt-sequence-configured-pr-base", false)?;
+        let ssh = test_ssh_command()?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("release".to_owned());
+        let policy = EffectivePolicy::new(&config);
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: policy.clone(),
+            ssh_executable: Some(ssh.clone()),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(preview.contains("repository: github.com/octo/repo"));
+        assert!(preview.contains("base: release"));
+        assert!(!preview.contains("repository default"));
+        assert_eq!(
+            sequence.sequence.remaining_requests,
+            vec![OperationRequest::OpenPullRequest { base: None }]
+        );
+        let paths = isolated_store_paths("prompt-sequence-configured-pr-base-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[pull-requests]\ndefault-base-branch = \"release\"\n",
+        )?;
+        let result = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(paths),
+            github_executable: Some(fake_gh.clone()),
+            policy,
+            ssh_executable: Some(ssh),
+        }
+        .execute(sequence.sequence);
+
+        assert!(
+            result
+                .message()
+                .contains("Prompt sequence completed 2 step(s)."),
+            "{}",
+            result.message()
+        );
+        assert!(
+            std::fs::read_to_string(fake_gh.with_file_name("invocations"))?
+                .contains("--base release")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_pull_request_stops_when_config_changes_effective_base() -> Result<(), Box<dyn Error>>
+    {
+        let repo = pushed_branch_repo("prompt-sequence-changed-pr-base")?;
+        let fake_gh = fake_gh("prompt-sequence-changed-pr-base", false)?;
+        let paths = isolated_store_paths("prompt-sequence-changed-pr-base-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[pull-requests]\ndefault-base-branch = \"release\"\n",
+        )?;
+        let policy = EffectivePolicy::new(&store.load_config().settings);
+        let ssh_root = isolated_temp_root("prompt-sequence-changed-pr-base-ssh")?;
+        std::fs::create_dir_all(&ssh_root)?;
+        let ssh = ssh_root.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'schema-version = 1' '[pull-requests]' 'default-base-branch = \"main\"' > '{}'\ntarget=$(git config --get-regexp '^remote\\..*\\.testbare$' | cut -d' ' -f2-)\nexec git-upload-pack \"$target\"\n",
+                store.paths().config_file.display()
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ssh)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ssh, permissions)?;
+        }
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: policy.clone(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        assert!(sequence.plan.preview_text().contains("base: release"));
+
+        let result = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(paths),
+            github_executable: Some(fake_gh.clone()),
+            policy,
+            ssh_executable: Some(ssh),
+        }
+        .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 2."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        assert!(message.contains("new sequence preview and confirmation"));
+        assert!(
+            !std::fs::read_to_string(fake_gh.with_file_name("invocations"))?.contains("pr:create")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_explicit_pull_request_base_keeps_enterprise_parity() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("prompt-sequence-enterprise-explicit-base")?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://git.example.com/octo/repo.git",
+            ],
+        )?;
+        let fake_gh = fake_gh("prompt-sequence-enterprise-explicit-base", false)?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("release".to_owned());
+        let sequence = OperationPlanner {
+            repo_root: repo,
+            github_executable: Some(fake_gh),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        }
+        .plan_prompt_sequence(vec![
+            OperationRequest::Branches,
+            OperationRequest::OpenPullRequest {
+                base: Some("main".to_owned()),
+            },
+        ])
+        .map_err(std::io::Error::other)?;
+
+        let preview = sequence.plan.preview_text();
+        assert!(preview.contains("repository: git.example.com/octo/repo"));
+        assert!(preview.contains("base: main"));
+        assert!(!preview.contains("base: release"));
+        assert_eq!(
+            sequence.sequence.remaining_requests,
+            vec![OperationRequest::OpenPullRequest {
+                base: Some("main".to_owned())
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_gh_blocks_sequence_before_push_with_setup_guidance() -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("prompt-sequence-missing-gh")?;
         let ssh = test_ssh_command()?;
         std::fs::write(repo.join("file.txt"), "push before setup check\n")?;
@@ -5413,34 +6739,32 @@ mod tests {
             policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh.clone()),
         };
-        let sequence = planner
-            .plan_prompt_sequence(vec![
-                OperationRequest::Push,
-                OperationRequest::OpenPullRequest { base: None },
-            ])
-            .map_err(std::io::Error::other)?;
-        let paths = isolated_store_paths("prompt-sequence-missing-gh-audit")?;
+        let error = match planner.plan_prompt_sequence(vec![
+            OperationRequest::Push,
+            OperationRequest::OpenPullRequest { base: None },
+        ]) {
+            Ok(_) => return Err(std::io::Error::other("missing gh must block preview").into()),
+            Err(error) => error,
+        };
 
-        let result = PromptSequenceExecutor::with_audit_paths_and_tools(
+        assert!(error.contains(bitbygit_gh::INSTALL_GH_GUIDANCE));
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?;
+        let remote = git_stdout_with_ssh(
             &repo,
-            paths.clone(),
-            missing_gh,
-            ssh.clone(),
-        )
-        .execute(sequence.sequence);
-
-        let message = result.message();
-        assert!(message.contains("Prompt sequence stopped before step 2 of 2."));
-        assert!(message.contains(bitbygit_gh::INSTALL_GH_GUIDANCE));
-        assert_remote_matches_head(&repo, &ssh)?;
-        let entries = LocalStore::open(paths)?.list_audit_entries()?;
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| entry.operation == "push"));
+            &[
+                "ls-remote",
+                "origin",
+                &format!("refs/heads/{}", branch.trim()),
+            ],
+            &ssh,
+        )?;
+        assert!(!remote.starts_with(git_stdout(&repo, &["rev-parse", "HEAD"])?.trim()));
         Ok(())
     }
 
     #[test]
-    fn gh_auth_failure_after_push_stops_pr_with_setup_guidance() -> Result<(), Box<dyn Error>> {
+    fn gh_auth_failure_blocks_sequence_before_push_with_setup_guidance()
+    -> Result<(), Box<dyn Error>> {
         let repo = pushed_branch_repo("prompt-sequence-gh-auth")?;
         let fake_gh = fake_gh("prompt-sequence-gh-auth", false)?;
         std::fs::write(fake_gh.with_file_name("auth-fails"), "")?;
@@ -5454,33 +6778,30 @@ mod tests {
             policy: EffectivePolicy::default(),
             ssh_executable: Some(ssh.clone()),
         };
-        let sequence = planner
-            .plan_prompt_sequence(vec![
-                OperationRequest::Push,
-                OperationRequest::OpenPullRequest { base: None },
-            ])
-            .map_err(std::io::Error::other)?;
-        let paths = isolated_store_paths("prompt-sequence-gh-auth-audit")?;
+        let error = match planner.plan_prompt_sequence(vec![
+            OperationRequest::Push,
+            OperationRequest::OpenPullRequest { base: None },
+        ]) {
+            Ok(_) => return Err(std::io::Error::other("gh auth must block preview").into()),
+            Err(error) => error,
+        };
 
-        let result = PromptSequenceExecutor::with_audit_paths_and_tools(
+        assert!(error.contains("GitHub CLI is not authenticated for github.com"));
+        assert!(error.contains("gh auth login --hostname github.com"));
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?;
+        let remote = git_stdout_with_ssh(
             &repo,
-            paths.clone(),
-            &fake_gh,
-            ssh.clone(),
-        )
-        .execute(sequence.sequence);
-
-        let message = result.message();
-        assert!(message.contains("Prompt sequence stopped before step 2 of 2."));
-        assert!(message.contains("GitHub CLI is not authenticated for github.com"));
-        assert!(message.contains("gh auth login --hostname github.com"));
-        assert_remote_matches_head(&repo, &ssh)?;
+            &[
+                "ls-remote",
+                "origin",
+                &format!("refs/heads/{}", branch.trim()),
+            ],
+            &ssh,
+        )?;
+        assert!(!remote.starts_with(git_stdout(&repo, &["rev-parse", "HEAD"])?.trim()));
         let invocations = std::fs::read_to_string(fake_gh.with_file_name("invocations"))?;
         assert!(invocations.contains("auth:status"));
         assert!(!invocations.contains("pr:create"));
-        let entries = LocalStore::open(paths)?.list_audit_entries()?;
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| entry.operation == "push"));
         Ok(())
     }
 
@@ -5589,6 +6910,57 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pull_request_base_precedence_is_explicit_then_configured_then_provider()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-base-precedence")?;
+        let fake_gh = fake_gh("open-pr-base-precedence", false)?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("release".to_owned());
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let configured = planner
+            .plan_request(OperationRequest::OpenPullRequest { base: None })
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            configured.plan.request,
+            OperationRequest::OpenPullRequest {
+                base: Some("release".to_owned())
+            }
+        );
+        assert!(configured.plan.preview_text().contains("base: release"));
+        let execution = PlanExecutor::with_audit_paths_and_ssh(
+            &repo,
+            isolated_store_paths("open-pr-base-precedence-audit")?,
+            test_ssh_command()?,
+        )
+        .execute(&configured.plan, configured.context);
+        assert!(execution.succeeded(), "{}", execution.message());
+        assert!(
+            std::fs::read_to_string(fake_gh.with_file_name("invocations"))?
+                .contains("--base release")
+        );
+
+        let explicit = planner
+            .plan_request(OperationRequest::OpenPullRequest {
+                base: Some("main".to_owned()),
+            })
+            .map_err(std::io::Error::other)?;
+        assert_eq!(
+            explicit.plan.request,
+            OperationRequest::OpenPullRequest {
+                base: Some("main".to_owned())
+            }
+        );
+        assert!(explicit.plan.preview_text().contains("base: main"));
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_https_pull_request_uses_authenticated_api_not_repository_credential_helpers()
@@ -5642,10 +7014,12 @@ mod tests {
             ],
         )?;
         let fake_gh = fake_gh("open-pr-enterprise-https", false)?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("release".to_owned());
         let planner = OperationPlanner {
             repo_root: repo.clone(),
             github_executable: Some(fake_gh.clone()),
-            policy: EffectivePolicy::default(),
+            policy: EffectivePolicy::new(&config),
             ssh_executable: Some(test_ssh_command()?),
         };
 
@@ -5657,7 +7031,7 @@ mod tests {
             operation
                 .plan
                 .preview_text()
-                .contains("https://git.example.com/octo/repo/compare/main...feature/open-pr")
+                .contains("https://git.example.com/octo/repo/compare/release...feature/open-pr")
         );
         let execution = PlanExecutor::with_audit_paths_and_ssh(
             &repo,
@@ -5676,6 +7050,7 @@ mod tests {
         assert!(invocations.contains("--hostname git.example.com"));
         assert!(invocations.contains("pr create"));
         assert!(invocations.contains("--repo git.example.com/octo/repo"));
+        assert!(invocations.contains("--base release"));
         Ok(())
     }
 
@@ -5961,6 +7336,35 @@ mod tests {
         };
 
         assert!(error.contains("base branch missing was not found"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_configured_pull_request_base_fails_closed_with_guidance()
+    -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("open-pr-missing-configured-base")?;
+        let fake_gh = fake_gh("open-pr-missing-configured-base", false)?;
+        let mut config = AppConfig::default();
+        config.pull_requests.default_base_branch = Some("missing".to_owned());
+        let planner = OperationPlanner {
+            repo_root: repo,
+            github_executable: Some(fake_gh),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let error = match planner.plan_request(OperationRequest::OpenPullRequest { base: None }) {
+            Ok(_) => {
+                return Err(
+                    std::io::Error::other("missing configured base must fail closed").into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains("base branch missing was not found"));
+        assert!(error.contains("pull-requests.default-base-branch"));
+        assert!(error.contains("open pr to <branch>"));
         Ok(())
     }
 
@@ -7286,6 +8690,35 @@ mod tests {
     }
 
     #[test]
+    fn blocked_prompt_sequence_does_not_bind_pull_request_target() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("blocked-sequence-pull-request-target")?;
+        let fake_gh = fake_gh("blocked-sequence-pull-request-target", false)?;
+        let mut config = AppConfig::default();
+        config.policy.confirmation.medium = ConfirmationSetting::Blocked;
+        let planner = OperationPlanner {
+            repo_root: repo,
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Branches,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::Blocked
+        );
+        assert_eq!(sequence.sequence.deferred_pull_request_targets, vec![None]);
+        assert!(!fake_gh.with_file_name("invocations").exists());
+        Ok(())
+    }
+
+    #[test]
     fn low_explicit_policy_applies_to_low_risk_prompt_sequences() -> Result<(), Box<dyn Error>> {
         let repo = isolated_git_repo("sequence-low-explicit-policy")?;
         let mut config = AppConfig::default();
@@ -7550,7 +8983,10 @@ mod tests {
     fn startup_policy_fails_closed_and_surfaces_malformed_config() -> Result<(), Box<dyn Error>> {
         let paths = isolated_store_paths("invalid-startup-policy")?;
         let store = LocalStore::open(paths.clone())?;
-        std::fs::write(&store.paths().config_file, "not valid toml = [")?;
+        std::fs::write(
+            &store.paths().config_file,
+            "credential = \"super-secret-value\"\nnot valid toml = [",
+        )?;
 
         let startup = startup_policy_from_paths(&paths);
 
@@ -7562,7 +8998,9 @@ mod tests {
                 .is_some_and(|diagnostic| diagnostic.contains("is invalid"))
         );
         let app = App::from_startup(startup);
-        assert!(details_text(&app).contains("safe fallback configuration"));
+        let details = details_text(&app);
+        assert!(details.contains("safe fallback configuration"));
+        assert!(!details.contains("super-secret-value"));
         Ok(())
     }
 
@@ -8903,22 +10341,6 @@ mod tests {
             .into());
         }
         Ok(String::from_utf8(output.stdout)?)
-    }
-
-    fn assert_remote_matches_head(
-        repo: &std::path::Path,
-        ssh_executable: &std::path::Path,
-    ) -> Result<(), Box<dyn Error>> {
-        let branch = git_stdout(repo, &["branch", "--show-current"])?;
-        let remote_ref = format!("refs/heads/{}", branch.trim());
-        let remote = git_stdout_with_ssh(
-            repo,
-            &["ls-remote", "origin", remote_ref.as_str()],
-            ssh_executable,
-        )?;
-        let head = git_stdout(repo, &["rev-parse", "HEAD"])?;
-        assert!(remote.starts_with(head.trim()));
-        Ok(())
     }
 
     fn test_ssh_command() -> Result<PathBuf, Box<dyn Error>> {

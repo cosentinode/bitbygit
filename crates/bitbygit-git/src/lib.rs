@@ -458,6 +458,45 @@ impl Git {
         Ok(Some((remote.to_owned(), push_branch.to_owned())))
     }
 
+    pub fn typed_push_target(
+        &self,
+        branch: &str,
+        upstream: Option<(&str, &str)>,
+        default_remote: Option<&str>,
+    ) -> Result<Option<(String, String)>, GitError> {
+        let remote = self
+            .config_value(["config", "--get", &format!("branch.{branch}.pushRemote")])?
+            .or(self.config_value(["config", "--get", "remote.pushDefault"])?)
+            .or_else(|| upstream.map(|(remote, _)| remote.to_owned()))
+            .or_else(|| default_remote.map(ToOwned::to_owned));
+        let Some(remote) = remote else {
+            return Ok(None);
+        };
+        if remote.is_empty() {
+            return Ok(None);
+        }
+        let Some((upstream_remote, upstream_branch)) = upstream else {
+            return Ok(Some((remote, branch.to_owned())));
+        };
+        let push_default = self
+            .config_value(["config", "--get", "push.default"])?
+            .unwrap_or_else(|| "simple".to_owned());
+        let target = match push_default.as_str() {
+            "simple" if remote != upstream_remote => (remote, branch.to_owned()),
+            "simple" | "upstream" | "tracking" => {
+                (upstream_remote.to_owned(), upstream_branch.to_owned())
+            }
+            "current" | "matching" => (remote, branch.to_owned()),
+            "nothing" => return Ok(None),
+            _ => {
+                return Err(GitError::Blocked {
+                    message: format!("push.default has unsupported value {push_default}"),
+                });
+            }
+        };
+        Ok(Some(target))
+    }
+
     pub fn remote_tracking_oid(
         &self,
         remote: &str,
@@ -3215,6 +3254,55 @@ mod tests {
         assert_eq!(
             Git::new(repo.path()).push_target("feature")?,
             Some(("fork".to_owned(), "feature".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_push_target_resolves_tracked_and_new_branches() -> Result<(), Box<dyn Error>> {
+        let repo = TempRepo::new()?;
+        repo.run(["init", "-b", "topic"])?;
+        repo.run(["config", "user.email", "bitbygit@example.invalid"])?;
+        repo.run(["config", "user.name", "bitbygit test"])?;
+        repo.run(["commit", "--allow-empty", "-m", "initial"])?;
+        repo.run(["remote", "add", "fork", "https://github.com/octo/repo.git"])?;
+        repo.run([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/upstream/repo.git",
+        ])?;
+        repo.run(["config", "branch.topic.remote", "fork"])?;
+        repo.run(["config", "branch.topic.merge", "refs/heads/topic"])?;
+        let git = Git::new(repo.path());
+
+        assert_eq!(
+            git.typed_push_target("topic", Some(("fork", "topic")), Some("origin"))?,
+            git.push_target("topic")?
+        );
+
+        repo.run(["config", "remote.pushDefault", "origin"])?;
+        for push_default in [
+            "simple", "current", "upstream", "tracking", "matching", "nothing",
+        ] {
+            repo.run(["config", "push.default", push_default])?;
+            assert_eq!(
+                git.typed_push_target("topic", Some(("fork", "topic")), Some("fork"))?,
+                git.push_target("topic")?,
+                "push.default={push_default}"
+            );
+        }
+
+        repo.run(["config", "branch.topic.pushRemote", "fork"])?;
+        repo.run(["config", "push.default", "current"])?;
+        assert_eq!(
+            git.typed_push_target("topic", Some(("fork", "topic")), Some("origin"))?,
+            git.push_target("topic")?
+        );
+        repo.run(["config", "branch.new.pushRemote", "fork"])?;
+        assert_eq!(
+            git.typed_push_target("new", None, Some("origin"))?,
+            Some(("fork".to_owned(), "new".to_owned()))
         );
         Ok(())
     }
