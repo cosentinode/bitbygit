@@ -1900,6 +1900,21 @@ fn prompt_sequence_request_preview(
     }
 }
 
+fn prompt_sequence_request_is_side_effecting(request: &OperationRequest) -> bool {
+    matches!(
+        request,
+        OperationRequest::Fetch
+            | OperationRequest::Commit { .. }
+            | OperationRequest::Push
+            | OperationRequest::Pull { .. }
+            | OperationRequest::Checkout { .. }
+            | OperationRequest::CreateBranch { .. }
+            | OperationRequest::Merge { .. }
+            | OperationRequest::Rebase { .. }
+            | OperationRequest::OpenPullRequest { .. }
+    )
+}
+
 fn repo_list(app: &App) -> List<'_> {
     let items = app
         .repos
@@ -4516,7 +4531,6 @@ impl PromptSequenceExecutor {
 
         let mut previewed_policies = policy_evaluations.into_iter();
         let mut previewed_sequence_policies = sequence_policy_evaluations.into_iter();
-        let mut previewed_pull_request_targets = deferred_pull_request_targets.into_iter();
 
         let (Some(previewed_policy), Some(previewed_sequence_policy)) = (
             previewed_policies.next(),
@@ -4567,7 +4581,9 @@ impl PromptSequenceExecutor {
 
         for (index, request) in remaining_requests.into_iter().enumerate() {
             let step_number = index + 2;
-            let Some(previewed_pull_request_target) = previewed_pull_request_targets.next() else {
+            let Some(previewed_pull_request_target) =
+                deferred_pull_request_targets.get(index).cloned()
+            else {
                 step_results.push(PromptSequenceStepResult::planning_failed(
                     step_number,
                     prompt_sequence_request_title(&request),
@@ -4587,6 +4603,38 @@ impl PromptSequenceExecutor {
                 #[cfg(test)]
                 ssh_executable: self.ssh_executable.clone(),
             };
+            let downstream_pull_request_targets = &deferred_pull_request_targets[index + 1..];
+            if prompt_sequence_request_is_side_effecting(&request)
+                && downstream_pull_request_targets.iter().any(Option::is_some)
+            {
+                let branch = git
+                    .status()
+                    .ok()
+                    .and_then(|status| branch_name(&status.branch).ok())
+                    .or_else(|| {
+                        git.head_target()
+                            .ok()
+                            .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
+                    });
+                let current_targets =
+                    planner.deferred_pull_request_targets(&requests[index + 1..], branch);
+                if !current_targets
+                    .as_ref()
+                    .is_ok_and(|targets| targets == downstream_pull_request_targets)
+                {
+                    step_results.push(PromptSequenceStepResult::planning_failed(
+                        step_number,
+                        prompt_sequence_request_title(&request),
+                        "pull request target changed since the sequence preview; create a new sequence preview and confirmation"
+                            .to_owned(),
+                    ));
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
+                }
+            }
             let operation = match planner.plan_request(request.clone()) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -5947,6 +5995,105 @@ mod tests {
                 .status()?
                 .success(),
             "push must not run before the changed pull request target is rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_revalidates_downstream_pr_target_after_fetch() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = isolated_git_repo("prompt-sequence-fetch-changes-push-target")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-fetch-origin")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-fetch-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &origin)?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "ssh://git@github.com/fork/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "config",
+                "remote.fork.testbare",
+                &fork.display().to_string(),
+            ],
+        )?;
+        let fake_gh = fake_gh("prompt-sequence-fetch-changes-push-target", false)?;
+        let ssh_root = isolated_temp_root("prompt-sequence-fetch-changes-push-target-ssh")?;
+        std::fs::create_dir_all(&ssh_root)?;
+        let ssh = ssh_root.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\ngit config remote.pushDefault fork\ncase \"$*\" in\n*fork/repo.git*) target='{}' ;;\n*) target='{}' ;;\nesac\ncase \"$*\" in\n*git-receive-pack*) exec git-receive-pack \"$target\" ;;\n*) exec git-upload-pack \"$target\" ;;\nesac\n",
+                fork.display(),
+                origin.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&ssh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions)?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        let preview = sequence.plan.preview_text();
+        assert!(
+            preview.contains("repository: github.com/octo/repo"),
+            "{preview}"
+        );
+        let paths = isolated_store_paths("prompt-sequence-fetch-changes-push-target-audit")?;
+
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert!(entries.iter().all(|entry| entry.operation != "push"));
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&fork)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()?
+                .success(),
+            "push must not create a ref at the changed destination"
         );
         Ok(())
     }
