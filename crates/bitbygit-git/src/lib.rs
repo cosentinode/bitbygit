@@ -5998,6 +5998,7 @@ mod tests {
     fn recovery_platform_end_to_end_deadline_does_not_interrupt_merge_abort()
     -> Result<(), Box<dyn Error>> {
         let repo = initialized_repo()?;
+        repo.run(["config", "core.autocrlf", "false"])?;
         repo.write("conflict.txt", "base\n")?;
         repo.run(["add", "conflict.txt"])?;
         repo.run(["commit", "-m", "base"])?;
