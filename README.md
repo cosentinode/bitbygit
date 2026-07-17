@@ -47,7 +47,7 @@ schema, and safe fallback behavior.
 Prerequisites:
 
 - Rust 1.85 or newer.
-- `git` available on `PATH`.
+- Git 2.42 or newer available on `PATH` (required for guarded conflict recovery).
 - `gh` is optional for future GitHub workflows.
 
 Run local checks:

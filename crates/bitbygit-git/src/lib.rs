@@ -55,12 +55,11 @@ const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOVERY_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 const RECOVERY_OUTPUT_LIMIT: usize = 256 * 1024;
 const RECOVERY_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
-const RECOVERY_EXECUTION_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 const RECOVERY_DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
 const RECOVERY_STATE_ENTRY_LIMIT: usize = 100_000;
 const RECOVERY_UNTRACKED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
-const RECOVERY_IGNORED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
 const RECOVERY_REBASE_TODO_LIMIT: u64 = 1024 * 1024;
+const RECOVERY_MINIMUM_GIT_VERSION: (u64, u64) = (2, 42);
 const RECOVERY_LOCK_DIRECTORY: &str = "recovery-locks";
 const RECOVERY_HOOKS: &[&str] = &[
     "applypatch-msg",
@@ -386,6 +385,7 @@ impl Git {
     ) -> Result<GitOutput, GitError> {
         ensure_recovery_execution_supported(operation, action)?;
         let deadline = Instant::now() + self.recovery_execution_timeout;
+        self.ensure_recovery_git_version_until(deadline)?;
         self.validate_recovery_until(operation, action, deadline)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
         let recovery_lock = self.acquire_recovery_lock_until(operation, action, deadline)?;
@@ -393,6 +393,7 @@ impl Git {
             let repository_root = self.canonical_repository_root_until(deadline)?;
             recovery_lock.ensure_identity(&repository_root, operation, action)?;
             self.validate_recovery_until(operation, action, deadline)?;
+            self.ensure_recovery_process_configuration_safe_until(deadline)?;
             let repository_root = self.canonical_repository_root_until(deadline)?;
             recovery_lock.ensure_identity(&repository_root, operation, action)
         })
@@ -401,6 +402,7 @@ impl Git {
     pub fn recovery_state(&self) -> Result<RecoveryState, GitError> {
         ensure_recovery_planning_supported()?;
         let deadline = Instant::now() + self.recovery_plan_timeout;
+        self.ensure_recovery_git_version_until(deadline)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
         self.recovery_state_until(deadline)
     }
@@ -412,6 +414,7 @@ impl Git {
     ) -> Result<RecoveryState, GitError> {
         ensure_recovery_planning_supported()?;
         let deadline = Instant::now() + self.recovery_plan_timeout;
+        self.ensure_recovery_git_version_until(deadline)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
         self.validate_recovery_until(operation, action, deadline)?;
         self.recovery_state_until(deadline)
@@ -424,6 +427,7 @@ impl Git {
     ) -> Result<(), GitError> {
         ensure_recovery_planning_supported()?;
         let deadline = Instant::now() + self.recovery_plan_timeout;
+        self.ensure_recovery_git_version_until(deadline)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
         self.validate_recovery_until(operation, action, deadline)
     }
@@ -449,6 +453,7 @@ impl Git {
     {
         ensure_recovery_execution_supported(operation, action)?;
         let deadline = Instant::now() + self.recovery_execution_timeout;
+        self.ensure_recovery_git_version_until(deadline)?;
         self.validate_recovery_action(operation, action)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
         let recovery_lock = self.acquire_recovery_lock_until(operation, action, deadline)?;
@@ -1288,7 +1293,7 @@ impl Git {
     }
 
     fn recovery_state_until(&self, deadline: Instant) -> Result<RecoveryState, GitError> {
-        self.recovery_state_until_with(deadline, None, &mut None::<fn() -> Result<(), GitError>>)
+        self.recovery_state_fenced_until(deadline, || Ok(()))
     }
 
     fn recovery_state_fenced_until<F>(
@@ -1352,7 +1357,7 @@ impl Git {
                 "--show-scope".to_owned(),
             ],
         ] {
-            let output = self.run_bounded_git(args.clone(), deadline, true)?;
+            let output = self.run_bounded_git_digest(args.clone(), deadline)?;
             if !output.status.success() {
                 return Err(output.git_error(args));
             }
@@ -1421,22 +1426,17 @@ impl Git {
                 Ok(())
             })?;
         }
-        let mut ignored_bytes_remaining = Some(RECOVERY_IGNORED_DATA_LIMIT);
-        for relative in self.ignored_worktree_paths_until(deadline)? {
-            let path = root.join(&relative);
-            let mut label = b"ignored-worktree/".to_vec();
-            label.extend_from_slice(relative.as_os_str().as_encoded_bytes());
-            let mut context = RecoveryHashContext {
-                deadline,
-                entries: &mut entries,
-                follow_symlinks: false,
-                byte_budget: &mut ignored_bytes_remaining,
-                byte_budget_error: "recovery planning is blocked because ignored worktree data exceeds the 64 MiB fingerprint limit",
-                fence: fence.as_deref_mut(),
-            };
-            hash_recovery_path_inner(&mut hasher, &label, &path, 0, &mut context, &mut |_, _| {
-                Ok(())
-            })?;
+        let ignored_args = self.other_worktree_paths_args(true);
+        let ignored = self.run_bounded_git_digest(ignored_args.clone(), deadline)?;
+        if !ignored.status.success() {
+            return Err(ignored.git_error(ignored_args));
+        }
+        hash_field(&mut hasher, &ignored.stdout.digest);
+        if let Some(fence) = fence.as_deref_mut() {
+            fence.probes.push(RecoveryProbe {
+                args: ignored_args,
+                digest: ignored.stdout.digest,
+            });
         }
         for relative in self.worktree_attributes_until(deadline)? {
             let mut label = b"worktree-attributes/".to_vec();
@@ -1602,26 +1602,13 @@ impl Git {
         self.other_worktree_paths_until(false, deadline)
     }
 
-    fn ignored_worktree_paths_until(&self, deadline: Instant) -> Result<Vec<PathBuf>, GitError> {
-        self.other_worktree_paths_until(true, deadline)
-    }
-
     fn other_worktree_paths_until(
         &self,
         ignored: bool,
         deadline: Instant,
     ) -> Result<Vec<PathBuf>, GitError> {
         let kind = if ignored { "ignored" } else { "untracked" };
-        let mut args = vec!["ls-files".to_owned(), "--others".to_owned()];
-        if ignored {
-            args.push("--ignored".to_owned());
-        }
-        args.extend([
-            "--exclude-standard".to_owned(),
-            "--full-name".to_owned(),
-            "-z".to_owned(),
-            "--".to_owned(),
-        ]);
+        let args = self.other_worktree_paths_args(ignored);
         let output = self.run_bounded_git(args.clone(), deadline, true)?;
         if !output.status.success() {
             return Err(output.git_error(args));
@@ -1653,6 +1640,29 @@ impl Git {
             paths.insert(path);
         }
         Ok(paths.into_iter().collect())
+    }
+
+    fn other_worktree_paths_args(&self, ignored: bool) -> Vec<String> {
+        let mut args = vec!["ls-files".to_owned(), "--others".to_owned()];
+        if ignored {
+            args.push("--ignored".to_owned());
+        }
+        args.extend([
+            "--exclude-standard".to_owned(),
+            "--full-name".to_owned(),
+            "-z".to_owned(),
+            "--".to_owned(),
+        ]);
+        args
+    }
+
+    fn ensure_recovery_git_version_until(&self, deadline: Instant) -> Result<(), GitError> {
+        let args = vec!["version".to_owned()];
+        let output = self.run_bounded_git(args.clone(), deadline, true)?;
+        if !output.status.success() {
+            return Err(output.git_error(args));
+        }
+        ensure_recovery_git_version(strip_byte_line_ending(&output.stdout.bytes))
     }
 
     fn repository_operation_until(
@@ -1953,11 +1963,40 @@ impl Git {
         self.run_bounded_git_with(args, deadline, optional_locks, || Ok(()))
     }
 
+    fn run_bounded_git_digest(
+        &self,
+        args: Vec<String>,
+        deadline: Instant,
+    ) -> Result<BoundedCommandOutput, GitError> {
+        self.run_bounded_git_with_policy(args, deadline, true, BoundedCommandPolicy::Digest, || {
+            Ok(())
+        })
+    }
+
     fn run_bounded_git_with<F>(
         &self,
         args: Vec<String>,
         deadline: Instant,
         optional_locks: bool,
+        before_spawn: F,
+    ) -> Result<BoundedCommandOutput, GitError>
+    where
+        F: FnOnce() -> Result<(), GitError>,
+    {
+        let policy = if optional_locks {
+            BoundedCommandPolicy::Diagnostic
+        } else {
+            BoundedCommandPolicy::RecoveryExecution
+        };
+        self.run_bounded_git_with_policy(args, deadline, optional_locks, policy, before_spawn)
+    }
+
+    fn run_bounded_git_with_policy<F>(
+        &self,
+        args: Vec<String>,
+        deadline: Instant,
+        optional_locks: bool,
+        policy: BoundedCommandPolicy,
         before_spawn: F,
     ) -> Result<BoundedCommandOutput, GitError>
     where
@@ -2004,14 +2043,7 @@ impl Git {
         } else {
             self.recovery_output_limit
         };
-        run_bounded_command(
-            command,
-            args,
-            deadline,
-            output_limit,
-            optional_locks,
-            before_spawn,
-        )
+        run_bounded_command(command, args, deadline, output_limit, policy, before_spawn)
     }
 
     fn run_args_with_editor(
@@ -2241,7 +2273,7 @@ fn run_bounded_command<F>(
     args: Vec<String>,
     deadline: Instant,
     output_limit: usize,
-    digest_all_output: bool,
+    policy: BoundedCommandPolicy,
     before_spawn: F,
 ) -> Result<BoundedCommandOutput, GitError>
 where
@@ -2250,11 +2282,12 @@ where
     if Instant::now() >= deadline {
         return Err(GitError::TimedOut { args });
     }
-    let capture_limit = if digest_all_output {
+    let capture_limit = if policy == BoundedCommandPolicy::Diagnostic {
         RECOVERY_DIAGNOSTIC_CAPTURE_LIMIT
     } else {
-        RECOVERY_EXECUTION_CAPTURE_LIMIT.max(output_limit.saturating_add(1))
+        usize::MAX
     };
+    let digest_all_output = policy != BoundedCommandPolicy::RecoveryExecution;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2263,6 +2296,9 @@ where
         return Err(GitError::TimedOut { args });
     }
     before_spawn()?;
+    if Instant::now() >= deadline {
+        return Err(GitError::TimedOut { args });
+    }
     let mut child = spawn_contained(command).map_err(|source| GitError::Io {
         args: args.clone(),
         source,
@@ -2295,7 +2331,7 @@ where
 
     let mut output_limit_hit = false;
     let status = loop {
-        if capture_exceeded.load(Ordering::Acquire) {
+        if policy == BoundedCommandPolicy::Diagnostic && capture_exceeded.load(Ordering::Acquire) {
             output_limit_hit = true;
             kill_process_tree(&mut child);
             break child.wait().map_err(|source| GitError::Io {
@@ -2310,7 +2346,7 @@ where
             break status;
         }
         let now = Instant::now();
-        if now >= deadline {
+        if policy != BoundedCommandPolicy::RecoveryExecution && now >= deadline {
             kill_process_tree(&mut child);
             let _result = child.wait();
             kill_process_tree(&mut child);
@@ -2318,14 +2354,21 @@ where
             join_capture_reader(stderr_reader, &args)?;
             return Err(GitError::TimedOut { args });
         }
-        thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
+        let delay = if policy == BoundedCommandPolicy::RecoveryExecution {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(5).min(deadline.saturating_duration_since(now))
+        };
+        thread::sleep(delay);
     };
     // End the contained process tree before joining the drains so descendants
     // cannot keep inherited pipe writers open.
     kill_process_tree(&mut child);
     let stdout = join_capture_reader(stdout_reader, &args)?;
     let stderr = join_capture_reader(stderr_reader, &args)?;
-    if output_limit_hit || capture_exceeded.load(Ordering::Acquire) {
+    if policy == BoundedCommandPolicy::Diagnostic
+        && (output_limit_hit || capture_exceeded.load(Ordering::Acquire))
+    {
         return Err(GitError::Blocked {
             message: format!(
                 "git {} output exceeded the bounded capture limit",
@@ -2339,6 +2382,13 @@ where
         stdout,
         stderr,
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundedCommandPolicy {
+    Diagnostic,
+    Digest,
+    RecoveryExecution,
 }
 
 fn drain_bounded_output(
@@ -2489,6 +2539,26 @@ fn ensure_recovery_execution_supported(
 #[cfg(any(unix, windows))]
 fn ensure_recovery_planning_supported() -> Result<(), GitError> {
     Ok(())
+}
+
+fn ensure_recovery_git_version(version: &[u8]) -> Result<(), GitError> {
+    let version = String::from_utf8_lossy(version);
+    let parsed = version.strip_prefix("git version ").and_then(|version| {
+        let mut components = version.split('.');
+        Some((
+            components.next()?.parse().ok()?,
+            components.next()?.parse().ok()?,
+        ))
+    });
+    if parsed.is_some_and(|version| version >= RECOVERY_MINIMUM_GIT_VERSION) {
+        return Ok(());
+    }
+    Err(GitError::Blocked {
+        message: format!(
+            "recovery requires Git {}.{} or newer because exact attribute-state fingerprinting is unavailable in older Git versions; upgrade Git or run recovery manually",
+            RECOVERY_MINIMUM_GIT_VERSION.0, RECOVERY_MINIMUM_GIT_VERSION.1
+        ),
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2911,8 +2981,9 @@ enum RecoveryInput {
 
 impl RecoveryInputFence {
     fn validate(&self, git: &Git, deadline: Instant) -> Result<(), GitError> {
+        git.ensure_recovery_process_configuration_safe_until(deadline)?;
         for probe in &self.probes {
-            let output = git.run_bounded_git(probe.args.clone(), deadline, true)?;
+            let output = git.run_bounded_git_digest(probe.args.clone(), deadline)?;
             if !output.status.success() {
                 return Err(output.git_error(probe.args.clone()));
             }
@@ -5063,6 +5134,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn recovery_reports_clear_minimum_git_version() -> Result<(), Box<dyn Error>> {
+        let Err(error) = ensure_recovery_git_version(b"git version 2.41.3") else {
+            return Err("expected old Git to be rejected".into());
+        };
+
+        assert!(error.to_string().contains("requires Git 2.42 or newer"));
+        ensure_recovery_git_version(b"git version 2.42.0")?;
+        ensure_recovery_git_version(b"git version 2.55.0.windows.1")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_execution_is_not_killed_after_spawn_limits() -> Result<(), Box<dyn Error>> {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "sleep 0.1; i=0; while [ $i -lt 5000 ]; do printf x; i=$((i + 1)); done",
+        ]);
+        configure_process_group(&mut command);
+
+        let output = run_bounded_command(
+            command,
+            vec!["mutating-recovery-test".to_owned()],
+            Instant::now() + Duration::from_millis(20),
+            32,
+            BoundedCommandPolicy::RecoveryExecution,
+            || Ok(()),
+        )?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.bytes.len(), 32);
+        assert!(output.stdout.truncated);
+        Ok(())
+    }
+
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn recovery_platform_command_output_is_bounded() -> Result<(), Box<dyn Error>> {
@@ -5089,7 +5197,7 @@ mod tests {
             vec!["recovery-output-bound-test".to_owned()],
             Instant::now() + Duration::from_secs(5),
             1024,
-            false,
+            BoundedCommandPolicy::Diagnostic,
             || Ok(()),
         ) else {
             return Err("expected oversized recovery output to be stopped".into());
@@ -5155,7 +5263,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_rebase_abort_rejects_changed_ignored_collision() -> Result<(), Box<dyn Error>> {
+    fn exact_rebase_abort_rejects_changed_ignored_collision_path() -> Result<(), Box<dyn Error>> {
         let repo = initialized_repo()?;
         repo.write(".gitignore", "target/\n")?;
         repo.run(["add", ".gitignore"])?;
@@ -5189,7 +5297,10 @@ mod tests {
         repo.write("target/victim.bin", "at preview\n")?;
         let git = Git::new(repo.path());
         let expected = git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Abort)?;
-        repo.write("target/victim.bin", "changed after preview\n")?;
+        fs::rename(
+            repo.path().join("target/victim.bin"),
+            repo.path().join("target/replacement.bin"),
+        )?;
 
         let Err(error) = git.recover_exact(
             RepositoryOperation::Rebase,
@@ -5201,8 +5312,8 @@ mod tests {
 
         assert!(error.to_string().contains("state changed after preview"));
         assert_eq!(
-            fs::read_to_string(repo.path().join("target/victim.bin"))?,
-            "changed after preview\n"
+            fs::read_to_string(repo.path().join("target/replacement.bin"))?,
+            "at preview\n"
         );
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
         Ok(())
@@ -5250,17 +5361,58 @@ mod tests {
     }
 
     #[test]
-    fn recovery_fingerprint_bounds_ignored_data() -> Result<(), Box<dyn Error>> {
+    fn recovery_fingerprint_streams_ignored_paths_without_reading_data()
+    -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
-        repo.write(".gitignore", "large.ignored\n")?;
+        repo.write(".gitignore", "large.ignored\ntarget/\n")?;
         let ignored = fs::File::create(repo.path().join("large.ignored"))?;
-        ignored.set_len(RECOVERY_IGNORED_DATA_LIMIT + 1)?;
+        ignored.set_len(RECOVERY_UNTRACKED_DATA_LIMIT + 1)?;
+        fs::create_dir(repo.path().join("target"))?;
+        for index in 0..4_000 {
+            repo.write(&format!("target/generated-artifact-{index:04}.bin"), "")?;
+        }
 
-        let Err(error) = Git::new(repo.path()).recovery_state() else {
-            return Err("expected oversized ignored data to block planning".into());
+        let git = Git::new(repo.path());
+        let baseline = git.recovery_state()?;
+        ignored.set_len(RECOVERY_UNTRACKED_DATA_LIMIT * 2)?;
+
+        assert_eq!(git.recovery_state()?, baseline);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preview_rechecks_process_safety_inside_state_fence() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let git = Git::new(repo.path());
+        let hook = repo.path().join(".git/hooks/commit-msg");
+
+        let Err(error) =
+            git.recovery_state_fenced_until(Instant::now() + Duration::from_secs(10), || {
+                fs::write(&hook, "#!/bin/sh\nexit 0\n").map_err(|source| GitError::Io {
+                    args: vec!["install synchronized hook".to_owned()],
+                    source,
+                })?;
+                let mut permissions = fs::metadata(&hook)
+                    .map_err(|source| GitError::Io {
+                        args: vec!["inspect synchronized hook".to_owned()],
+                        source,
+                    })?
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&hook, permissions).map_err(|source| GitError::Io {
+                    args: vec!["enable synchronized hook".to_owned()],
+                    source,
+                })
+            })
+        else {
+            return Err("expected a hook enabled during fingerprinting to be rejected".into());
         };
 
-        assert!(error.to_string().contains("ignored worktree data exceeds"));
+        assert!(error.to_string().contains("executable Git hooks"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         Ok(())
     }
 
@@ -5273,7 +5425,7 @@ mod tests {
         let (repo, _original_head) = prepare_merge_conflict()?;
         let external = TempRepo::new()?;
         let external_data = fs::File::create(external.path().join("large.bin"))?;
-        external_data.set_len(RECOVERY_IGNORED_DATA_LIMIT + 1)?;
+        external_data.set_len(RECOVERY_UNTRACKED_DATA_LIMIT + 1)?;
         repo.write(".gitignore", "ignored-link\n")?;
         symlink(external.path(), repo.path().join("ignored-link"))?;
         let git = Git::new(repo.path());
@@ -5678,7 +5830,7 @@ mod tests {
             vec!["descendant-timeout-test".to_owned()],
             Instant::now() + Duration::from_millis(100),
             4096,
-            false,
+            BoundedCommandPolicy::Diagnostic,
             || Ok(()),
         ) else {
             return Err("expected descendant command to time out".into());
@@ -5706,7 +5858,7 @@ mod tests {
             vec!["windows-job-timeout-test".to_owned()],
             Instant::now() + Duration::from_millis(100),
             4096,
-            false,
+            BoundedCommandPolicy::Diagnostic,
             || Ok(()),
         ) else {
             return Err("expected Windows descendant command to time out".into());
