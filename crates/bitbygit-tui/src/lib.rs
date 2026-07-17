@@ -4660,6 +4660,37 @@ impl PromptSequenceExecutor {
                     );
                 }
             };
+            if prompt_sequence_request_is_side_effecting(&request)
+                && downstream_pull_request_targets.iter().any(Option::is_some)
+            {
+                let branch = git
+                    .status()
+                    .ok()
+                    .and_then(|status| branch_name(&status.branch).ok())
+                    .or_else(|| {
+                        git.head_target()
+                            .ok()
+                            .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
+                    });
+                let current_targets =
+                    planner.deferred_pull_request_targets(&requests[index + 1..], branch);
+                if !current_targets
+                    .as_ref()
+                    .is_ok_and(|targets| targets == downstream_pull_request_targets)
+                {
+                    step_results.push(PromptSequenceStepResult::planning_failed(
+                        step_number,
+                        operation.plan.title.clone(),
+                        "pull request target changed since the sequence preview; create a new sequence preview and confirmation"
+                            .to_owned(),
+                    ));
+                    return PromptSequenceExecutionResult::new(
+                        total_steps,
+                        step_results,
+                        current_policy,
+                    );
+                }
+            }
             if let Some(previewed_target) = previewed_pull_request_target {
                 if prepared_pull_request_target(&operation).as_ref() != Some(&previewed_target) {
                     step_results.push(PromptSequenceStepResult::planning_failed(
@@ -6097,6 +6128,120 @@ mod tests {
                 .status()?
                 .success(),
             "push must not create a ref at the changed destination"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_revalidates_downstream_pr_target_after_replanning() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = isolated_git_repo("prompt-sequence-replan-changes-push-target")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-replan-origin")?;
+        let fork = isolated_bare_git_repo("prompt-sequence-replan-fork")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &origin)?;
+        git_stdout(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "ssh://git@github.com/fork/repo.git",
+            ],
+        )?;
+        git_stdout(
+            &repo,
+            &[
+                "config",
+                "remote.fork.testbare",
+                &fork.display().to_string(),
+            ],
+        )?;
+
+        let delegated_gh = fake_gh("prompt-sequence-replan-changes-push-target", false)?;
+        let gh_root = isolated_temp_root("prompt-sequence-replan-changes-push-target-gh")?;
+        std::fs::create_dir_all(&gh_root)?;
+        let fake_gh = gh_root.join("gh");
+        let repo_view_count = gh_root.join("repo-view-count");
+        std::fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\nif [ \"$1:$2\" = repo:view ]; then\n  count=0\n  [ ! -f '{}' ] || count=$(cat '{}')\n  count=$((count + 1))\n  printf '%s\\n' \"$count\" > '{}'\n  if [ \"$count\" -eq 5 ]; then git config remote.pushDefault fork; fi\nfi\nexec '{}' \"$@\"\n",
+                repo_view_count.display(),
+                repo_view_count.display(),
+                repo_view_count.display(),
+                delegated_gh.display(),
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&fake_gh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, permissions)?;
+
+        let ssh_root = isolated_temp_root("prompt-sequence-replan-changes-push-target-ssh")?;
+        std::fs::create_dir_all(&ssh_root)?;
+        let ssh = ssh_root.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*fork/repo.git*) target='{}' ;;\n*) target='{}' ;;\nesac\ncase \"$*\" in\n*git-receive-pack*) exec git-receive-pack \"$target\" ;;\n*) exec git-upload-pack \"$target\" ;;\nesac\n",
+                fork.display(),
+                origin.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&ssh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions)?;
+
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::default(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        let paths = isolated_store_paths("prompt-sequence-replan-changes-push-target-audit")?;
+
+        let result =
+            PromptSequenceExecutor::with_audit_paths_and_tools(&repo, paths.clone(), &fake_gh, ssh)
+                .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert!(entries.iter().all(|entry| entry.operation != "push"));
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&fork)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()?
+                .success(),
+            "push must not create a ref at the replanned destination"
         );
         Ok(())
     }
