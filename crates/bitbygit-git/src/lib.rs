@@ -58,6 +58,7 @@ const RECOVERY_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 const RECOVERY_DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
 const RECOVERY_STATE_ENTRY_LIMIT: usize = 100_000;
 const RECOVERY_UNTRACKED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
+const RECOVERY_IGNORED_DATA_LIMIT: u64 = 64 * 1024 * 1024;
 const RECOVERY_REBASE_TODO_LIMIT: u64 = 1024 * 1024;
 const RECOVERY_MINIMUM_GIT_VERSION: (u64, u64) = (2, 42);
 const RECOVERY_LOCK_DIRECTORY: &str = "recovery-locks";
@@ -1426,17 +1427,22 @@ impl Git {
                 Ok(())
             })?;
         }
-        let ignored_args = self.other_worktree_paths_args(true);
-        let ignored = self.run_bounded_git_digest(ignored_args.clone(), deadline)?;
-        if !ignored.status.success() {
-            return Err(ignored.git_error(ignored_args));
-        }
-        hash_field(&mut hasher, &ignored.stdout.digest);
-        if let Some(fence) = fence.as_deref_mut() {
-            fence.probes.push(RecoveryProbe {
-                args: ignored_args,
-                digest: ignored.stdout.digest,
-            });
+        let mut ignored_bytes_remaining = Some(RECOVERY_IGNORED_DATA_LIMIT);
+        for relative in self.ignored_worktree_paths_until(deadline)? {
+            let path = root.join(&relative);
+            let mut label = b"ignored-worktree/".to_vec();
+            label.extend_from_slice(relative.as_os_str().as_encoded_bytes());
+            let mut context = RecoveryHashContext {
+                deadline,
+                entries: &mut entries,
+                follow_symlinks: false,
+                byte_budget: &mut ignored_bytes_remaining,
+                byte_budget_error: "recovery planning is blocked because ignored worktree data exceeds the 64 MiB fingerprint limit",
+                fence: fence.as_deref_mut(),
+            };
+            hash_recovery_path_inner(&mut hasher, &label, &path, 0, &mut context, &mut |_, _| {
+                Ok(())
+            })?;
         }
         for relative in self.worktree_attributes_until(deadline)? {
             let mut label = b"worktree-attributes/".to_vec();
@@ -1600,6 +1606,10 @@ impl Git {
 
     fn untracked_worktree_paths_until(&self, deadline: Instant) -> Result<Vec<PathBuf>, GitError> {
         self.other_worktree_paths_until(false, deadline)
+    }
+
+    fn ignored_worktree_paths_until(&self, deadline: Instant) -> Result<Vec<PathBuf>, GitError> {
+        self.other_worktree_paths_until(true, deadline)
     }
 
     fn other_worktree_paths_until(
@@ -5324,10 +5334,7 @@ mod tests {
         repo.write("target/victim.bin", "at preview\n")?;
         let git = Git::new(repo.path());
         let expected = git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Abort)?;
-        fs::rename(
-            repo.path().join("target/victim.bin"),
-            repo.path().join("target/replacement.bin"),
-        )?;
+        repo.write("target/victim.bin", "changed after preview\n")?;
 
         let Err(error) = git.recover_exact(
             RepositoryOperation::Rebase,
@@ -5339,8 +5346,8 @@ mod tests {
 
         assert!(error.to_string().contains("state changed after preview"));
         assert_eq!(
-            fs::read_to_string(repo.path().join("target/replacement.bin"))?,
-            "at preview\n"
+            fs::read_to_string(repo.path().join("target/victim.bin"))?,
+            "changed after preview\n"
         );
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
         Ok(())
@@ -5388,22 +5395,17 @@ mod tests {
     }
 
     #[test]
-    fn recovery_fingerprint_streams_ignored_paths_without_reading_data()
-    -> Result<(), Box<dyn Error>> {
+    fn recovery_fingerprint_bounds_ignored_data() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
-        repo.write(".gitignore", "large.ignored\ntarget/\n")?;
+        repo.write(".gitignore", "large.ignored\n")?;
         let ignored = fs::File::create(repo.path().join("large.ignored"))?;
-        ignored.set_len(RECOVERY_UNTRACKED_DATA_LIMIT + 1)?;
-        fs::create_dir(repo.path().join("target"))?;
-        for index in 0..4_000 {
-            repo.write(&format!("target/generated-artifact-{index:04}.bin"), "")?;
-        }
+        ignored.set_len(RECOVERY_IGNORED_DATA_LIMIT + 1)?;
 
-        let git = Git::new(repo.path());
-        let baseline = git.recovery_state()?;
-        ignored.set_len(RECOVERY_UNTRACKED_DATA_LIMIT * 2)?;
+        let Err(error) = Git::new(repo.path()).recovery_state() else {
+            return Err("expected oversized ignored data to block planning".into());
+        };
 
-        assert_eq!(git.recovery_state()?, baseline);
+        assert!(error.to_string().contains("ignored worktree data exceeds"));
         Ok(())
     }
 
