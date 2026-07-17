@@ -1568,7 +1568,7 @@ impl Git {
         ];
         let output = self.run_bounded_git(args.clone(), deadline, true)?;
         let safety = RecoveryProbeSafety::ExternalDrivers;
-        ensure_recovery_probe_observation_safe(safety, &args, &output)?;
+        self.ensure_recovery_external_drivers_safe_until(&args, &output, deadline)?;
         hash_recovery_probe(hasher, &output);
         if let Some(fence) = fence {
             fence.probes.push(RecoveryProbe {
@@ -1638,30 +1638,7 @@ impl Git {
             "--list".to_owned(),
         ];
         let output = self.run_bounded_git(args.clone(), deadline, true)?;
-        if !output.status.success() {
-            return Err(output.git_error(args));
-        }
-        if output.stdout.truncated {
-            return Err(GitError::Blocked {
-                message: "recovery is blocked because Git configuration exceeds the bounded diagnostic limit, so external drivers cannot be ruled out"
-                    .to_owned(),
-            });
-        }
-        let names = output
-            .stdout
-            .bytes
-            .split(|byte| *byte == 0)
-            .filter(|name| is_recovery_external_driver_config(name))
-            .map(|name| String::from_utf8_lossy(name).into_owned())
-            .collect::<Vec<_>>();
-        if !names.is_empty() {
-            return Err(GitError::Blocked {
-                message: format!(
-                    "recovery is blocked because configured external Git drivers may be activated by a recovery target tree and start uncontained processes: {}; remove them from every Git config scope, preview recovery again, or run Git manually",
-                    names.join(", ")
-                ),
-            });
-        }
+        self.ensure_recovery_external_drivers_safe_until(&args, &output, deadline)?;
 
         let hooks = self.recovery_hooks_path_until(deadline)?;
         let enabled_hooks = RECOVERY_HOOKS
@@ -1699,6 +1676,160 @@ impl Git {
             }
         }
         Ok(())
+    }
+
+    fn ensure_recovery_external_drivers_safe_until(
+        &self,
+        args: &[String],
+        output: &BoundedCommandOutput,
+        deadline: Instant,
+    ) -> Result<(), GitError> {
+        if !output.status.success() {
+            return Err(output.clone().git_error(args.to_vec()));
+        }
+        if output.stdout.truncated {
+            return Err(GitError::Blocked {
+                message: "recovery is blocked because Git configuration exceeds the bounded diagnostic limit, so external drivers cannot be ruled out"
+                    .to_owned(),
+            });
+        }
+        let mut names = Vec::new();
+        let mut filter_keys = BTreeMap::<String, Vec<String>>::new();
+        for name in output.stdout.bytes.split(|byte| *byte == 0) {
+            if !is_recovery_external_driver_config(name) {
+                continue;
+            }
+            let display = String::from_utf8_lossy(name).into_owned();
+            if let Some(driver) = recovery_filter_driver(name) {
+                filter_keys.entry(driver).or_default().push(display);
+            } else {
+                names.push(display);
+            }
+        }
+        if !filter_keys.is_empty() {
+            let configured = filter_keys.keys().cloned().collect();
+            for driver in self.active_recovery_filters_until(&configured, deadline)? {
+                if let Some(keys) = filter_keys.get(&driver) {
+                    names.extend(keys.iter().cloned());
+                }
+            }
+        }
+        if !names.is_empty() {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "recovery is blocked because configured external Git drivers are active or may be activated by a recovery target tree and start uncontained processes: {}; disable the applicable attributes or remove the drivers from every Git config scope, preview recovery again, or run Git manually",
+                    names.join(", ")
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn active_recovery_filters_until(
+        &self,
+        configured: &BTreeSet<String>,
+        deadline: Instant,
+    ) -> Result<BTreeSet<String>, GitError> {
+        let mut sources = BTreeSet::from([None]);
+        match self.repository_operation_until(deadline)? {
+            Some(RepositoryOperation::Merge) => {
+                sources.insert(Some("ORIG_HEAD".to_owned()));
+            }
+            Some(RepositoryOperation::Rebase) => {
+                sources.insert(self.recovery_overwrite_target_until(
+                    RepositoryOperation::Rebase,
+                    RecoveryAction::Abort,
+                    deadline,
+                )?);
+                sources.extend(
+                    self.remaining_rebase_commit_oids_until(deadline)?
+                        .into_iter()
+                        .map(Some),
+                );
+            }
+            None => {}
+        }
+
+        let mut active = BTreeSet::new();
+        for source in sources {
+            let list_args = match source.as_deref() {
+                Some(source) => vec![
+                    "ls-tree".to_owned(),
+                    "-r".to_owned(),
+                    "--name-only".to_owned(),
+                    "-z".to_owned(),
+                    source.to_owned(),
+                    "--".to_owned(),
+                ],
+                None => vec![
+                    "ls-files".to_owned(),
+                    "--cached".to_owned(),
+                    "-z".to_owned(),
+                    "--".to_owned(),
+                ],
+            };
+            let paths = self.run_bounded_git(list_args.clone(), deadline, true)?;
+            if !paths.status.success() {
+                return Err(paths.git_error(list_args));
+            }
+            if paths.stdout.truncated {
+                return Err(GitError::Blocked {
+                    message: "recovery is blocked because paths requiring attribute inspection exceed the bounded output limit"
+                        .to_owned(),
+                });
+            }
+            let paths = paths
+                .stdout
+                .bytes
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>();
+            for chunk in paths.chunks(128) {
+                let mut args = vec!["check-attr".to_owned(), "-z".to_owned()];
+                if let Some(source) = source.as_deref() {
+                    args.push(format!("--source={source}"));
+                }
+                args.extend(["filter".to_owned(), "--".to_owned()]);
+                for path in chunk {
+                    let path = std::str::from_utf8(path).map_err(|_| GitError::Blocked {
+                        message: "recovery is blocked because an attribute path is not valid UTF-8"
+                            .to_owned(),
+                    })?;
+                    args.push(path.to_owned());
+                }
+                let attributes = self.run_bounded_git(args.clone(), deadline, true)?;
+                if !attributes.status.success() {
+                    return Err(attributes.git_error(args));
+                }
+                if attributes.stdout.truncated {
+                    return Err(GitError::Blocked {
+                        message: "recovery is blocked because effective attributes exceed the bounded output limit"
+                            .to_owned(),
+                    });
+                }
+                let fields = attributes
+                    .stdout
+                    .bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|field| !field.is_empty())
+                    .collect::<Vec<_>>();
+                let mut triples = fields.chunks_exact(3);
+                for triple in &mut triples {
+                    let driver = String::from_utf8_lossy(triple[2]).to_ascii_lowercase();
+                    if configured.contains(&driver) {
+                        active.insert(driver);
+                    }
+                }
+                if !triples.remainder().is_empty() {
+                    return Err(GitError::Blocked {
+                        message:
+                            "recovery is blocked because effective attributes could not be parsed"
+                                .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(active)
     }
 
     fn bounded_config_is_enabled(&self, key: &str, deadline: Instant) -> Result<bool, GitError> {
@@ -1789,17 +1920,28 @@ impl Git {
         else {
             return Ok(());
         };
-        let changed_args = vec![
-            "diff".to_owned(),
-            "--name-only".to_owned(),
-            "--no-renames".to_owned(),
-            "--no-ext-diff".to_owned(),
-            "--no-textconv".to_owned(),
-            "-z".to_owned(),
-            "HEAD".to_owned(),
-            target,
-            "--".to_owned(),
-        ];
+        let changed_args = if action == RecoveryAction::Abort {
+            vec![
+                "ls-tree".to_owned(),
+                "-r".to_owned(),
+                "--name-only".to_owned(),
+                "-z".to_owned(),
+                target,
+                "--".to_owned(),
+            ]
+        } else {
+            vec![
+                "diff".to_owned(),
+                "--name-only".to_owned(),
+                "--no-renames".to_owned(),
+                "--no-ext-diff".to_owned(),
+                "--no-textconv".to_owned(),
+                "-z".to_owned(),
+                "HEAD".to_owned(),
+                target,
+                "--".to_owned(),
+            ]
+        };
         let changed = self.run_bounded_git(changed_args.clone(), deadline, true)?;
         if !changed.status.success() {
             return Err(changed.git_error(changed_args));
@@ -2656,6 +2798,15 @@ fn is_recovery_external_driver_config(name: &[u8]) -> bool {
         || (name.starts_with("merge.") && name.ends_with(".driver"))
 }
 
+fn recovery_filter_driver(name: &[u8]) -> Option<String> {
+    let name = String::from_utf8_lossy(name).to_ascii_lowercase();
+    let name = name.strip_prefix("filter.")?;
+    let driver = [".clean", ".smudge", ".process"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix))?;
+    (!driver.is_empty()).then(|| driver.to_owned())
+}
+
 fn hash_recovery_probe(hasher: &mut Sha256, output: &BoundedCommandOutput) {
     hash_field(
         hasher,
@@ -2715,7 +2866,10 @@ fn ensure_recovery_probe_observation_safe(
                 .stdout
                 .bytes
                 .split(|byte| *byte == 0)
-                .filter(|name| is_recovery_external_driver_config(name))
+                .filter(|name| {
+                    is_recovery_external_driver_config(name)
+                        && recovery_filter_driver(name).is_none()
+                })
                 .map(|name| String::from_utf8_lossy(name).into_owned())
                 .collect::<Vec<_>>();
             if !names.is_empty() {
@@ -2858,7 +3012,7 @@ where
             break status;
         }
         let now = Instant::now();
-        if policy != BoundedCommandPolicy::RecoveryExecution && now >= deadline {
+        if now >= deadline {
             kill_process_tree(&mut child);
             let _result = child.wait();
             kill_process_tree(&mut child);
@@ -2866,11 +3020,7 @@ where
             join_capture_reader(stderr_reader, &args)?;
             return Err(GitError::TimedOut { args });
         }
-        let delay = if policy == BoundedCommandPolicy::RecoveryExecution {
-            Duration::from_millis(5)
-        } else {
-            Duration::from_millis(5).min(deadline.saturating_duration_since(now))
-        };
+        let delay = Duration::from_millis(5).min(deadline.saturating_duration_since(now));
         thread::sleep(delay);
     };
     // End the contained process tree before joining the drains so descendants
@@ -3518,7 +3668,12 @@ impl RecoveryInputFence {
                 }
                 _ => git.run_bounded_git(probe.args.clone(), deadline, true)?,
             };
-            ensure_recovery_probe_observation_safe(probe.safety, &probe.args, &output)?;
+            match probe.safety {
+                RecoveryProbeSafety::ExternalDrivers => {
+                    git.ensure_recovery_external_drivers_safe_until(&probe.args, &output, deadline)?
+                }
+                _ => ensure_recovery_probe_observation_safe(probe.safety, &probe.args, &output)?,
+            }
             if output.status.code() != probe.status {
                 return Err(GitError::Blocked {
                     message: format!(
@@ -5822,7 +5977,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_execution_is_not_killed_after_spawn_limits() -> Result<(), Box<dyn Error>> {
+    fn recovery_execution_times_out_after_spawn() -> Result<(), Box<dyn Error>> {
         let mut command = Command::new("sh");
         command.args([
             "-c",
@@ -5830,18 +5985,18 @@ mod tests {
         ]);
         configure_process_group(&mut command);
 
-        let output = run_bounded_command(
+        let Err(error) = run_bounded_command(
             command,
             vec!["mutating-recovery-test".to_owned()],
             Instant::now() + Duration::from_millis(20),
             32,
             BoundedCommandPolicy::RecoveryExecution,
             || Ok(()),
-        )?;
+        ) else {
+            return Err("expected mutating recovery to time out".into());
+        };
 
-        assert!(output.status.success());
-        assert_eq!(output.stdout.bytes.len(), 32);
-        assert!(output.stdout.truncated);
+        assert!(matches!(error, GitError::TimedOut { .. }));
         Ok(())
     }
 
@@ -5887,8 +6042,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn recovery_platform_execution_is_not_killed_after_spawn_limits() -> Result<(), Box<dyn Error>>
-    {
+    fn recovery_platform_execution_times_out_after_spawn() -> Result<(), Box<dyn Error>> {
         let mut command = Command::new("powershell");
         command.args([
             "-NoProfile",
@@ -5896,18 +6050,18 @@ mod tests {
             "[Console]::Out.Write('x' * 5000000); Start-Sleep -Milliseconds 200",
         ]);
 
-        let output = run_bounded_command(
+        let Err(error) = run_bounded_command(
             command,
             vec!["mutating-recovery-test".to_owned()],
             Instant::now() + Duration::from_millis(100),
             32,
             BoundedCommandPolicy::RecoveryExecution,
             || Ok(()),
-        )?;
+        ) else {
+            return Err("expected mutating recovery to time out".into());
+        };
 
-        assert!(output.status.success());
-        assert_eq!(output.stdout.bytes.len(), 32);
-        assert!(output.stdout.truncated);
+        assert!(matches!(error, GitError::TimedOut { .. }));
         Ok(())
     }
 
@@ -6008,6 +6162,40 @@ mod tests {
             "at preview\n"
         );
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn merge_abort_blocks_ignored_collision_omitted_from_endpoint_diff()
+    -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.write("stable.txt", "tracked stable contents\n")?;
+        repo.run(["add", "conflict.txt", "stable.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "other"])?;
+        repo.write("conflict.txt", "other\n")?;
+        repo.run(["commit", "-am", "other"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.run(["commit", "-am", "main"])?;
+        repo.run_allow_failure(["merge", "other"])?;
+        repo.run(["rm", "--cached", "stable.txt"])?;
+        repo.write(".gitignore", "stable.txt\n")?;
+        repo.write("stable.txt", "local ignored data\n")?;
+        let git = Git::new(repo.path());
+
+        let Err(error) = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)
+        else {
+            return Err("expected ignored stable path to block merge abort".into());
+        };
+
+        assert!(error.to_string().contains("would be overwritten"));
+        assert_eq!(
+            fs::read_to_string(repo.path().join("stable.txt"))?,
+            "local ignored data\n"
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
         Ok(())
     }
 
@@ -6289,6 +6477,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_recovery_rejects_filter_activated_at_spawn_boundary() -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_merge_conflict()?;
+        repo.write(".gitattributes", "*.txt filter=unsafe\n")?;
+        let git = Git::new(repo.path());
+        let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+
+        let Err(error) = git.recover_exact_with(
+            RepositoryOperation::Merge,
+            RecoveryAction::Abort,
+            &expected,
+            || {
+                let output = Command::new("git")
+                    .current_dir(repo.path())
+                    .args(["config", "filter.unsafe.smudge", "cat"])
+                    .output()
+                    .map_err(|source| GitError::Io {
+                        args: vec!["install synchronized filter config".to_owned()],
+                        source,
+                    })?;
+                if !output.status.success() {
+                    return Err(GitError::Blocked {
+                        message: "synchronized filter mutation failed".to_owned(),
+                    });
+                }
+                Ok(())
+            },
+        ) else {
+            return Err("expected activated filter at spawn boundary to block recovery".into());
+        };
+
+        assert!(error.to_string().contains("filter.unsafe.smudge"));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Merge));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exact_recovery_rechecks_process_control_after_first_final_fence_pass()
     -> Result<(), Box<dyn Error>> {
         for (relative, contents) in [
@@ -6490,6 +6718,7 @@ mod tests {
     #[test]
     fn recovery_rejects_all_configured_external_driver_kinds() -> Result<(), Box<dyn Error>> {
         let (repo, _original_head) = prepare_merge_conflict()?;
+        repo.write(".gitattributes", "*.txt filter=unsafe\n")?;
         let git = Git::new(repo.path());
         for key in [
             "filter.unsafe.clean",
@@ -6525,6 +6754,24 @@ mod tests {
 
         assert!(error.to_string().contains("diff.external"));
         assert!(error.to_string().contains("every Git config scope"));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_allows_inactive_global_lfs_configuration() -> Result<(), Box<dyn Error>> {
+        let (repo, _original_head) = prepare_merge_conflict()?;
+        let config_dir = TempRepo::new()?;
+        let global_config = config_dir.path().join("global-config");
+        fs::write(
+            &global_config,
+            "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n",
+        )?;
+        let git = Git::new(repo.path()).with_test_global_config(global_config);
+
+        let expected = git.prepare_recovery(RepositoryOperation::Merge, RecoveryAction::Abort)?;
+        git.recover_exact(RepositoryOperation::Merge, RecoveryAction::Abort, &expected)?;
+
+        assert_eq!(git.status()?.operation, None);
         Ok(())
     }
 
@@ -6654,7 +6901,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_platform_timeout_kills_descendants() -> Result<(), Box<dyn Error>> {
+    fn recovery_execution_timeout_kills_descendants() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         let marker = repo.path().join("descendant-ran");
         let mut command = Command::new("sh");
@@ -6670,7 +6917,7 @@ mod tests {
             vec!["descendant-timeout-test".to_owned()],
             Instant::now() + Duration::from_millis(100),
             4096,
-            BoundedCommandPolicy::Diagnostic,
+            BoundedCommandPolicy::RecoveryExecution,
             || Ok(()),
         ) else {
             return Err("expected descendant command to time out".into());
@@ -6683,7 +6930,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn recovery_platform_timeout_kills_windows_job_descendants() -> Result<(), Box<dyn Error>> {
+    fn recovery_execution_timeout_kills_windows_job_descendants() -> Result<(), Box<dyn Error>> {
         let repo = TempRepo::new()?;
         let marker = repo.path().join("windows-descendant-ran");
         let script = format!(
@@ -6698,7 +6945,7 @@ mod tests {
             vec!["windows-job-timeout-test".to_owned()],
             Instant::now() + Duration::from_millis(100),
             4096,
-            BoundedCommandPolicy::Diagnostic,
+            BoundedCommandPolicy::RecoveryExecution,
             || Ok(()),
         ) else {
             return Err("expected Windows descendant command to time out".into());
