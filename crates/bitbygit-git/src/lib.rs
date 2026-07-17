@@ -483,7 +483,9 @@ impl Git {
             .unwrap_or_else(|| "simple".to_owned());
         let target = match push_default.as_str() {
             "simple" if remote != upstream_remote => (remote, branch.to_owned()),
-            "simple" | "upstream" => (upstream_remote.to_owned(), upstream_branch.to_owned()),
+            "simple" | "upstream" | "tracking" => {
+                (upstream_remote.to_owned(), upstream_branch.to_owned())
+            }
             "current" | "matching" => (remote, branch.to_owned()),
             "nothing" => return Ok(None),
             _ => {
@@ -3280,7 +3282,9 @@ mod tests {
         );
 
         repo.run(["config", "remote.pushDefault", "origin"])?;
-        for push_default in ["simple", "current", "upstream", "matching", "nothing"] {
+        for push_default in [
+            "simple", "current", "upstream", "tracking", "matching", "nothing",
+        ] {
             repo.run(["config", "push.default", push_default])?;
             assert_eq!(
                 git.typed_push_target("topic", Some(("fork", "topic")), Some("fork"))?,

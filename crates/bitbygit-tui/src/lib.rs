@@ -2161,18 +2161,21 @@ impl OperationPlanner {
                     .ok()
                     .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
             });
-        let deferred_pull_request_targets =
-            self.deferred_pull_request_targets(&requests, branch.clone())?;
         let (policy_evaluations, sequence_policy_evaluations) =
-            prompt_sequence_policy_evaluations(&self.policy, &git, &requests, branch)?;
-        let first_request = requests
-            .first()
-            .cloned()
-            .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
+            prompt_sequence_policy_evaluations(&self.policy, &git, &requests, branch.clone())?;
         let blocked = policy_evaluations
             .iter()
             .chain(&sequence_policy_evaluations)
             .any(|evaluation| evaluation.requirement == ConfirmationRequirement::Blocked);
+        let deferred_pull_request_targets = if blocked {
+            vec![None; requests.len().saturating_sub(1)]
+        } else {
+            self.deferred_pull_request_targets(&requests, branch.clone())?
+        };
+        let first_request = requests
+            .first()
+            .cloned()
+            .ok_or_else(|| "Prompt sequence requires at least two steps.".to_owned())?;
         let first = if blocked {
             prompt_sequence_preflight_operation(first_request)?
         } else {
@@ -8417,6 +8420,35 @@ mod tests {
                 .prompt
                 .contains("run 2 prompt steps")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_prompt_sequence_does_not_bind_pull_request_target() -> Result<(), Box<dyn Error>> {
+        let repo = pushed_branch_repo("blocked-sequence-pull-request-target")?;
+        let fake_gh = fake_gh("blocked-sequence-pull-request-target", false)?;
+        let mut config = AppConfig::default();
+        config.policy.confirmation.medium = ConfirmationSetting::Blocked;
+        let planner = OperationPlanner {
+            repo_root: repo,
+            github_executable: Some(fake_gh.clone()),
+            policy: EffectivePolicy::new(&config),
+            ssh_executable: Some(test_ssh_command()?),
+        };
+
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Branches,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            sequence.plan.confirmation.requirement,
+            ConfirmationRequirement::Blocked
+        );
+        assert_eq!(sequence.sequence.deferred_pull_request_targets, vec![None]);
+        assert!(!fake_gh.with_file_name("invocations").exists());
         Ok(())
     }
 
