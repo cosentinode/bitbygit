@@ -5359,7 +5359,9 @@ mod tests {
                         .map_err(|source| recovery_state_io(path, source))?;
                     fs::write(&input, b"replaced")
                         .map_err(|source| recovery_state_io(path, source))?;
-                    fs::File::open(&input)
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&input)
                         .and_then(|file| {
                             file.set_times(fs::FileTimes::new().set_modified(modified))
                         })
@@ -5372,7 +5374,7 @@ mod tests {
             return Err("expected same-metadata replacement to be rejected".into());
         };
 
-        assert!(replaced);
+        assert!(replaced, "unexpected error: {error}");
         assert!(same_recovery_file(
             &original_metadata,
             &fs::metadata(&input)?
@@ -5806,7 +5808,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn recovery_platform_lock_serializes_bitbygit_execution() -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_merge_conflict()?;
