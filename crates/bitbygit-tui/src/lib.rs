@@ -1915,6 +1915,17 @@ fn prompt_sequence_request_is_side_effecting(request: &OperationRequest) -> bool
     )
 }
 
+fn deferred_pull_request_base_changed(
+    previous: &EffectivePolicy,
+    current: &EffectivePolicy,
+    requests: &[OperationRequest],
+) -> bool {
+    previous.default_pull_request_base() != current.default_pull_request_base()
+        && requests
+            .iter()
+            .any(|request| matches!(request, OperationRequest::OpenPullRequest { base: None }))
+}
+
 fn repo_list(app: &App) -> List<'_> {
     let items = app
         .repos
@@ -4486,13 +4497,9 @@ impl PromptSequenceExecutor {
         let current_pull_request_targets =
             planner.deferred_pull_request_targets(&requests, branch.clone());
         current_policy = self.load_policy(&current_policy);
-        let current_pull_request_targets = if planner.policy == current_policy {
-            current_pull_request_targets
-        } else {
-            self.planner(current_policy.clone())
-                .deferred_pull_request_targets(&requests, branch.clone())
-        };
-        if current_pull_request_targets.as_ref() != Ok(&deferred_pull_request_targets) {
+        if deferred_pull_request_base_changed(&planner.policy, &current_policy, &requests)
+            || current_pull_request_targets.as_ref() != Ok(&deferred_pull_request_targets)
+        {
             step_results.push(PromptSequenceStepResult::planning_failed(
                 1,
                 first.plan.title.clone(),
@@ -4615,16 +4622,15 @@ impl PromptSequenceExecutor {
                             .ok()
                             .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
                     });
+                let remaining_requests = &requests[index + 1..];
                 let current_targets =
-                    planner.deferred_pull_request_targets(&requests[index + 1..], branch.clone());
+                    planner.deferred_pull_request_targets(remaining_requests, branch);
                 current_policy = self.load_policy(&current_policy);
-                let current_targets = if planner.policy == current_policy {
-                    current_targets
-                } else {
-                    self.planner(current_policy.clone())
-                        .deferred_pull_request_targets(&requests[index + 1..], branch)
-                };
-                if !current_targets
+                if deferred_pull_request_base_changed(
+                    &planner.policy,
+                    &current_policy,
+                    remaining_requests,
+                ) || !current_targets
                     .as_ref()
                     .is_ok_and(|targets| targets == downstream_pull_request_targets)
                 {
@@ -4676,16 +4682,15 @@ impl PromptSequenceExecutor {
                             .ok()
                             .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
                     });
+                let remaining_requests = &requests[index + 1..];
                 let current_targets =
-                    planner.deferred_pull_request_targets(&requests[index + 1..], branch.clone());
+                    planner.deferred_pull_request_targets(remaining_requests, branch);
                 current_policy = self.load_policy(&current_policy);
-                let current_targets = if planner.policy == current_policy {
-                    current_targets
-                } else {
-                    self.planner(current_policy.clone())
-                        .deferred_pull_request_targets(&requests[index + 1..], branch)
-                };
-                if !current_targets
+                if deferred_pull_request_base_changed(
+                    &planner.policy,
+                    &current_policy,
+                    remaining_requests,
+                ) || !current_targets
                     .as_ref()
                     .is_ok_and(|targets| targets == downstream_pull_request_targets)
                 {
