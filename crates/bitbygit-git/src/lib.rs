@@ -5808,7 +5808,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn recovery_platform_lock_serializes_bitbygit_execution() -> Result<(), Box<dyn Error>> {
         let (repo, original_head) = prepare_merge_conflict()?;
@@ -5885,7 +5885,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn recovery_platform_lock_directory_replacement_is_rejected_after_final_validation()
     -> Result<(), Box<dyn Error>> {
