@@ -33,3 +33,6 @@ semantic versioning once releases begin.
   in [#13](https://github.com/cosentinode/bitbygit/issues/13).
 - Added strict typed TOML configuration loading with complete safe-default
   fallback and redacted path-aware diagnostics.
+- Applied configured pull request base defaults after explicit prompt targets
+  and before provider defaults, with provider validation and visible safe config
+  diagnostics in the TUI.
