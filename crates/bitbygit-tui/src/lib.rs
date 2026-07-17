@@ -4482,14 +4482,16 @@ impl PromptSequenceExecutor {
                     .ok()
                     .and_then(|status| branch_name(&status.branch).ok())
             });
-        let current_pull_request_targets = OperationPlanner {
-            repo_root: self.repo_root.clone(),
-            github_executable: self.github_executable.clone(),
-            policy: current_policy.clone(),
-            #[cfg(test)]
-            ssh_executable: self.ssh_executable.clone(),
-        }
-        .deferred_pull_request_targets(&requests, branch.clone());
+        let planner = self.planner(current_policy.clone());
+        let current_pull_request_targets =
+            planner.deferred_pull_request_targets(&requests, branch.clone());
+        current_policy = self.load_policy(&current_policy);
+        let current_pull_request_targets = if planner.policy == current_policy {
+            current_pull_request_targets
+        } else {
+            self.planner(current_policy.clone())
+                .deferred_pull_request_targets(&requests, branch.clone())
+        };
         if current_pull_request_targets.as_ref() != Ok(&deferred_pull_request_targets) {
             step_results.push(PromptSequenceStepResult::planning_failed(
                 1,
@@ -4599,13 +4601,7 @@ impl PromptSequenceExecutor {
                 );
             };
             current_policy = self.load_policy(&current_policy);
-            let planner = OperationPlanner {
-                repo_root: self.repo_root.clone(),
-                github_executable: self.github_executable.clone(),
-                policy: current_policy.clone(),
-                #[cfg(test)]
-                ssh_executable: self.ssh_executable.clone(),
-            };
+            let planner = self.planner(current_policy.clone());
             let downstream_pull_request_targets = &deferred_pull_request_targets[index + 1..];
             if prompt_sequence_request_is_side_effecting(&request)
                 && downstream_pull_request_targets.iter().any(Option::is_some)
@@ -4620,7 +4616,14 @@ impl PromptSequenceExecutor {
                             .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
                     });
                 let current_targets =
-                    planner.deferred_pull_request_targets(&requests[index + 1..], branch);
+                    planner.deferred_pull_request_targets(&requests[index + 1..], branch.clone());
+                current_policy = self.load_policy(&current_policy);
+                let current_targets = if planner.policy == current_policy {
+                    current_targets
+                } else {
+                    self.planner(current_policy.clone())
+                        .deferred_pull_request_targets(&requests[index + 1..], branch)
+                };
                 if !current_targets
                     .as_ref()
                     .is_ok_and(|targets| targets == downstream_pull_request_targets)
@@ -4638,6 +4641,7 @@ impl PromptSequenceExecutor {
                     );
                 }
             }
+            let planner = self.planner(current_policy.clone());
             let operation = match planner.plan_request(request.clone()) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -4673,7 +4677,14 @@ impl PromptSequenceExecutor {
                             .and_then(|target| head_target_branch(&target).map(ToOwned::to_owned))
                     });
                 let current_targets =
-                    planner.deferred_pull_request_targets(&requests[index + 1..], branch);
+                    planner.deferred_pull_request_targets(&requests[index + 1..], branch.clone());
+                current_policy = self.load_policy(&current_policy);
+                let current_targets = if planner.policy == current_policy {
+                    current_targets
+                } else {
+                    self.planner(current_policy.clone())
+                        .deferred_pull_request_targets(&requests[index + 1..], branch)
+                };
                 if !current_targets
                     .as_ref()
                     .is_ok_and(|targets| targets == downstream_pull_request_targets)
@@ -4690,6 +4701,8 @@ impl PromptSequenceExecutor {
                         current_policy,
                     );
                 }
+            } else {
+                current_policy = self.load_policy(&current_policy);
             }
             if let Some(previewed_target) = previewed_pull_request_target {
                 if prepared_pull_request_target(&operation).as_ref() != Some(&previewed_target) {
@@ -4721,7 +4734,6 @@ impl PromptSequenceExecutor {
                     current_policy,
                 );
             };
-            current_policy = self.load_policy(&current_policy);
             let branch = policy_branch(&operation.context);
             let current_evaluation = evaluate_plan_policy(&current_policy, &operation.plan, branch);
             let current_sequence_evaluation =
@@ -4772,6 +4784,16 @@ impl PromptSequenceExecutor {
 
     fn load_policy(&self, fallback: &EffectivePolicy) -> EffectivePolicy {
         self.audit.load_policy(fallback)
+    }
+
+    fn planner(&self, policy: EffectivePolicy) -> OperationPlanner {
+        OperationPlanner {
+            repo_root: self.repo_root.clone(),
+            github_executable: self.github_executable.clone(),
+            policy,
+            #[cfg(test)]
+            ssh_executable: self.ssh_executable.clone(),
+        }
     }
 
     fn execute_prepared_step(
@@ -6242,6 +6264,100 @@ mod tests {
                 .status()?
                 .success(),
             "push must not create a ref at the replanned destination"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_revalidates_downstream_pr_base_after_config_reload() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = isolated_git_repo("prompt-sequence-reload-changes-pr-base")?;
+        let origin = isolated_bare_git_repo("prompt-sequence-reload-pr-base-origin")?;
+        configure_git_identity(&repo)?;
+        std::fs::write(repo.join("file.txt"), "base\n")?;
+        git_stdout(&repo, &["add", "file.txt"])?;
+        git_stdout(&repo, &["commit", "-m", "initial"])?;
+        let branch = git_stdout(&repo, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        add_github_remote(&repo, "origin", &origin)?;
+
+        let paths = isolated_store_paths("prompt-sequence-reload-changes-pr-base-audit")?;
+        let store = LocalStore::open(paths.clone())?;
+        std::fs::write(
+            &store.paths().config_file,
+            "schema-version = 1\n[pull-requests]\ndefault-base-branch = \"release\"\n",
+        )?;
+        let policy = EffectivePolicy::new(&store.load_config().settings);
+        let delegated_gh = fake_gh("prompt-sequence-reload-changes-pr-base", false)?;
+        let gh_root = isolated_temp_root("prompt-sequence-reload-changes-pr-base-gh")?;
+        std::fs::create_dir_all(&gh_root)?;
+        let fake_gh = gh_root.join("gh");
+        let repo_view_count = gh_root.join("repo-view-count");
+        std::fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\nif [ \"$1:$2\" = repo:view ]; then\n  count=0\n  [ ! -f '{}' ] || count=$(cat '{}')\n  count=$((count + 1))\n  printf '%s\\n' \"$count\" > '{}'\n  if [ \"$count\" -eq 5 ]; then printf '%s\\n' 'schema-version = 1' '[pull-requests]' 'default-base-branch = \"main\"' > '{}'; fi\nfi\nexec '{}' \"$@\"\n",
+                repo_view_count.display(),
+                repo_view_count.display(),
+                repo_view_count.display(),
+                store.paths().config_file.display(),
+                delegated_gh.display(),
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&fake_gh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, permissions)?;
+        let ssh = test_ssh_command()?;
+        let planner = OperationPlanner {
+            repo_root: repo.clone(),
+            github_executable: Some(fake_gh.clone()),
+            policy: policy.clone(),
+            ssh_executable: Some(ssh.clone()),
+        };
+        let sequence = planner
+            .plan_prompt_sequence(vec![
+                OperationRequest::Fetch,
+                OperationRequest::Push,
+                OperationRequest::OpenPullRequest { base: None },
+            ])
+            .map_err(std::io::Error::other)?;
+        assert!(sequence.plan.preview_text().contains("base: release"));
+
+        let result = PromptSequenceExecutor {
+            repo_root: repo,
+            audit: AuditDestination::Paths(paths.clone()),
+            github_executable: Some(fake_gh),
+            policy,
+            ssh_executable: Some(ssh),
+        }
+        .execute(sequence.sequence);
+
+        let message = result.message();
+        assert!(
+            message.contains("Prompt sequence stopped before step 2 of 3."),
+            "{message}"
+        );
+        assert!(
+            message.contains("pull request target changed since the sequence preview"),
+            "{message}"
+        );
+        let entries = LocalStore::open(paths)?.list_audit_entries()?;
+        assert!(entries.iter().all(|entry| entry.operation != "push"));
+        assert!(
+            !std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&origin)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()?
+                .success(),
+            "push must not create a ref after the configured base changes"
         );
         Ok(())
     }
