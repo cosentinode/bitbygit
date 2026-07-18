@@ -113,7 +113,7 @@ Success condition:
 
 Status:
 
-- completed
+- merged
 
 Must have:
 
@@ -205,6 +205,10 @@ Success condition:
 
 ## Phase 11: GitHub integration and pull request creation
 
+Status:
+
+- merged as part of [#13](https://github.com/cosentinode/bitbygit/issues/13)
+
 Must have:
 
 - detect `gh` availability and auth state
@@ -212,14 +216,23 @@ Must have:
 - confirm base branch
 - surface PR URL
 - add `open pr`, `open pull request`, and `commit and push and open pr` prompt
-  execution after the GitHub provider integration in
-  [#13](https://github.com/cosentinode/bitbygit/issues/13)
+  execution
 
 Success condition:
 
 - users can include PR creation in a guarded multi-step workflow
 
 ## Phase 12: Conflict detection and recovery UX
+
+Status:
+
+- in progress under [#14](https://github.com/cosentinode/bitbygit/issues/14)
+- operation-state detection and typed recovery commands merged in
+  [#53](https://github.com/cosentinode/bitbygit/issues/53) and
+  [#54](https://github.com/cosentinode/bitbygit/issues/54)
+- recovery policy and TUI actions remain open in
+  [#55](https://github.com/cosentinode/bitbygit/issues/55) and
+  [#56](https://github.com/cosentinode/bitbygit/issues/56)
 
 Must have:
 
@@ -233,6 +246,17 @@ Success condition:
 - conflict states are understandable and recoverable from the TUI
 
 ## Phase 13: Config and policy controls
+
+Status:
+
+- implementation slices merged in
+  [#59](https://github.com/cosentinode/bitbygit/issues/59),
+  [#62](https://github.com/cosentinode/bitbygit/issues/62),
+  [#65](https://github.com/cosentinode/bitbygit/issues/65),
+  [#67](https://github.com/cosentinode/bitbygit/issues/67), and
+  [#69](https://github.com/cosentinode/bitbygit/issues/69); umbrella
+  [#15](https://github.com/cosentinode/bitbygit/issues/15) is closed and Phase
+  13 is complete
 
 Must have:
 
@@ -248,6 +272,16 @@ Success condition:
 
 ## Phase 14: Packaging, installation, and release automation
 
+Status:
+
+- release automation and installation docs merged in
+  [#57](https://github.com/cosentinode/bitbygit/issues/57),
+  [#61](https://github.com/cosentinode/bitbygit/issues/61), and
+  [#64](https://github.com/cosentinode/bitbygit/issues/64)
+- the first real release remains open in
+  [#81](https://github.com/cosentinode/bitbygit/issues/81), and umbrella
+  [#16](https://github.com/cosentinode/bitbygit/issues/16) remains open
+
 Must have:
 
 - release build workflow
@@ -260,6 +294,15 @@ Success condition:
 - users can install and run `bitbygit` from release artifacts
 
 ## Phase 15: Docs, onboarding, and contributor workflow
+
+Status:
+
+- in progress under [#17](https://github.com/cosentinode/bitbygit/issues/17);
+  remaining documentation slices are tracked in
+  [#60](https://github.com/cosentinode/bitbygit/issues/60),
+  [#63](https://github.com/cosentinode/bitbygit/issues/63),
+  [#66](https://github.com/cosentinode/bitbygit/issues/66), and
+  [#68](https://github.com/cosentinode/bitbygit/issues/68)
 
 Must have:
 
