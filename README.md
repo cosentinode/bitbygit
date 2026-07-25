@@ -62,12 +62,13 @@ Package-manager distribution is not currently available.
 Prerequisites:
 
 - Rust 1.85 or newer.
-- `git` available on `PATH`.
+- Git 2.42 or newer available on `PATH` (required for guarded conflict recovery).
 - `gh` is optional and required only for GitHub-specific workflows.
 
 Run local checks:
 
 ```sh
+bash scripts/test-ci-workflow.sh
 bash scripts/test-release-workflow.sh
 bash scripts/test-installation-docs.sh
 cargo fmt --all --check

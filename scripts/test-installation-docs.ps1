@@ -56,6 +56,9 @@ if ($SelectedVersion -eq $WorkspaceVersion -or $SelectedVersion -eq "0.1.0") {
 if (-not $DocsText.Contains("`$Version = `"$WorkspaceVersion`"")) {
     Fail "PowerShell examples do not use workspace version $WorkspaceVersion"
 }
+if (-not $DocsText.Contains("Guarded conflict recovery requires Git 2.42 or newer")) {
+    Fail "runtime prerequisites do not document the guarded recovery Git version"
+}
 $UserPathOrder = '$NewUserPath = (@($InstallDir) + $UserPathEntries) -join ";"'
 if ([regex]::Matches($DocsText, [regex]::Escape($UserPathOrder)).Count -ne 2) {
     Fail "Windows examples do not prioritize the install directory in user PATH"

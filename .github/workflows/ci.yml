@@ -54,7 +54,7 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Validate release workflow
+      - name: Validate workflows
         shell: bash
         run: |
           set -euo pipefail
@@ -65,6 +65,7 @@ jobs:
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${tool_dir}/${archive}" | sha256sum -c -
           tar -C "${tool_dir}" -xzf "${tool_dir}/${archive}" actionlint
           "${tool_dir}/actionlint"
+          bash scripts/test-ci-workflow.sh
           bash scripts/test-release-workflow.sh
 
       - name: Validate Linux installation documentation
@@ -81,6 +82,29 @@ jobs:
         run: cargo test --locked --workspace
 
       - name: Build
+        run: cargo build --locked --workspace
+
+  recovery-platforms:
+    name: Recovery safety (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test end-to-end recovery support
+        run: cargo test --locked -p bitbygit-git recovery_platform_
+
+      - name: Build workspace
         run: cargo build --locked --workspace
 
   installation-docs-macos:

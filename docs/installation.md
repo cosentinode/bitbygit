@@ -8,6 +8,8 @@ instructions once the version you want appears on the
 ## Runtime prerequisites
 
 - `git` must be installed and available on `PATH`.
+  Guarded conflict recovery requires Git 2.42 or newer; other operations remain
+  available with older Git versions.
 - [GitHub CLI (`gh`)](https://cli.github.com/) is optional. It is required only
   for GitHub-specific operations such as opening a pull request; run
   `gh auth login` before using those operations.

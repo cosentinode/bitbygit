@@ -139,8 +139,13 @@ pub const fn operation_family(operation: OperationKind) -> OperationFamily {
         OperationKind::Branches => OperationFamily::Branches,
         OperationKind::CheckoutBranch => OperationFamily::Checkout,
         OperationKind::CreateBranch => OperationFamily::CreateBranch,
-        OperationKind::MergeFastForward => OperationFamily::Merge,
-        OperationKind::Rebase => OperationFamily::Rebase,
+        OperationKind::MergeFastForward
+        | OperationKind::MergeContinue
+        | OperationKind::MergeAbort => OperationFamily::Merge,
+        OperationKind::Rebase
+        | OperationKind::RebaseContinue
+        | OperationKind::RebaseAbort
+        | OperationKind::RebaseSkip => OperationFamily::Rebase,
         OperationKind::OpenPullRequest => OperationFamily::OpenPullRequest,
     }
 }
@@ -159,9 +164,13 @@ const fn protected_branch_requirement(operation: OperationKind) -> Option<Confir
         OperationKind::Commit
         | OperationKind::PushCurrentBranch
         | OperationKind::PushSetUpstream => Some(ConfirmationRequirement::VisiblePlan),
-        OperationKind::PullRebase | OperationKind::Rebase => {
-            Some(ConfirmationRequirement::ExplicitConfirmation)
-        }
+        OperationKind::PullRebase
+        | OperationKind::Rebase
+        | OperationKind::MergeContinue
+        | OperationKind::MergeAbort
+        | OperationKind::RebaseContinue
+        | OperationKind::RebaseAbort
+        | OperationKind::RebaseSkip => Some(ConfirmationRequirement::ExplicitConfirmation),
         OperationKind::RefreshStatus
         | OperationKind::ViewDiff
         | OperationKind::Fetch
@@ -358,7 +367,12 @@ mod tests {
             (OperationKind::CheckoutBranch, OperationFamily::Checkout),
             (OperationKind::CreateBranch, OperationFamily::CreateBranch),
             (OperationKind::MergeFastForward, OperationFamily::Merge),
+            (OperationKind::MergeContinue, OperationFamily::Merge),
+            (OperationKind::MergeAbort, OperationFamily::Merge),
             (OperationKind::Rebase, OperationFamily::Rebase),
+            (OperationKind::RebaseContinue, OperationFamily::Rebase),
+            (OperationKind::RebaseAbort, OperationFamily::Rebase),
+            (OperationKind::RebaseSkip, OperationFamily::Rebase),
             (
                 OperationKind::OpenPullRequest,
                 OperationFamily::OpenPullRequest,

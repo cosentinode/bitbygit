@@ -339,6 +339,7 @@ extract_selected_block "${failure_heading}" bash > "${cleanup_failure_dir}/snipp
 [[ "${docs_text}" == *'git -C "${SOURCE_DIR}" checkout --detach "${tag_commit}"'* ]] || fail "Bash source build does not detach at the selected tag"
 [[ "${docs_text}" == *'git -C $SourceDir fetch --depth 1 https://github.com/cosentinode/bitbygit.git "${Tag}:${Tag}"'* ]] || fail "PowerShell source build does not fetch the exact selected tag"
 [[ "${docs_text}" == *'git -C $SourceDir checkout --detach $TagCommit'* ]] || fail "PowerShell source build does not detach at the selected tag"
+[[ "${docs_text}" == *'Guarded conflict recovery requires Git 2.42 or newer'* ]] || fail "runtime prerequisites do not document the guarded recovery Git version"
 [[ "${docs_text}" == *'"${HOME}/.local/bin/bitbygit" --version'* ]] || fail "Unix installation does not validate the installed path"
 [[ "${docs_text}" == *'& $InstalledBinary --version'* ]] || fail "Windows installation does not validate the installed path"
 [[ "$(grep -c 'resolved_binary="$(type -P bitbygit || true)"' "${docs}")" -eq 3 ]] || fail "Unix installations do not bypass aliases and functions during PATH resolution"

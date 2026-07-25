@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::OperationRequest;
+use crate::{OperationRequest, RecoveryRequest};
 
-const PROMPT_EXAMPLES: &str = "branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, open pr, commit -m \"message\", fetch, push, pull, or pull --rebase";
-pub const UNSUPPORTED_PROMPT_MESSAGE: &str = "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, rebase <base>, open pr, commit -m \"message\", fetch, push, pull, or pull --rebase";
+const PROMPT_EXAMPLES: &str = "branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, merge --continue, merge --abort, rebase <base>, rebase --continue, rebase --abort, rebase --skip, open pr, commit -m \"message\", fetch, push, pull, or pull --rebase";
+pub const UNSUPPORTED_PROMPT_MESSAGE: &str = "Unsupported prompt. Try: branches, checkout <branch>, branch <name>, branch <name> from <base>, merge <branch>, merge --continue, merge --abort, rebase <base>, rebase --continue, rebase --abort, rebase --skip, open pr, commit -m \"message\", fetch, push, pull, or pull --rebase";
 const SHELL_SYNTAX_MESSAGE: &str =
     "Shell-style prompt syntax is not supported. Use one guarded prompt at a time.";
 const RAW_GIT_MESSAGE: &str =
@@ -171,6 +171,14 @@ fn parse_single_prompt(input: &str) -> Result<OperationRequest, PromptParseError
         "open pr" | "open pull request" => Ok(OperationRequest::OpenPullRequest { base: None }),
         "pull" => Ok(OperationRequest::Pull { rebase: false }),
         "pull --rebase" | "pull rebase" => Ok(OperationRequest::Pull { rebase: true }),
+        "merge --continue" => Ok(OperationRequest::Recover(RecoveryRequest::MergeContinue)),
+        "merge --abort" => Ok(OperationRequest::Recover(RecoveryRequest::MergeAbort)),
+        "rebase --continue" => Ok(OperationRequest::Recover(RecoveryRequest::RebaseContinue)),
+        "rebase --abort" => Ok(OperationRequest::Recover(RecoveryRequest::RebaseAbort)),
+        "rebase --skip" => Ok(OperationRequest::Recover(RecoveryRequest::RebaseSkip)),
+        "merge --skip" => Err(parse_error(
+            "Merge skip is not supported by Git. Use merge --continue or merge --abort.",
+        )),
         _ if lower.starts_with("checkout ") => parse_one_arg_prompt(trimmed, "checkout")
             .map(|branch| OperationRequest::Checkout { branch }),
         _ if lower.starts_with("merge ") => {
@@ -354,6 +362,26 @@ mod tests {
             ("pull --rebase", OperationRequest::Pull { rebase: true }),
             ("pull rebase", OperationRequest::Pull { rebase: true }),
             (
+                "merge --continue",
+                OperationRequest::Recover(RecoveryRequest::MergeContinue),
+            ),
+            (
+                "MERGE --ABORT",
+                OperationRequest::Recover(RecoveryRequest::MergeAbort),
+            ),
+            (
+                "rebase --continue",
+                OperationRequest::Recover(RecoveryRequest::RebaseContinue),
+            ),
+            (
+                "rebase --abort",
+                OperationRequest::Recover(RecoveryRequest::RebaseAbort),
+            ),
+            (
+                "rebase --skip",
+                OperationRequest::Recover(RecoveryRequest::RebaseSkip),
+            ),
+            (
                 "checkout feature/auth",
                 OperationRequest::Checkout {
                     branch: "feature/auth".to_owned(),
@@ -462,6 +490,11 @@ mod tests {
             ),
             ("push --force", UNSUPPORTED_PROMPT_MESSAGE.to_owned()),
             ("pull --ff-only", UNSUPPORTED_PROMPT_MESSAGE.to_owned()),
+            (
+                "merge --skip",
+                "Merge skip is not supported by Git. Use merge --continue or merge --abort."
+                    .to_owned(),
+            ),
             ("git push", RAW_GIT_MESSAGE.to_owned()),
             ("git commit -m \"message\"", RAW_GIT_MESSAGE.to_owned()),
             (
