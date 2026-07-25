@@ -457,6 +457,7 @@ impl Git {
         let deadline = Instant::now() + self.recovery_start_timeout;
         self.ensure_recovery_git_version_until(deadline)?;
         self.validate_recovery_action(operation, action)?;
+        self.ensure_recovery_backend_supported_until(operation, action, deadline)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
         let recovery_lock = self.acquire_recovery_lock_until(operation, action, deadline)?;
         self.run_recovery_args_until_with(operation, action, deadline, || {
@@ -530,11 +531,32 @@ impl Git {
                 });
             }
         }
+        self.ensure_recovery_backend_supported_until(operation, action, deadline)?;
         if action == RecoveryAction::Continue && self.has_unresolved_conflicts_until(deadline)? {
             return Err(GitError::Blocked {
                 message: format!(
                     "{} continue is blocked while unresolved conflicts are present",
                     operation.label()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_recovery_backend_supported_until(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        deadline: Instant,
+    ) -> Result<(), GitError> {
+        if operation == RepositoryOperation::Rebase
+            && action != RecoveryAction::Abort
+            && self.git_path_until("rebase-apply", deadline)?.exists()
+        {
+            return Err(GitError::Blocked {
+                message: format!(
+                    "rebase {} is blocked for the apply backend because its remaining patches cannot be inspected safely; abort and restart with the merge backend, or run Git manually",
+                    action.label()
                 ),
             });
         }
@@ -1920,13 +1942,17 @@ impl Git {
         else {
             return Ok(());
         };
-        let changed_args = if action == RecoveryAction::Abort {
+        let changed_args = if matches!(action, RecoveryAction::Abort | RecoveryAction::Skip) {
             vec![
                 "ls-tree".to_owned(),
                 "-r".to_owned(),
                 "--name-only".to_owned(),
                 "-z".to_owned(),
-                target,
+                if action == RecoveryAction::Skip {
+                    "HEAD".to_owned()
+                } else {
+                    target
+                },
                 "--".to_owned(),
             ]
         } else {
@@ -6281,6 +6307,101 @@ mod tests {
             "local ignored data\n"
         );
         assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_skip_blocks_ignored_path_tracked_unchanged_at_head() -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.write("stable.txt", "tracked stable contents\n")?;
+        repo.run(["add", "conflict.txt", "stable.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("conflict.txt", "topic\n")?;
+        repo.run(["commit", "-am", "topic"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.run(["commit", "-am", "main"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "main"])?;
+        repo.run(["rm", "--cached", "stable.txt"])?;
+        repo.write(".gitignore", "stable.txt\n")?;
+        repo.write("stable.txt", "local ignored data\n")?;
+        let git = Git::new(repo.path());
+
+        let Err(error) = git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Skip)
+        else {
+            return Err("expected ignored stable path to block rebase skip".into());
+        };
+
+        assert!(error.to_string().contains("would be overwritten"));
+        assert_eq!(
+            fs::read_to_string(repo.path().join("stable.txt"))?,
+            "local ignored data\n"
+        );
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rebase_continue_and_skip_fail_closed_without_filters_or_overwrites()
+    -> Result<(), Box<dyn Error>> {
+        let repo = initialized_repo()?;
+        repo.write(".gitignore", "victim.txt\n")?;
+        repo.write("conflict.txt", "base\n")?;
+        repo.run(["add", ".gitignore", "conflict.txt"])?;
+        repo.run(["commit", "-m", "base"])?;
+        repo.run(["switch", "-c", "topic"])?;
+        repo.write("conflict.txt", "topic\n")?;
+        repo.run(["commit", "-am", "conflicting change"])?;
+        repo.write(".gitattributes", "victim.txt filter=unsafe\n")?;
+        repo.write("victim.txt", "committed intermediate contents\n")?;
+        repo.run(["add", ".gitattributes"])?;
+        repo.run(["add", "-f", "victim.txt"])?;
+        repo.run(["commit", "-m", "add filtered ignored victim"])?;
+        repo.run(["rm", ".gitattributes", "victim.txt"])?;
+        repo.run(["commit", "-m", "remove filtered ignored victim"])?;
+        repo.run(["switch", "main"])?;
+        repo.write("conflict.txt", "main\n")?;
+        repo.write("upstream.txt", "upstream\n")?;
+        repo.run(["add", "conflict.txt", "upstream.txt"])?;
+        repo.run(["commit", "-m", "upstream change"])?;
+        repo.run(["switch", "topic"])?;
+        repo.run_allow_failure(["rebase", "--apply", "main"])?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        repo.write("victim.txt", "local ignored data\n")?;
+        let marker = repo.path().join("filter-ran");
+        repo.run_args(&[
+            "config",
+            "filter.unsafe.smudge",
+            &format!("git config --file \"{}\" marker.ran true", marker.display()),
+        ])?;
+        let git = Git::new(repo.path());
+        assert!(git.git_path("rebase-apply")?.exists());
+
+        for action in [RecoveryAction::Continue, RecoveryAction::Skip] {
+            let Err(error) = git.prepare_recovery(RepositoryOperation::Rebase, action) else {
+                return Err(
+                    format!("expected apply-backend rebase {action:?} to fail closed").into(),
+                );
+            };
+            assert!(error.to_string().contains("apply backend"));
+
+            let Err(error) = git.recover(RepositoryOperation::Rebase, action) else {
+                return Err(
+                    format!("expected apply-backend rebase {action:?} to remain blocked").into(),
+                );
+            };
+            assert!(error.to_string().contains("apply backend"));
+            assert_eq!(
+                fs::read_to_string(repo.path().join("victim.txt"))?,
+                "local ignored data\n"
+            );
+            assert!(!marker.exists(), "configured filter process started");
+            assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        }
         Ok(())
     }
 
