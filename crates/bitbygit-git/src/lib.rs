@@ -453,12 +453,34 @@ impl Git {
     where
         F: FnOnce() -> Result<(), GitError>,
     {
+        self.recover_exact_with_checks(
+            operation,
+            action,
+            expected_state,
+            || Ok(()),
+            before_spawn_check,
+        )
+    }
+
+    fn recover_exact_with_checks<F, G>(
+        &self,
+        operation: RepositoryOperation,
+        action: RecoveryAction,
+        expected_state: &RecoveryState,
+        after_process_check: F,
+        before_spawn_check: G,
+    ) -> Result<GitOutput, GitError>
+    where
+        F: FnOnce() -> Result<(), GitError>,
+        G: FnOnce() -> Result<(), GitError>,
+    {
         ensure_recovery_execution_supported(operation, action)?;
         let deadline = Instant::now() + self.recovery_start_timeout;
         self.ensure_recovery_git_version_until(deadline)?;
         self.validate_recovery_action(operation, action)?;
         self.ensure_recovery_backend_supported_until(operation, action, deadline)?;
         self.ensure_recovery_process_configuration_safe_until(deadline)?;
+        after_process_check()?;
         let recovery_lock = self.acquire_recovery_lock_until(operation, action, deadline)?;
         self.run_recovery_args_until_with(operation, action, deadline, || {
             let repository_root = self.canonical_repository_root_until(deadline)?;
@@ -5148,11 +5170,11 @@ fn ensure_recovery_control_observation_safe(label: &[u8], contents: &[u8]) -> Re
         matches!(
             line.split(|byte| byte.is_ascii_whitespace())
                 .find(|field| !field.is_empty()),
-            Some(b"reset" | b"t")
+            Some(b"reset" | b"t" | b"merge" | b"m")
         )
     }) {
         return Err(GitError::Blocked {
-            message: "recovery is blocked because the remaining rebase plan contains a reset command whose target tree cannot be safely inspected; remove it and preview recovery again, or run Git manually"
+            message: "recovery is blocked because the remaining rebase plan contains a reset or merge command whose target tree cannot be safely inspected; remove it and preview recovery again, or run Git manually"
                 .to_owned(),
         });
     }
@@ -6810,6 +6832,45 @@ mod tests {
                 original_head
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_recovery_rejects_merge_todo_retained_after_preliminary_scan()
+    -> Result<(), Box<dyn Error>> {
+        let (repo, original_head) = prepare_rebase_conflict()?;
+        repo.write("conflict.txt", "resolved\n")?;
+        repo.run(["add", "conflict.txt"])?;
+        let git = Git::new(repo.path());
+        let expected =
+            git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Continue)?;
+        let todo = git.git_path("rebase-merge/git-rebase-todo")?;
+        let message_commit = repo.git_stdout(["rev-parse", "HEAD"])?;
+
+        let Err(error) = git.recover_exact_with_checks(
+            RepositoryOperation::Rebase,
+            RecoveryAction::Continue,
+            &expected,
+            || {
+                fs::write(
+                    &todo,
+                    format!("merge -C {} rewritten-target\n", message_commit.trim()),
+                )
+                .map_err(|source| recovery_state_io(&todo, source))
+            },
+            || Ok(()),
+        ) else {
+            return Err("expected retained merge todo observation to block recovery".into());
+        };
+
+        assert!(error.to_string().contains("reset or merge command"));
+        assert!(fs::read_to_string(todo)?.starts_with("merge "));
+        assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        assert_eq!(
+            repo.git_stdout(["rev-parse", "rebase-merge/orig-head"])?
+                .trim(),
+            original_head
+        );
         Ok(())
     }
 
