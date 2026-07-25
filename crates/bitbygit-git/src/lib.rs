@@ -1696,12 +1696,14 @@ impl Git {
                         .to_owned(),
                 });
             }
-            if contents
-                .lines()
-                .any(|line| matches!(line.split_ascii_whitespace().next(), Some("reset" | "t")))
-            {
+            if contents.lines().any(|line| {
+                matches!(
+                    line.split_ascii_whitespace().next(),
+                    Some("reset" | "t" | "merge" | "m")
+                )
+            }) {
                 return Err(GitError::Blocked {
-                    message: "recovery is blocked because the remaining rebase plan contains a reset command whose target tree cannot be safely inspected; remove it and preview recovery again, or run Git manually"
+                    message: "recovery is blocked because the remaining rebase plan contains a reset or merge command whose target tree cannot be safely inspected; remove it and preview recovery again, or run Git manually"
                         .to_owned(),
                 });
             }
@@ -6430,8 +6432,8 @@ mod tests {
     }
 
     #[test]
-    fn rebase_merges_reset_fails_closed_without_filters_or_overwrites() -> Result<(), Box<dyn Error>>
-    {
+    fn rebase_merges_targets_fail_closed_without_filters_or_overwrites()
+    -> Result<(), Box<dyn Error>> {
         let repo = initialized_repo()?;
         repo.write(".gitignore", "victim.txt\n")?;
         repo.write("conflict.txt", "base\n")?;
@@ -6454,6 +6456,7 @@ mod tests {
         repo.run(["commit", "-am", "main"])?;
         repo.run(["switch", "topic"])?;
         repo.run_allow_failure(["rebase", "--rebase-merges", "main"])?;
+        let message_commit = repo.git_stdout(["rev-parse", "HEAD"])?;
         repo.write("conflict.txt", "resolved\n")?;
         repo.run(["add", "conflict.txt"])?;
         repo.write("victim.txt", "local ignored data\n")?;
@@ -6465,29 +6468,36 @@ mod tests {
         ])?;
         repo.run_args(&["update-ref", "refs/rewritten/dangerous", dangerous.trim()])?;
         let git = Git::new(repo.path());
-        fs::write(
-            git.git_path("rebase-merge/git-rebase-todo")?,
-            "reset dangerous\n",
-        )?;
-
-        for recover in [false, true] {
-            let result = if recover {
-                git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue)
-                    .map(|_| ())
-            } else {
-                git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Continue)
-                    .map(|_| ())
-            };
-            let Err(error) = result else {
-                return Err("expected rebase-merges reset to fail closed".into());
-            };
-            assert!(error.to_string().contains("reset command"));
-            assert_eq!(
-                fs::read_to_string(repo.path().join("victim.txt"))?,
-                "local ignored data\n"
-            );
-            assert!(!marker.exists(), "configured filter process started");
-            assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+        for (todo, command) in [
+            (
+                format!("merge -C {} dangerous\n", message_commit.trim()),
+                "merge",
+            ),
+            ("reset dangerous\n".to_owned(), "reset"),
+        ] {
+            fs::write(git.git_path("rebase-merge/git-rebase-todo")?, todo)?;
+            for recover in [false, true] {
+                let result = if recover {
+                    git.recover(RepositoryOperation::Rebase, RecoveryAction::Continue)
+                        .map(|_| ())
+                } else {
+                    git.prepare_recovery(RepositoryOperation::Rebase, RecoveryAction::Continue)
+                        .map(|_| ())
+                };
+                let Err(error) = result else {
+                    return Err(format!("expected rebase-merges {command} to fail closed").into());
+                };
+                assert!(
+                    error.to_string().contains("reset or merge command"),
+                    "unexpected {command} error (recover={recover}): {error}"
+                );
+                assert_eq!(
+                    fs::read_to_string(repo.path().join("victim.txt"))?,
+                    "local ignored data\n"
+                );
+                assert!(!marker.exists(), "configured filter process started");
+                assert_eq!(git.status()?.operation, Some(RepositoryOperation::Rebase));
+            }
         }
         Ok(())
     }
